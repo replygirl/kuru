@@ -795,6 +795,214 @@ fn real_pty_file_checkpoint_inspect_and_selected_undo() -> Result<()> {
     terminal.assert_restored()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_fresh_terminals_share_owner_and_keep_private_sessions_through_eof() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let first_held = Arc::new(AtomicBool::new(false));
+        let second_held = Arc::new(AtomicBool::new(false));
+        let first_release = Arc::new(tokio::sync::Notify::new());
+        let second_release = Arc::new(tokio::sync::Notify::new());
+        let (arrivals, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/v1/models", get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }))
+            .route("/v1/responses", post({
+                let requests = requests.clone();
+                let first_held = first_held.clone();
+                let second_held = second_held.clone();
+                let first_release = first_release.clone();
+                let second_release = second_release.clone();
+                move |Json(request): Json<Value>| {
+                    let requests = requests.clone();
+                    let first_held = first_held.clone();
+                    let second_held = second_held.clone();
+                    let first_release = first_release.clone();
+                    let second_release = second_release.clone();
+                    let arrivals = arrivals.clone();
+                    async move {
+                        let text = request.to_string();
+                        requests.lock().unwrap().push(request);
+                        if text.contains("FIRST_PRIVATE_SENTINEL") && !first_held.swap(true, Ordering::SeqCst) {
+                            arrivals.send("first").unwrap();
+                            first_release.notified().await;
+                        } else if text.contains("SECOND_PRIVATE_SENTINEL") && !second_held.swap(true, Ordering::SeqCst) {
+                            arrivals.send("second").unwrap();
+                            second_release.notified().await;
+                        }
+                        ([(CONTENT_TYPE, "text/event-stream")], format!("data: {}\n\n", json!({
+                            "type":"response.completed", "response": {
+                                "id":"session-admission", "status":"completed",
+                                "output":[{"type":"message","content":[{"type":"output_text","text":"COUNTED_SESSION_ANSWER"}]}],
+                                "usage":{"input_tokens":3,"output_tokens":2}
+                            }
+                        }))).into_response()
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = sandbox.root.path().join("concurrent-provider.toml");
+        std::fs::write(&config, format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\nmax_parallel=1\n",
+            listener.local_addr()?
+        ))?;
+        let _server = Server(tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }));
+        let command = || {
+            let mut command = sandbox.command("responses");
+            command.args(["--model", "fixture", "--config"]).arg(&config).env("KURU_FIXTURE_KEY", "fixture");
+            command
+        };
+        let mut first = Terminal::spawn(command(), 40, 120)?;
+        first.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+        let mut second = Terminal::spawn(command(), 40, 80)?;
+        second.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+        let options = memory_options(&sandbox)?;
+        let mut inspection = options.clone();
+        inspection.read_only = true;
+        let inspector = MemoryStore::open_managed_observed(
+            inspection,
+            sandbox.project.canonicalize()?,
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        )
+        .1
+        .await?;
+        let drivers = inspector.live_session_drivers().await?;
+        ensure!(
+            drivers.len() == 2,
+            "two fresh processes did not retain distinct live claims: {drivers:?}"
+        );
+        ensure!(drivers[0].proof.session_id != drivers[1].proof.session_id);
+        ensure!(
+            drivers[0].proof.service_generation == drivers[1].proof.service_generation,
+            "fresh processes elected different owners"
+        );
+        let ids = drivers
+            .iter()
+            .map(|driver| driver.proof.session_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        first.submit("FIRST_PRIVATE_SENTINEL")?;
+        second.submit("SECOND_PRIVATE_SENTINEL")?;
+        let overlapping = tokio::time::timeout(READY_TIMEOUT, async {
+            let mut seen = BTreeSet::new();
+            while seen.len() != 2 {
+                seen.insert(arrived.recv().await.context("provider arrival channel closed")?);
+            }
+            Ok::<_, anyhow::Error>(seen)
+        }).await.context("two actual provider requests did not overlap")??;
+        ensure!(overlapping == BTreeSet::from(["first", "second"]));
+        ensure!(inspector.live_session_drivers().await?.len() == 2);
+        first_release.notify_one();
+        second_release.notify_one();
+        first.wait_composer_frame(&["COUNTED_SESSION_ANSWER", "enter send"], READY_TIMEOUT)?;
+        second.wait_composer_frame(&["COUNTED_SESSION_ANSWER", "enter send"], READY_TIMEOUT)?;
+        {
+            let captured = requests.lock().unwrap();
+            ensure!(captured.len() >= 2);
+            ensure!(captured.iter().all(|request| {
+                let text = request.to_string();
+                !(text.contains("FIRST_PRIVATE_SENTINEL") && text.contains("SECOND_PRIVATE_SENTINEL"))
+            }), "actual provider requests concatenated unrelated private histories");
+        }
+        let scope = kuru_runtime::project_scope(&sandbox.project)?;
+        let profile = ModeProfile::builtin(Mode::Ifs);
+        let membership = inspector
+            .get(&format!("{scope}/ifs/membership"))
+            .await?
+            .context("membership absent")?;
+        let mut seen = BTreeSet::new();
+        for id in &ids {
+            let transcript = profile.memory.transcript_namespace(&scope, id);
+            let history = inspector.history(&transcript, 64).await?;
+            let owns_first = history
+                .iter()
+                .any(|message| message.plain_text() == Some("FIRST_PRIVATE_SENTINEL"));
+            let owns_second = history
+                .iter()
+                .any(|message| message.plain_text() == Some("SECOND_PRIVATE_SENTINEL"));
+            ensure!(
+                owns_first != owns_second,
+                "fresh session mixed or lost submitted transcripts"
+            );
+            let own = if owns_first {
+                "FIRST_PRIVATE_SENTINEL"
+            } else {
+                "SECOND_PRIVATE_SENTINEL"
+            };
+            let foreign = if owns_first {
+                "SECOND_PRIVATE_SENTINEL"
+            } else {
+                "FIRST_PRIVATE_SENTINEL"
+            };
+            seen.insert(own);
+            let mut private_seen = false;
+            for part in membership["parts"]
+                .as_array()
+                .context("membership parts absent")?
+            {
+                let actor = part["id"].as_str().context("part identity absent")?;
+                let namespace = profile.memory.identity_namespace(&scope, Mode::Ifs, actor);
+                let private = inspector.session_history_window(&namespace, id, 64).await?;
+                ensure!(
+                    private.messages.iter().all(|message| !message
+                        .plain_text()
+                        .is_some_and(|text| text.contains(foreign))),
+                    "unrelated raw private history crossed sessions"
+                );
+                private_seen |= private
+                    .messages
+                    .iter()
+                    .any(|message| message.plain_text().is_some_and(|text| text.contains(own)));
+            }
+            ensure!(
+                private_seen,
+                "own submitted context was not persisted for any participant"
+            );
+        }
+        ensure!(seen.len() == 2);
+        second.command("/sessions", Some("Sessions"))?;
+        second.wait_text(&["live"], &[])?;
+        second.close_picker(b"\x1b")?;
+
+        first.send(b"/quit\r")?;
+        first.wait_exit(EXIT_TIMEOUT)?;
+        first.assert_restored()?;
+        // Completed owner reads observe actual EOF handling; no elapsed grace
+        // authorizes release of a claim or reuse of the native barrier.
+        let remaining = tokio::time::timeout(READY_TIMEOUT, async {
+            loop {
+                let live = inspector.live_session_drivers().await?;
+                if live.len() == 1 {
+                    return Ok::<_, anyhow::Error>(live);
+                }
+            }
+        })
+        .await
+        .context("normal close did not release its exact presence")??;
+        ensure!(ids.contains(&remaining[0].proof.session_id));
+        second.submit("SURVIVING_SESSION_STILL_WORKS")?;
+        second.wait_composer_frame(
+            &["SURVIVING_SESSION_STILL_WORKS", "COUNTED_SESSION_ANSWER", "enter send"],
+            READY_TIMEOUT,
+        )?;
+        // An abrupt process exit exercises socket EOF rather than Close.
+        second.close(EXIT_TIMEOUT)?;
+        tokio::time::timeout(READY_TIMEOUT, async {
+            loop {
+                if inspector.live_session_drivers().await?.is_empty() {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await
+        .context("abrupt exit left an orphan driver presence")??;
+        inspector.close().await?;
+        kuru_memory::test_support::await_managed_quiescence(&options).await?;
+        Ok(())
+    })
+    .await
+}
+
 struct Sandbox {
     root: memory::ServiceCleanup,
     project: PathBuf,
@@ -1603,7 +1811,18 @@ async fn real_pty_public_pages_literal_search_and_deep_item_anchor_at_120_and_80
             PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
         );
         let memory = opening.await?;
+        let (claimed, driver) = memory.bind_project_driver(&sandbox.project).await?;
+        memory.close().await?;
+        let memory = claimed;
         let seeded: Result<()> = async {
+            driver
+                .select(kuru_memory::SessionDriverTarget::Catalog(Box::new(
+                    memory
+                        .session_catalog_record(&session)
+                        .await?
+                        .context("navigation claim catalog")?,
+                )))
+                .await?;
             let generation = memory
                 .session_catalog_record(&session)
                 .await?
@@ -1663,9 +1882,11 @@ async fn real_pty_public_pages_literal_search_and_deep_item_anchor_at_120_and_80
             Ok(())
         }
         .await;
+        let released = driver.close().await;
         let closed = memory.close().await;
         let quiesced = kuru_memory::test_support::await_managed_quiescence(&options).await;
         seeded?;
+        released?;
         closed?;
         quiesced?;
         let mut command = sandbox.command("demo");
@@ -2221,12 +2442,24 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
             .to_owned();
         ensure!(cli_action(&["sessions", "remove", &cli_pending])?["lifecycle_state"] == "removed");
         ensure!(cli_action(&["sessions", "restore", &cli_pending])?["lifecycle_state"] == "active");
+        let options = memory_options(&sandbox)?;
         let (_, opening) = MemoryStore::open_managed_observed(
-            memory_options(&sandbox)?,
+            options.clone(),
             sandbox.project.canonicalize()?,
             PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
         );
         let memory = opening.await.context("attach managed CLI catalog")?;
+        let (claimed, driver) = memory.bind_project_driver(&sandbox.project).await?;
+        memory.close().await?;
+        let memory = claimed;
+        driver
+            .select(kuru_memory::SessionDriverTarget::Catalog(Box::new(
+                memory
+                    .session_catalog_record(&cli_pending)
+                    .await?
+                    .context("pending claim catalog")?,
+            )))
+            .await?;
         let generation = memory
             .session_catalog_record(&cli_pending)
             .await?
@@ -2250,7 +2483,9 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
                 },
             )
             .await?;
+        driver.close().await?;
         memory.close().await?;
+        kuru_memory::test_support::await_managed_quiescence(&options).await?;
 
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&requests);
@@ -2521,7 +2756,7 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
         ensure!(
             reopened_picker
                 .lines()
-                .any(|line| { line.contains(&child_id) && line.contains("active fork") }),
+                .any(|line| { line.contains(&child_id) && line.contains("live fork") }),
             "fresh TUI lost the fork identity or provenance: {reopened_picker}"
         );
         ensure!(

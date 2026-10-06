@@ -168,6 +168,14 @@ fn session_picker_label(session: &SessionSummary) -> String {
     ) {
         (SessionLifecycleState::Removed, true) => "removed pending",
         (SessionLifecycleState::Removed, false) => "removed",
+        (SessionLifecycleState::Active, true) if session.live_driver.is_some() => "live pending",
+        (SessionLifecycleState::Active, false) if session.live_driver.is_some() => "live",
+        (SessionLifecycleState::Active, true) if !session.live_presence_known => {
+            "pending · presence unknown"
+        }
+        (SessionLifecycleState::Active, false) if !session.live_presence_known => {
+            "active · presence unknown"
+        }
         (SessionLifecycleState::Active, true) => "pending",
         (SessionLifecycleState::Active, false) => "active",
     };
@@ -3554,6 +3562,9 @@ async fn dispatch_controlled_inner(
                 | CommandId::FileUndo
                 | CommandId::Mcp
                 | CommandId::Tools
+                // Resume performs its own exact ownership recovery before
+                // staging; a generic lost-driver check cannot preempt it.
+                | CommandId::Resume
         )
     });
     if !independent_recovery {
@@ -4810,6 +4821,8 @@ mod tests {
         head: Option<&str>,
     ) -> SessionSummary {
         SessionSummary {
+            live_driver: None,
+            live_presence_known: true,
             id: id.into(),
             turns: usize::from(head.is_some()),
             last_completed_speaker: head.map(|_| "part-a".into()),

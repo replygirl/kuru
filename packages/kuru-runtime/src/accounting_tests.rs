@@ -1790,6 +1790,8 @@ async fn cancellation_after_compact_settlement_drains_the_atomic_checkpoint() {
             )
             .await
             .unwrap();
+            memory.close().await.unwrap();
+            let memory = harness.memory.clone();
             let actor = harness.topology.parts[0].id.clone();
             let namespace = harness.namespace(&actor);
             memory
@@ -1957,6 +1959,8 @@ async fn unrelated_peer_write_during_compact_inference_preserves_source_and_usag
             )
             .await
             .unwrap();
+            memory.close().await.unwrap();
+            let memory = harness.memory.clone();
             let actor = harness.topology.parts[0].id.clone();
             let namespace = harness.namespace(&actor);
             let other_actor = harness.topology.parts[1].id.clone();
@@ -2227,6 +2231,8 @@ async fn accepted_compact_checkpoint_lost_reply_reconciles_on_a_successor_withou
             )
             .await
             .unwrap();
+            memory.close().await.unwrap();
+            let memory = harness.memory.clone();
             let actor = harness.topology.parts[0].id.clone();
             let namespace = harness.namespace(&actor);
             let actor_abort = harness.actors.get(&actor).unwrap().abort_handle();
@@ -2284,20 +2290,13 @@ async fn accepted_compact_checkpoint_lost_reply_reconciles_on_a_successor_withou
             );
             checkpoint_barrier.release();
             memory.close_transport_for_test().await.unwrap();
+            harness.disconnect_driver_presence_for_test().await.unwrap();
             sibling.close().await.unwrap();
-            kuru_memory::test_support::retire_idle_service(&options)
+            kuru_memory::test_support::await_owner_release(&options)
                 .await
                 .unwrap();
 
-            harness.reconcile().await.unwrap();
             let mut stopped = harness.actors.remove(&actor).unwrap();
-            let notices = harness.take_compaction_notices();
-            assert_eq!(notices.len(), 1, "exact lost-reply recovery lost its notice");
-            let crate::Event::Compaction { actor: noticed_actor, notice } = &notices[0] else { panic!("wrong notice event"); };
-            assert_eq!(noticed_actor, &actor);
-            assert_eq!(notice.summary_id, accepted.summary_id);
-            assert!(!notice.text(noticed_actor).contains("private compact sidecar"));
-            assert!(harness.take_compaction_notices().is_empty());
             stopped.wait().await;
             harness.actors.insert(
                 actor.clone(),
@@ -2307,6 +2306,16 @@ async fn accepted_compact_checkpoint_lost_reply_reconciles_on_a_successor_withou
                     harness.permits.clone(),
                 ),
             );
+
+            harness.reopen_session_after_owner_loss().await.unwrap();
+            harness.reconcile().await.unwrap();
+            let notices = harness.take_compaction_notices();
+            assert_eq!(notices.len(), 1, "exact lost-reply recovery lost its notice");
+            let crate::Event::Compaction { actor: noticed_actor, notice } = &notices[0] else { panic!("wrong notice event"); };
+            assert_eq!(noticed_actor, &actor);
+            assert_eq!(notice.summary_id, accepted.summary_id);
+            assert!(!notice.text(noticed_actor).contains("private compact sidecar"));
+            assert!(harness.take_compaction_notices().is_empty());
             let retry = harness
                 .compact_controlled(Some(&actor), &CancellationToken::new())
                 .await
@@ -2394,6 +2403,10 @@ async fn manual_compact_reports_its_immutable_checkpoint_after_a_concurrent_adva
             )
             .await
             .unwrap();
+            memory.close().await.unwrap();
+            let memory = harness.memory.clone();
+            sibling.close().await.unwrap();
+            let sibling = memory.fixture_independent_driver_exchange().await.unwrap();
             let actor = harness.topology.parts[0].id.clone();
             let namespace = harness.namespace(&actor);
             let invalid = harness
@@ -2565,10 +2578,17 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
             )
             .await
             .unwrap();
+            memory.close().await.unwrap();
+            let memory = harness.memory.clone();
             let actor = harness.topology.parts[0].id.clone();
             let namespace = harness.namespace(&actor);
             let older_session = "shared-summary-older-session";
-            memory
+            memory.create_session(older_session, Mode::Ifs, "older shared policy").await.unwrap();
+            let (older, older_driver) = memory.bind_project_driver(&project_path).await.unwrap();
+            older_driver.select(kuru_memory::SessionDriverTarget::Catalog(Box::new(
+                memory.session_catalog_record(older_session).await.unwrap().unwrap()
+            ))).await.unwrap();
+            older
                 .append_session_message(
                     &namespace,
                     older_session,
@@ -2576,7 +2596,7 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
                 )
                 .await
                 .unwrap();
-            let first_source = memory
+            let first_source = older
                 .session_source_snapshot(&namespace, older_session, &namespace, 0, 1_024)
                 .await
                 .unwrap();
@@ -2595,7 +2615,7 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
                 invocation_id: "shared-summary-first-invocation".into(),
                 summary: "older usable summary A".into(),
             };
-            memory
+            older
                 .checkpoint_context_summary(&ContextSummaryCheckpoint {
                     record: first.clone(),
                     private_reasoning: vec![],
@@ -2629,7 +2649,7 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
                 result = &mut running => panic!("ordinary context ended before shared-window pause: {result:?}"),
             }
 
-            sibling
+            older
                 .append_session_message(
                     &namespace,
                     older_session,
@@ -2637,7 +2657,7 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
                 )
                 .await
                 .unwrap();
-            let next_source = sibling
+            let next_source = older
                 .session_source_snapshot(
                     &namespace,
                     older_session,
@@ -2647,7 +2667,7 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
                 )
                 .await
                 .unwrap();
-            sibling
+            older
                 .checkpoint_context_summary(&ContextSummaryCheckpoint {
                     record: ContextSummaryRecord {
                         source_revision: next_source.revision,
@@ -2672,6 +2692,8 @@ async fn ordinary_context_refuses_a_shared_summary_changed_after_its_window_read
             );
             assert!(provider.requests.lock().unwrap().is_empty());
             harness.shutdown(false).await.unwrap();
+            older_driver.close().await.unwrap();
+            older.close().await.unwrap();
             sibling.close().await.unwrap();
             memory.close().await.unwrap();
             kuru_memory::test_support::await_managed_quiescence(&options)
@@ -2722,6 +2744,10 @@ async fn ordinary_context_refuses_a_cursor_advanced_after_its_prior_summary_read
             )
             .await
             .unwrap();
+            memory.close().await.unwrap();
+            let memory = harness.memory.clone();
+            sibling.close().await.unwrap();
+            let sibling = memory.fixture_independent_driver_exchange().await.unwrap();
             let actor = harness.topology.parts[0].id.clone();
             let namespace = harness.namespace(&actor);
 

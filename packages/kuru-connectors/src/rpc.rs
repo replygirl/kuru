@@ -51,11 +51,21 @@ const GRACE: Duration = Duration::from_millis(300);
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
 
 enum Command {
-    Send(Value, oneshot::Sender<Result<()>>),
+    Send(
+        Value,
+        oneshot::Sender<Result<()>>,
+        Option<crate::InvocationHold>,
+    ),
     #[cfg(test)]
     Read(oneshot::Sender<Result<Value>>),
-    Request(String, Value, Duration, oneshot::Sender<Result<Value>>),
-    Close(oneshot::Sender<Result<()>>),
+    Request(
+        String,
+        Value,
+        Duration,
+        oneshot::Sender<Result<Value>>,
+        Option<crate::InvocationHold>,
+    ),
+    Close(oneshot::Sender<Result<()>>, Option<crate::InvocationHold>),
 }
 
 /// Handle for one serial session whose worker owns the process and pipes.
@@ -79,6 +89,7 @@ impl Rpc {
         }
     }
 
+    #[cfg(test)]
     pub fn spawn(
         program: &str,
         args: &[String],
@@ -86,6 +97,18 @@ impl Rpc {
         cwd: &Path,
         root_guard: Arc<Directory>,
         admission: Arc<Admission>,
+    ) -> Result<Self> {
+        Self::spawn_held(program, args, env, cwd, root_guard, admission, None)
+    }
+
+    pub(crate) fn spawn_held(
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+        root_guard: Arc<Directory>,
+        admission: Arc<Admission>,
+        hold: Option<crate::InvocationHold>,
     ) -> Result<Self> {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (ready, started) = oneshot::channel();
@@ -122,6 +145,7 @@ impl Rpc {
                     admission,
                     worker_stderr,
                     worker_completion,
+                    hold,
                 ));
             })
             .context("MCP worker thread failed")?;
@@ -141,9 +165,17 @@ impl Rpc {
     }
 
     pub async fn send(&mut self, message: Value) -> Result<()> {
+        self.send_held(message, None).await
+    }
+
+    pub(crate) async fn send_held(
+        &mut self,
+        message: Value,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.commands
-            .send(Command::Send(message, tx))
+            .send(Command::Send(message, tx, hold))
             .map_err(|_| anyhow::anyhow!("JSON-RPC session is closed"))?;
         rx.await.context("JSON-RPC send was cancelled")?
     }
@@ -163,9 +195,19 @@ impl Rpc {
         params: Value,
         duration: Duration,
     ) -> Result<Value> {
+        self.request_held(method, params, duration, None).await
+    }
+
+    pub(crate) async fn request_held(
+        &mut self,
+        method: &str,
+        params: Value,
+        duration: Duration,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<Value> {
         let (tx, rx) = oneshot::channel();
         self.commands
-            .send(Command::Request(method.into(), params, duration, tx))
+            .send(Command::Request(method.into(), params, duration, tx, hold))
             .map_err(|_| anyhow::anyhow!("JSON-RPC session is closed"))?;
         rx.await.context("JSON-RPC request was cancelled")?
     }
@@ -175,8 +217,12 @@ impl Rpc {
     }
 
     pub async fn close(&mut self) -> Result<()> {
+        self.close_held(None).await
+    }
+
+    pub(crate) async fn close_held(&mut self, hold: Option<crate::InvocationHold>) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        if self.commands.send(Command::Close(tx)).is_err() {
+        if self.commands.send(Command::Close(tx, hold)).is_err() {
             return self.completion.result();
         }
         match tokio::time::timeout(CLEANUP + GRACE + STDERR_DRAIN + Duration::from_secs(1), rx)
@@ -192,7 +238,7 @@ impl Rpc {
 impl Drop for Rpc {
     fn drop(&mut self) {
         let (tx, _) = oneshot::channel();
-        let _ = self.commands.send(Command::Close(tx));
+        let _ = self.commands.send(Command::Close(tx, None));
     }
 }
 
@@ -219,6 +265,7 @@ async fn worker(
     admission: Arc<Admission>,
     stderr: Arc<StdMutex<StderrTail>>,
     completion: Arc<Completion>,
+    hold: Option<crate::InvocationHold>,
 ) {
     let _finished = FinishOnDrop(completion.clone());
     let mut session = match Session::spawn(
@@ -253,22 +300,31 @@ async fn worker(
         session.finish(false).await;
         return;
     }
+    // Native startup is complete. Idle reusable transport ownership does not
+    // retain a prior session's drain barrier; each outstanding call owns its own.
+    drop(hold);
     while let Some(command) = commands.recv().await {
         let keep_running = match command {
-            Command::Send(value, mut reply) => {
+            Command::Send(value, mut reply, hold) => {
                 let result = session.dispatch(value, &mut reply).await;
-                settle(&mut session, reply, result).await
+                let keep_running = settle(&mut session, reply, result).await;
+                drop(hold);
+                keep_running
             }
             #[cfg(test)]
             Command::Read(mut reply) => {
                 let result = session.receive(&mut reply).await;
                 settle(&mut session, reply, result).await
             }
-            Command::Request(method, params, duration, mut reply) => {
+            Command::Request(method, params, duration, mut reply, hold) => {
                 let result = session.request(&method, params, duration, &mut reply).await;
-                settle(&mut session, reply, result).await
+                let keep_running = settle(&mut session, reply, result).await;
+                // Caller loss and unconfirmed cleanup retain the same worker
+                // through actual cleanup before releasing this exact hold.
+                drop(hold);
+                keep_running
             }
-            Command::Close(reply) => {
+            Command::Close(reply, hold) => {
                 commands.close();
                 let confirmed = session.cleanup(true).await;
                 let result = confirmed
@@ -278,6 +334,7 @@ async fn worker(
                 if !confirmed {
                     session.retain().await;
                 }
+                drop(hold);
                 false
             }
         };
@@ -922,7 +979,7 @@ mod tests {
         let mut context = Context::from_waker(&waker);
         assert!(matches!(result.as_mut().poll(&mut context), Poll::Pending));
 
-        rpc.commands.send(Command::Close(reply)).unwrap();
+        rpc.commands.send(Command::Close(reply, None)).unwrap();
         tokio::time::timeout(
             CLEANUP + GRACE + STDERR_DRAIN + Duration::from_secs(1),
             wake.notified.notified(),
@@ -1040,6 +1097,14 @@ mod tests {
 
     #[tokio::test]
     async fn worker_retains_cleanup_after_parent_runtime_loss() {
+        struct Hold(Arc<AtomicBool>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let hold: crate::InvocationHold = Arc::new(Hold(released.clone()));
         let script = StdioFixture::new([Step::Read, Step::HoldStderr(5_000), Step::Sleep(5_000)]);
         let command = script.command().to_owned();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -1067,7 +1132,7 @@ mod tests {
                     let _ = call
                         .lock()
                         .await
-                        .request("mutate", json!({}), IO_TIMEOUT)
+                        .request_held("mutate", json!({}), IO_TIMEOUT, Some(hold))
                         .await;
                 });
                 assert!(ready_tx.send(completion).is_ok());
@@ -1076,10 +1141,15 @@ mod tests {
         });
         let completion = ready_rx.await.unwrap();
         script.wait_for_requests(1).await;
+        assert!(
+            !released.load(Ordering::Acquire),
+            "outstanding native call released its session barrier"
+        );
         stop_tx.send(()).unwrap();
         runtime.join().unwrap();
         tokio::time::timeout(CLEANUP + Duration::from_secs(2), async {
-            while !completion.finished.load(Ordering::Acquire) {
+            while !completion.finished.load(Ordering::Acquire) || !released.load(Ordering::Acquire)
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })

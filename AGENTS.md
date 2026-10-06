@@ -80,11 +80,15 @@ publish in-memory topology/configuration only after persistence. Never kill a
 process or delete a held lock based on a stale PID or occupied port. The owned
 supervisor must reap Dolt before releasing its directory or lifecycle lease.
 Writable opens require ownership; attached inspection handles never control the
-owner's lifetime. Await command cleanup before releasing the project writer lease,
+owner's lifetime. Await command cleanup before releasing its native session lease,
 and hold the stable lifecycle lock through migration/recovery directory moves.
 Ordinary writable runtime opens attach to the checked private per-project memory
-service while retaining the single conversation-driver lease; concurrent session
-admission remains gated until session-scoped storage lands. Candidate inspection
+service. Distinct sessions may run concurrently; each session has one owner-checked
+driver and a native lease retained through local work and cleanup. Select a session
+atomically against its captured catalog without releasing the old claim first.
+Presence is connection-bound; owner loss cancels new dispatch and requires checked
+existing-store recovery before fresh admission. Accepted external effects remain
+uncertain until their existing outcome proves otherwise. Candidate inspection
 is bounded and read-only. Explicit candidate abandonment binds the inspected
 exact ref, base and head to its own typed request outcome; never promote, replay
 or abandon a candidate from missing or ambiguous evidence.

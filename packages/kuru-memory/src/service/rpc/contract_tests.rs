@@ -79,6 +79,56 @@ fn values() -> Vec<(String, Value)> {
     vec![("key".into(), json!({"value": true}))]
 }
 
+fn driver_proof() -> crate::SessionDriverProof {
+    crate::SessionDriverProof {
+        session_id: "session".into(),
+        claim_id: HANDLE,
+        service_generation: GENERATION.into(),
+    }
+}
+
+fn driver_targets() -> Vec<crate::SessionDriverTarget> {
+    vec![
+        crate::SessionDriverTarget::Absent("session".into()),
+        crate::SessionDriverTarget::Catalog(Box::new(crate::SessionCatalogRecord {
+            session_id: "session".into(),
+            mode: Mode::Ifs,
+            label: "label".into(),
+            created_order: 1,
+            updated_order: 2,
+            lifecycle_generation: 3,
+            lifecycle_state: crate::SessionLifecycleState::Active,
+            head_node_id: Some("head".into()),
+            pending_node_id: Some("pending".into()),
+            legacy_prefix: Some(crate::LegacyTranscriptPrefix {
+                namespace: "transcript".into(),
+                source_session_id: "source".into(),
+                source_revision: "revision".into(),
+                first_sequence: 1,
+                through_sequence: 2,
+                row_count: 2,
+                record_format: "legacy_prefix.v1".into(),
+            }),
+            fork_provenance: Some(crate::SessionForkProvenance {
+                source_session_id: "source".into(),
+                source_node_id: "node".into(),
+                source_turn_id: "turn".into(),
+                source_label: "source label".into(),
+                shares_current_project_memory: true,
+                record_format: "session_fork.v1".into(),
+            }),
+            record_format: "session_catalog.v1".into(),
+        })),
+    ]
+}
+
+fn driver_selection() -> crate::SessionDriverSelection {
+    crate::SessionDriverSelection {
+        expected: Some(driver_proof()),
+        target: driver_targets().remove(1),
+    }
+}
+
 fn reasoning_summary() -> crate::ReasoningSummaryRecord {
     crate::ReasoningSummaryRecord {
         session_id: "session".into(),
@@ -342,6 +392,20 @@ pub(super) fn service_call_samples() -> Result<Vec<ServiceCall>> {
     let export_cursor: ExportCursor =
         serde_json::from_value(json!({"snapshot": HANDLE, "phase": {"Messages": 1}}))?;
     Ok(vec![
+        ServiceCall::SelectSessionDriver {
+            selection: driver_selection(),
+        },
+        ServiceCall::SessionDriverOutcome {
+            original_id: HANDLE,
+            original_generation: GENERATION.into(),
+            selection: driver_selection(),
+        },
+        ServiceCall::ReattachSessionDriver {
+            original_id: HANDLE,
+            original_generation: GENERATION.into(),
+            selection: driver_selection(),
+        },
+        ServiceCall::LiveSessionDrivers,
         ServiceCall::RetireIfIdle,
         ServiceCall::TryAcquireDreamLease,
         ServiceCall::AppendMessage {
@@ -512,6 +576,10 @@ fn labelled_calls() -> Result<Vec<(String, ServiceCall)>> {
 
 /// Today's classification: (label, may_mutate, unit receipt method).
 const CLASSIFICATION: &[(&str, bool, Option<&str>)] = &[
+    ("select_session_driver", true, None),
+    ("session_driver_outcome", false, None),
+    ("reattach_session_driver", true, None),
+    ("live_session_drivers", false, None),
     ("retire_if_idle", true, None),
     ("try_acquire_dream_lease", false, None),
     ("append_message", true, Some("append_message")),
@@ -626,6 +694,8 @@ fn every_operation_keeps_its_pinned_classification() -> Result<()> {
 
 /// Mutating calls without a unit receipt, and the typed proof each keeps.
 const TYPED_PROOFS: &[(&str, Receipt)] = &[
+    ("select_session_driver", Receipt::None),
+    ("reattach_session_driver", Receipt::None),
     ("retire_if_idle", Receipt::None),
     ("begin_candidate", Receipt::CandidateCreation),
     ("promote_candidate", Receipt::CandidateTransition),
@@ -671,13 +741,16 @@ fn every_operation_contract_decides_receipt_and_reply_budget() -> Result<()> {
 }
 
 #[test]
-fn only_idle_retirement_mutates_without_a_durable_receipt() -> Result<()> {
+fn only_connection_resources_mutate_without_a_durable_receipt() -> Result<()> {
     for (label, call) in labelled_calls()? {
         let contract = call.contract();
         match (contract.mutation, contract.receipt) {
-            (Mutation::Write, Receipt::None) => assert_eq!(
-                label, "retire_if_idle",
-                "{label} mutates without a durable receipt; a lost reply could not be proven"
+            (Mutation::Write, Receipt::None) => assert!(
+                matches!(
+                    label.as_str(),
+                    "retire_if_idle" | "select_session_driver" | "reattach_session_driver"
+                ),
+                "{label} changes persistent data without a durable receipt"
             ),
             (Mutation::Read, Receipt::None) => {}
             (Mutation::Write, _) => {}
@@ -752,6 +825,27 @@ fn unknown_unit() -> Value {
 
 fn wire_enums() -> Result<Vec<(&'static str, Vec<String>)>> {
     Ok(vec![
+        (
+            "session_driver_target",
+            serde_variants::<crate::SessionDriverTarget>(
+                "SessionDriverTarget",
+                unknown_adjacent("expectation"),
+            )?,
+        ),
+        (
+            "session_driver_outcome",
+            serde_variants::<crate::SessionDriverOutcome>(
+                "SessionDriverOutcome",
+                unknown_adjacent("outcome"),
+            )?,
+        ),
+        (
+            "session_driver_refusal",
+            serde_variants::<crate::SessionDriverRefusal>(
+                "SessionDriverRefusal",
+                unknown_tag("refusal"),
+            )?,
+        ),
         (
             "service_call",
             serde_variants::<ServiceCall>("ServiceCall", unknown_tag("kind"))?,
@@ -1136,6 +1230,42 @@ fn wire_surface() -> Result<String> {
     }
     lines.push(String::new());
     let sets = [
+        (
+            "session_driver_target",
+            internal(&driver_targets(), "expectation")?,
+        ),
+        (
+            "session_driver_outcome",
+            internal(
+                &[
+                    crate::SessionDriverOutcome::InFlight,
+                    crate::SessionDriverOutcome::Selected(driver_proof()),
+                    crate::SessionDriverOutcome::NotSelected(Some(driver_proof())),
+                    crate::SessionDriverOutcome::StillUncertain,
+                ],
+                "outcome",
+            )?,
+        ),
+        (
+            "session_driver_refusal",
+            internal(
+                &[
+                    crate::SessionDriverRefusal::AlreadyDriven {
+                        session_id: "session".into(),
+                        claim_id: HANDLE,
+                    },
+                    crate::SessionDriverRefusal::Draining {
+                        session_id: "session".into(),
+                    },
+                    crate::SessionDriverRefusal::OldClaimChanged,
+                    crate::SessionDriverRefusal::CatalogChanged,
+                    crate::SessionDriverRefusal::Removed,
+                    crate::SessionDriverRefusal::NotDriven,
+                    crate::SessionDriverRefusal::SelectionNotAccepted,
+                ],
+                "refusal",
+            )?,
+        ),
         ("service_call", internal(&service_call_samples()?, "kind")?),
         (
             "view_operation",
@@ -1217,10 +1347,39 @@ fn wire_surface() -> Result<String> {
     for (name, shapes) in sets {
         sampled(name, shapes, variants(name)?, &mut lines)?;
     }
-    let request = ServiceRequest::with_id(GENERATION, HANDLE, ServiceCall::Revision);
+    let mut request = ServiceRequest::with_id(GENERATION, HANDLE, ServiceCall::Revision);
+    request.driver = Some(driver_proof());
     lines.push(format!(
         "envelope request {}",
         shape(&serde_json::to_value(&request)?)
+    ));
+    let hello = super::super::ClientHello {
+        version: super::super::ProtocolVersion {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+        },
+        project_path: vec![1, 2],
+        project_scope: "project".into(),
+        store_instance: "store".into(),
+        service_generation: GENERATION.into(),
+        connection_secret: "fixture-secret".into(),
+        // This sample pins the field's wire type, not a supported schema.
+        schema_version: 4,
+        starter_token: Some(HANDLE.to_string()),
+        client_id: Some(HANDLE),
+    };
+    lines.push(format!(
+        "envelope hello {}",
+        shape(&serde_json::to_value(hello)?)
+    ));
+    let live_driver = crate::LiveSessionDriver {
+        proof: driver_proof(),
+        age_millis: 1,
+        reserved: true,
+    };
+    lines.push(format!(
+        "projection live_session_driver {}",
+        shape(&serde_json::to_value(live_driver)?)
     ));
     let reply = ServiceReply {
         id: HANDLE,

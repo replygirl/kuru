@@ -2366,6 +2366,17 @@ async fn provider_free_undo_preserves_sessions_and_archives_added_identities() {
         let sessions = memory.get(&format!("{scope}/sessions")).await.unwrap();
         harness.shutdown(false).await.unwrap();
         drop(harness);
+        let (memory, driver) = memory.bind_project_driver(_directory.path()).await.unwrap();
+        driver
+            .select(kuru_memory::SessionDriverTarget::Catalog(Box::new(
+                memory
+                    .session_catalog_record(&session)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )))
+            .await
+            .unwrap();
 
         undo_dream(&config, &scope, &memory, Some(&session))
             .await
@@ -2392,6 +2403,8 @@ async fn provider_free_undo_preserves_sessions_and_archives_added_identities() {
                 .unwrap()
                 .active
         );
+        driver.close().await.unwrap();
+        memory.close().await.unwrap();
     })
     .await
 }

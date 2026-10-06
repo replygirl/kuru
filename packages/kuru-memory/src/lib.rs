@@ -10,6 +10,7 @@ mod progress;
 pub mod provision;
 pub mod server;
 pub mod service;
+mod session_driver;
 #[cfg(test)]
 mod spawn_gate;
 mod store;
@@ -17,8 +18,9 @@ mod store;
 pub use facade::{
     ActiveExportSnapshot, Candidate, CandidateReconciliation, CandidateReconciliationRecovery,
     CandidateReconciliationResolution, CandidateTransitionRecovery, CandidateTransitionResolution,
-    CandidateUnitRecovery, DreamLease, ExportCursor, ExportPage, MemoryStore, MemoryView,
-    SelectedAbandonResolution, SelectedAbandonUncertain, StateReadCut, UsageLedger,
+    CandidateUnitRecovery, DreamLease, DriverPresence, ExportCursor, ExportPage, MemoryStore,
+    MemoryView, SelectedAbandonResolution, SelectedAbandonUncertain, SessionDriver, StateReadCut,
+    UsageLedger,
 };
 pub use progress::{MemoryOpenProgress, MemoryOpenStage};
 pub use store::purge::PurgeOutcome;
@@ -28,17 +30,19 @@ pub use store::{
     ContextSummaryConfirmation, ContextSummaryCursor, ContextSummaryItem, ContextSummaryRecord,
     ContextSummaryStale, ContextSummaryWindow, ExportProvenance, FORK_PROVENANCE_RECORD_FORMAT,
     HistoryWindow, LEGACY_PREFIX_RECORD_FORMAT, LegacySessionTurnResume, LegacyTranscriptPrefix,
-    MAX_SESSION_LABEL_BYTES, MemoryStatus, OpenOptions, PUBLIC_TURN_RECORD_FORMAT,
-    ProjectStructure, PublicTranscriptCursor, PublicTranscriptEntry, PublicTranscriptPage,
-    PublicTranscriptPosition, PublicTurnKind, PublicTurnRecord, PublicTurnSettlement,
-    ReasoningSummaryConflict, ReasoningSummaryRecord, Revision, SESSION_CATALOG_RECORD_FORMAT,
-    SESSION_LIFECYCLE_OUTCOME_FORMAT, SequencedMessage, SessionCatalogCursor, SessionCatalogPage,
-    SessionCatalogRecord, SessionForkProvenance, SessionHistoryWindowAfter,
-    SessionLifecycleOutcome, SessionLifecycleRefusal, SessionLifecycleRejected,
-    SessionLifecycleState, SessionModeCheckpoint, SessionSourceSnapshot, SessionTurnCheckpoint,
-    SessionTurnRefusal, SessionTurnRejected, StorageRecord, StoredNote, UsageLedgerStateChanged,
-    UsageProof, context_summary_id, public_turn_continuation_node_id,
-    public_turn_legacy_continuation_node_id, public_turn_node_id,
+    LiveSessionDriver, MAX_SESSION_LABEL_BYTES, MemoryStatus, OpenOptions,
+    PUBLIC_TURN_RECORD_FORMAT, ProjectStructure, PublicTranscriptCursor, PublicTranscriptEntry,
+    PublicTranscriptPage, PublicTranscriptPosition, PublicTurnKind, PublicTurnRecord,
+    PublicTurnSettlement, ReasoningSummaryConflict, ReasoningSummaryRecord, Revision,
+    SESSION_CATALOG_RECORD_FORMAT, SESSION_LIFECYCLE_OUTCOME_FORMAT, SequencedMessage,
+    SessionCatalogCursor, SessionCatalogPage, SessionCatalogRecord, SessionDriverOutcome,
+    SessionDriverProof, SessionDriverRefusal, SessionDriverRejected, SessionDriverSelection,
+    SessionDriverTarget, SessionForkProvenance, SessionHistoryWindowAfter, SessionLifecycleOutcome,
+    SessionLifecycleRefusal, SessionLifecycleRejected, SessionLifecycleState,
+    SessionModeCheckpoint, SessionSourceSnapshot, SessionTurnCheckpoint, SessionTurnRefusal,
+    SessionTurnRejected, StorageRecord, StoredNote, UsageLedgerStateChanged, UsageProof,
+    context_summary_id, public_turn_continuation_node_id, public_turn_legacy_continuation_node_id,
+    public_turn_node_id,
 };
 pub use store::{
     MAX_STATE_BATCH_BYTES, MAX_STATE_BATCH_KEYS, StateExpectation, StateReadCursor, StateReadPage,

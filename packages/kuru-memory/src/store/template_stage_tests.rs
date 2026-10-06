@@ -59,6 +59,7 @@ async fn server_options(
 ) -> Result<ServerOptions> {
     let options = options(data_dir, scope)?;
     Ok(ServerOptions {
+        expected_instance: None,
         binary: crate::test_support::warm_runtime_cache().await?,
         directory: directory.to_owned(),
         project_scope: scope.to_owned(),

@@ -43,8 +43,34 @@ candidate branches stay outside this export. Use `kuru memory export` for the
 full current-memory snapshot. Historical rows without proven speaker or turn
 identity show unknown values; Kuru does not guess from current topology.
 
-P11 still allows one conversation driver per project. Concurrent drivers and
-live-session presence are covered by the separate concurrent-session work.
+You can run several Kuru instances in one project. Each ordinary fresh invocation
+creates a separate conversation, and those conversations share one memory owner.
+Only one instance can drive a given session. `--resume` and `--continue` refuse a
+session that is already driven; `--continue` does not silently select an older
+conversation instead. Refusal happens before provider setup and private context
+loading. Session listings and the terminal picker show safe live presence when
+attached to that owner; standalone inspection reports presence as unknown.
+
+Changing the selected conversation checks the captured catalog and transfers
+ownership together. A definite refusal keeps the previous conversation usable.
+If the reply is lost, Kuru fences new work until it can recover that exact
+selection; it does not guess which conversation won. Another instance cannot
+remove a driven session or change its label or fork it on that driver's behalf.
+
+Normal close and process exit release only that instance's connection-bound
+presence. The last client leaving causes the memory owner to stop and reap its
+database; no idle timer controls retirement. Locally owned work that is still
+being cleaned up keeps its native session barrier even if live presence has
+already disappeared. Such a session reports draining ownership rather than
+becoming available prematurely.
+
+If the memory owner is lost, Kuru cancels admitted local work and refuses new
+dispatch. Once actual cleanup finishes, explicitly use `/resume CURRENT_ID` or
+select that session in the picker to reopen the same existing store and acquire
+fresh ownership. An unresolved selection requires its exact outcome; if that
+outcome is unavailable, quit and restart rather than forcing ownership. Accepted
+external requests can remain uncertain: cancellation and process death do not
+promise rollback or prove that a remote operation stopped.
 
 Parts and relationships are shared by the project's sessions in each framework.
 Modeled-state reports are saved per identity, with the last accepted report for

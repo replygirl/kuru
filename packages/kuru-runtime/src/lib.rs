@@ -14,9 +14,9 @@ pub use bus::PeerMessage;
 pub use dream::{DreamProposal, DreamReport, undo_dream};
 pub use engine::{
     CancellationToken, ControlledTurnOutput, ForgetNoteResult,
-    HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER, Harness, INTERRUPTION_ROLE, INTERRUPTION_TEXT,
-    NotesView, ResponseOutcome, Session, SessionSummary, Topology, TurnInputMismatch, TurnOutput,
-    forget_note, project_scope, read_notes, turn_was_cancelled,
+    HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER, Harness, HarnessAdmission, INTERRUPTION_ROLE,
+    INTERRUPTION_TEXT, NotesView, ResponseOutcome, Session, SessionSummary, Topology,
+    TurnInputMismatch, TurnOutput, forget_note, project_scope, read_notes, turn_was_cancelled,
 };
 pub use event::{
     CompactionNotice, Event, HookObservation, StateReport, ToolObservation, ToolOutcome,

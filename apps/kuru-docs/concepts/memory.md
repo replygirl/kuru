@@ -98,8 +98,8 @@ refuse the upgraded store instead of downgrading it.
 Schema 5 retains physical session identity on new transcript and actor-history
 rows while leaving ambiguous legacy rows unattributed. It also adds strict
 context-summary and cursor records for bounded same-view compaction. Existing
-single conversation-driver admission remains active while later Phase 2 work
-integrates concurrent drivers. Policy-selected continuity already admits bounded
+session-scoped admission permits different conversations to run together while
+keeping one driver per session. Policy-selected continuity admits bounded
 same-actor current summaries from other sessions through own-history visibility,
 while keeping the current session's cursor and raw suffix separate. Older shared
 summaries are omitted whole when needed for model fit; foreign raw rows and

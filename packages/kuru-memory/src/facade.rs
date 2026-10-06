@@ -20,6 +20,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use uuid::Uuid;
 
 use crate::service::rpc::{CandidateTransitionKind, LedgerOperation, ViewOperation};
+mod driver;
 use crate::{
     ExportProvenance, HistoryWindow, MemoryOpenProgress, MemoryOpenStage, MemoryStatus,
     OpenOptions, Revision, StorageRecord, StoredNote,
@@ -27,6 +28,7 @@ use crate::{
     service::{self, AttachmentFactory, ServiceAttachment, ServiceCall, ServiceValue},
     store,
 };
+pub use driver::{DriverPresence, SessionDriver};
 
 #[derive(Clone)]
 pub struct MemoryStore {
@@ -390,6 +392,24 @@ impl std::fmt::Debug for MemoryStore {
 }
 
 impl RemoteSession {
+    /// Refresh checked endpoint authority while retaining this logical
+    /// client's identity and published-proof cell. The probe remains attached
+    /// until the identified connection is installed, so it cannot retire the
+    /// successor between the two checked handshakes.
+    async fn attach_for_recovery(&self) -> Result<ServiceAttachment> {
+        let mut probe = service::attach_or_start_existing(
+            &self.options,
+            &self.project,
+            &self.executable,
+            self.factory.store_instance(),
+        )
+        .await?;
+        let factory = probe.factory()?.for_checked_successor_of(&self.factory)?;
+        let attachment = factory.connect().await?;
+        probe.close();
+        Ok(attachment)
+    }
+
     /// A new session's main view. Its writable primary keeps a cancelled
     /// call's stream until a replacement has connected; a read-only primary
     /// never holds the owner and gets no replacement.
@@ -597,10 +617,10 @@ impl RemoteSession {
             pending.candidate_creation_id.is_none(),
             "candidate unit write requires typed candidate recovery before further mutation"
         );
-        let mut attachment =
-            service::attach_or_start(&self.options, &self.project, &self.executable)
-                .await
-                .context("connect for memory write outcome reconciliation")?;
+        let mut attachment = self
+            .attach_for_recovery()
+            .await
+            .context("connect for memory write outcome reconciliation")?;
         ensure!(
             attachment.store_instance() == self.factory.store_instance(),
             "memory store identity changed before write outcome reconciliation"
@@ -655,10 +675,10 @@ impl RemoteSession {
         let Some(creation_id) = pending.candidate_creation_id else {
             return Ok(None);
         };
-        let mut attachment =
-            service::attach_or_start(&self.options, &self.project, &self.executable)
-                .await
-                .context("connect for candidate unit outcome")?;
+        let mut attachment = self
+            .attach_for_recovery()
+            .await
+            .context("connect for candidate unit outcome")?;
         ensure!(
             attachment.store_instance() == self.factory.store_instance(),
             "memory store identity changed before candidate unit outcome"
@@ -754,10 +774,10 @@ impl RemoteSession {
             .map_err(|_| anyhow::anyhow!("memory pending usage proof is poisoned"))?
             .clone()
             .context("memory service has no pending usage proof")?;
-        let mut attachment =
-            service::attach_or_start(&self.options, &self.project, &self.executable)
-                .await
-                .context("connect for usage outcome reconciliation")?;
+        let mut attachment = self
+            .attach_for_recovery()
+            .await
+            .context("connect for usage outcome reconciliation")?;
         ensure!(
             attachment.store_instance() == self.factory.store_instance(),
             "memory store identity changed before usage outcome reconciliation"
@@ -806,10 +826,10 @@ impl RemoteSession {
         let Some(pending) = pending else {
             return Ok(None);
         };
-        let mut attachment =
-            service::attach_or_start(&self.options, &self.project, &self.executable)
-                .await
-                .context("connect for candidate transition outcome")?;
+        let mut attachment = self
+            .attach_for_recovery()
+            .await
+            .context("connect for candidate transition outcome")?;
         ensure!(
             attachment.store_instance() == self.factory.store_instance(),
             "memory store identity changed before candidate transition outcome"
@@ -950,10 +970,10 @@ impl RemoteSession {
         let Some(pending) = pending else {
             return Ok(None);
         };
-        let mut attachment =
-            service::attach_or_start(&self.options, &self.project, &self.executable)
-                .await
-                .context("connect for selected candidate abandonment outcome")?;
+        let mut attachment = self
+            .attach_for_recovery()
+            .await
+            .context("connect for selected candidate abandonment outcome")?;
         ensure!(
             attachment.store_instance() == self.factory.store_instance(),
             "memory store identity changed before selected abandonment outcome"
@@ -1015,10 +1035,10 @@ impl RemoteSession {
         let Some(pending) = pending else {
             return Ok(None);
         };
-        let mut attachment =
-            service::attach_or_start(&self.options, &self.project, &self.executable)
-                .await
-                .context("connect for candidate creation outcome")?;
+        let mut attachment = self
+            .attach_for_recovery()
+            .await
+            .context("connect for candidate creation outcome")?;
         ensure!(
             attachment.store_instance() == self.factory.store_instance(),
             "memory store identity changed before candidate creation outcome"
@@ -1106,10 +1126,10 @@ impl RemoteSession {
             pending.branch == branch && pending.from == from && pending.live == live,
             "candidate reconciliation recovery does not match the original tuple"
         );
-        let mut attachment =
-            service::attach_or_start(&self.options, &self.project, &self.executable)
-                .await
-                .context("connect for candidate reconciliation outcome")?;
+        let mut attachment = self
+            .attach_for_recovery()
+            .await
+            .context("connect for candidate reconciliation outcome")?;
         ensure!(
             attachment.store_instance() == self.factory.store_instance(),
             "memory store identity changed before reconciliation recovery"
@@ -1625,6 +1645,44 @@ impl MemoryStore {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    /// A separate fixture exchange owner for the same authenticated driver.
+    /// No claim is minted and no pending mutation is transferred.
+    pub async fn fixture_independent_driver_exchange(&self) -> Result<Self> {
+        let backend = match &self.backend {
+            Backend::Local(store) => {
+                ensure!(
+                    store.owns_session_presence() && store.pinned_view() == "main",
+                    "fixture exchange requires writable live memory"
+                );
+                self.reconcile().await?;
+                Backend::Local(store.clone())
+            }
+            Backend::Remote(remote) => {
+                ensure!(
+                    !remote.read_only && remote.candidate.is_none() && remote.pinned_view == "main",
+                    "fixture exchange requires writable live memory"
+                );
+                remote.ensure_writable()?;
+                ensure!(
+                    remote.attachment.lock().await.has_complete_exchange(),
+                    "fixture exchange requires a settled attachment"
+                );
+                let attachment = remote.session.factory.connect().await?;
+                Backend::Remote(RemoteSession::new_view(
+                    attachment,
+                    remote.session.options.clone(),
+                    remote.session.project.clone(),
+                    remote.session.executable.clone(),
+                )?)
+            }
+        };
+        Ok(Self {
+            backend,
+            ..self.clone()
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn fixture_pause_next_service_reply(
         &self,
         barrier: &crate::test_support::ReplyBarrier,
@@ -1767,10 +1825,7 @@ impl MemoryStore {
         session.drain().await?;
         let attachment = match session.take_successor() {
             Some(attachment) => attachment,
-            None => {
-                service::attach_or_start(&session.options, &session.project, &session.executable)
-                    .await?
-            }
+            None => session.attach_for_recovery().await?,
         };
         ensure!(
             attachment.store_instance() == session.factory.store_instance(),
@@ -2401,10 +2456,11 @@ impl MemoryStore {
                     // Ownership acquisition must precede exact uncertain-write
                     // recovery. It does not authorize a mutation or clear that
                     // view's fence; the dedicated attachment owns only the lease.
-                    let attachment = service::attach_or_start(
+                    let attachment = service::attach_or_start_existing(
                         &remote.session.options,
                         &remote.session.project,
                         &remote.session.executable,
+                        remote.session.factory.store_instance(),
                     )
                     .await?;
                     ensure!(
@@ -2855,7 +2911,7 @@ impl MemoryStore {
     pub async fn begin_candidate(&self, label: &str) -> Result<Candidate> {
         match &self.backend {
             Backend::Local(store) => Ok(Candidate {
-                backend: CandidateBackend::Local(store.begin_candidate(label).await?),
+                backend: CandidateBackend::Local(Box::new(store.begin_candidate(label).await?)),
                 #[cfg(any(test, feature = "test-support"))]
                 reject_next_state_write: Arc::new(AtomicBool::new(
                     self.reject_next_state_write.swap(false, Ordering::AcqRel),
@@ -3091,7 +3147,7 @@ pub struct Candidate {
 
 #[derive(Clone, Debug)]
 enum CandidateBackend {
-    Local(store::Candidate),
+    Local(Box<store::Candidate>),
     Remote(RemoteCandidate),
 }
 
@@ -3113,6 +3169,121 @@ impl std::fmt::Debug for RemoteCandidate {
 }
 
 impl Candidate {
+    /// Refresh this retained candidate's attachment only at a checked exact
+    /// head. This reads its original creation outcome; it neither creates a
+    /// candidate nor resolves a pending mutation or transition.
+    pub async fn reattach_checked(&self, expected_head: &str) -> Result<Self> {
+        store::validate_reconciliation_heads(expected_head, expected_head)?;
+        match &self.backend {
+            CandidateBackend::Local(_) => {
+                ensure!(
+                    self.view().revision().await? == expected_head,
+                    "retained candidate head changed before reattachment"
+                );
+                Ok(self.clone())
+            }
+            CandidateBackend::Remote(candidate) => {
+                let session = &candidate.view.session;
+                let creation_id = candidate
+                    .view
+                    .candidate_creation_id
+                    .context("retained candidate lost its creation identity")?;
+                let generation = candidate
+                    .view
+                    .attachment
+                    .lock()
+                    .await
+                    .generation()
+                    .to_owned();
+                let _mutation = session.mutations.lock().await;
+                if session.closed.load(Ordering::Acquire) {
+                    ensure!(
+                        session.checked_successor_rebind.load(Ordering::Acquire),
+                        "closed candidate has no checked successor recovery"
+                    );
+                    ensure!(
+                        session
+                            .pending_unit
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("pending unit unavailable"))?
+                            .is_none()
+                            && session
+                                .pending_candidate
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("pending candidate unavailable"))?
+                                .is_none()
+                            && session
+                                .pending_ledger
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("pending ledger unavailable"))?
+                                .is_none()
+                            && session
+                                .pending_transition
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("pending transition unavailable"))?
+                                .is_none()
+                            && session
+                                .pending_reconciliation
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("pending reconciliation unavailable"))?
+                                .is_none()
+                            && session
+                                .pending_selected_abandon
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("pending abandonment unavailable"))?
+                                .is_none(),
+                        "candidate needs its exact pending outcome before reattachment"
+                    );
+                } else {
+                    session.ensure_mutation_allowed()?;
+                }
+                let mut attachment = session.attach_for_recovery().await?;
+                let ServiceValue::CandidateOutcome(service::rpc::CandidateCreationOutcome::Open {
+                    handle,
+                    base,
+                    branch,
+                }) = attachment
+                    .call(ServiceCall::CandidateOutcome {
+                        original_id: creation_id,
+                        original_generation: generation,
+                    })
+                    .await?
+                else {
+                    bail!("retained candidate creation outcome is not an exact open ref");
+                };
+                ensure!(
+                    base == candidate.base && branch == candidate.view.pinned_view,
+                    "retained candidate identity changed before reattachment"
+                );
+                let ServiceValue::Revision(head) = attachment
+                    .call(ServiceCall::View {
+                        candidate: Some(handle),
+                        operation: Box::new(ViewOperation::Revision),
+                    })
+                    .await?
+                else {
+                    bail!("candidate reattachment returned the wrong revision response")
+                };
+                ensure!(
+                    head == expected_head,
+                    "retained candidate head changed before reattachment"
+                );
+                let view = RemoteSession::new_candidate_view(
+                    attachment,
+                    session.options.clone(),
+                    session.project.clone(),
+                    session.executable.clone(),
+                    (handle, creation_id, branch),
+                )?;
+                Ok(Self {
+                    backend: CandidateBackend::Remote(RemoteCandidate { view, handle, base }),
+                    #[cfg(any(test, feature = "test-support"))]
+                    reject_next_state_write: self.reject_next_state_write.clone(),
+                })
+            }
+        }
+    }
+
     /// Merge one captured live revision into this exact private head. Ordinary
     /// promotion still requires its returned head/base and a fresh handle.
     pub async fn reconcile_with_live(
@@ -3129,7 +3300,7 @@ impl Candidate {
                 Ok(CandidateReconciliation {
                     result,
                     candidate: fresh.map(|candidate| Candidate {
-                        backend: CandidateBackend::Local(candidate),
+                        backend: CandidateBackend::Local(Box::new(candidate)),
                         #[cfg(any(test, feature = "test-support"))]
                         reject_next_state_write: Arc::new(AtomicBool::new(false)),
                     }),
@@ -3227,7 +3398,7 @@ impl Candidate {
                 Ok(Some(CandidateReconciliationRecovery {
                     resolution,
                     candidate: Candidate {
-                        backend: CandidateBackend::Local(fresh),
+                        backend: CandidateBackend::Local(Box::new(fresh)),
                         #[cfg(any(test, feature = "test-support"))]
                         reject_next_state_write: Arc::new(AtomicBool::new(false)),
                     },
@@ -4373,6 +4544,17 @@ mod tests {
                         memory
                             .create_session(session, Mode::Ifs, "fork parent")
                             .await?;
+                        let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                        memory.close().await?;
+                        let memory = claimed;
+                        driver
+                            .select(crate::SessionDriverTarget::Catalog(Box::new(
+                                memory
+                                    .session_catalog_record(session)
+                                    .await?
+                                    .context("fixture session catalog")?,
+                            )))
+                            .await?;
                         memory
                             .checkpoint_session_turn(
                                 &namespace,
@@ -4548,6 +4730,7 @@ mod tests {
                         );
                         candidate.abandon().await?;
 
+                        driver.close().await?;
                         memory.close().await?;
                         sibling.close().await?;
                         Ok::<(), anyhow::Error>(())
@@ -4612,6 +4795,12 @@ mod tests {
                 let sibling = open().await?;
                 let session = "managed-mode";
                 memory.create_session(session, Mode::Ifs, "").await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record(session).await?.context("fixture session catalog")?
+                ))).await?;
                 let before = memory.revision().await?;
                 let namespace = format!("{scope}/transcript/{session}");
                 let state_key = format!("{scope}/session/{session}");
@@ -4744,6 +4933,7 @@ mod tests {
                         .is_empty(),
                     "mode checkpoint fabricated a public turn"
                 );
+                driver.close().await?;
                 memory.close().await?;
                 sibling.close().await?;
                 Ok::<(), anyhow::Error>(())
@@ -4811,6 +5001,12 @@ mod tests {
                         memory
                             .create_session("managed-turn", Mode::Ifs, "")
                             .await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record("managed-turn").await?.context("fixture session catalog")?
+                ))).await?;
                         let Backend::Remote(remote) = &memory.backend else {
                             bail!("managed turn fixture did not attach to the service")
                         };
@@ -4962,6 +5158,7 @@ mod tests {
                             "managed public turn duplicated its raw transcript"
                         );
 
+                        driver.select(crate::SessionDriverTarget::Absent("candidate-turn".into())).await?;
                         let candidate = memory.begin_candidate("public turn candidate").await?;
                         candidate
                             .view()
@@ -4998,6 +5195,9 @@ mod tests {
                             "candidate public-turn admission leaked into main"
                         );
                         candidate.abandon().await?;
+                        driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                            memory.session_catalog_record("managed-turn").await?.context("main session catalog")?
+                        ))).await?;
 
                         memory
                             .checkpoint_session_turn(
@@ -5181,7 +5381,8 @@ mod tests {
                             "older continuation changed the fork's settled prefix"
                         );
 
-                        memory.close().await?;
+                        driver.close().await?;
+                memory.close().await?;
                         sibling.close().await?;
                         Ok::<(), anyhow::Error>(())
                     }
@@ -5314,6 +5515,12 @@ mod tests {
                         };
                         let memory = open().await?;
                         let sibling = open().await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record("legacy-managed").await?.context("fixture session catalog")?
+                ))).await?;
                         let barrier = crate::test_support::ReplyBarrier::default();
                         memory.fixture_pause_next_service_reply(&barrier).await?;
                         let resume = tokio::spawn({
@@ -5385,7 +5592,8 @@ mod tests {
                             "legacy continuation duplicated its retained user row"
                         );
 
-                        memory.close().await?;
+                        driver.close().await?;
+                memory.close().await?;
                         sibling.close().await?;
                         Ok::<(), anyhow::Error>(())
                     }
@@ -6287,6 +6495,13 @@ mod tests {
                 };
                 let memory = open().await?;
                 let sibling = open().await?;
+                memory.create_session("session", Mode::Ifs, "fixture").await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record("session").await?.context("fixture session catalog")?
+                ))).await?;
                 let Backend::Remote(remote) = &memory.backend else {
                     bail!("reasoning summary fixture did not attach to the managed service")
                 };
@@ -6366,6 +6581,7 @@ mod tests {
                 later.summary_index = 1;
                 later.text = "later settled private summary".into();
                 memory.put_reasoning_summaries(&[later]).await?;
+                driver.close().await?;
                 memory.close().await?;
                 sibling.close().await?;
                 Ok::<(), anyhow::Error>(())
@@ -6427,6 +6643,13 @@ mod tests {
                 };
                 let memory = open().await?;
                 let inspector = open().await?;
+                memory.create_session("session-a", Mode::Ifs, "fixture").await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record("session-a").await?.context("fixture session catalog")?
+                ))).await?;
                 let actor = "project/example/ifs/identity/actor";
                 memory
                     .append_message(actor, &Message::text("user", "legacy"))
@@ -6784,6 +7007,7 @@ mod tests {
                     "candidate row leaked into main session history"
                 );
                 candidate.abandon().await?;
+                driver.close().await?;
                 memory.close().await?;
                 inspector.close().await?;
                 Ok::<(), anyhow::Error>(())
@@ -8671,6 +8895,8 @@ mod tests {
                 &mut events,
                 &[
                     AttachmentAccepted { active: 2 },
+                    AttachmentAccepted { active: 3 },
+                    AttachmentJoined { remaining: 2 },
                     AttachmentJoined { remaining: 1 },
                 ],
             )
@@ -9149,7 +9375,15 @@ mod tests {
                     memory.reconcile().await? == Some(true),
                     "the successor did not prove the pending write"
                 );
-                expect_serve_events(&mut events, &[AttachmentAccepted { active: 1 }]).await?;
+                expect_serve_events(
+                    &mut events,
+                    &[
+                        AttachmentAccepted { active: 1 },
+                        AttachmentAccepted { active: 2 },
+                        AttachmentJoined { remaining: 1 },
+                    ],
+                )
+                .await?;
                 expect_no_serve_event(&mut events, "a successor after checked recovery")?;
                 if reopen {
                     let reopened = memory
@@ -9208,7 +9442,15 @@ mod tests {
                 ..
             } = retire_with_pending_write(&options, &project, gate).await?;
             ensure!(memory.reconcile().await? == Some(true));
-            expect_serve_events(&mut events, &[AttachmentAccepted { active: 1 }]).await?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentAccepted { active: 1 },
+                    AttachmentAccepted { active: 2 },
+                    AttachmentJoined { remaining: 1 },
+                ],
+            )
+            .await?;
             // The kept attachment counts: another client is not the sole one.
             let other = open_retiring(&options, &project).await?;
             expect_serve_events(&mut events, &[AttachmentAccepted { active: 2 }]).await?;

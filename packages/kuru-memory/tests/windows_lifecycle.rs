@@ -35,6 +35,7 @@ fn environment() -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
 
 fn options(root: &Path, binary: PathBuf) -> ServerOptions {
     ServerOptions {
+        expected_instance: None,
         binary,
         directory: root.join("store café 東京"),
         project_scope: "native-owner-fixture".into(),
@@ -194,6 +195,7 @@ async fn marker_rows(
     expected_revision: &str,
 ) -> Result<()> {
     let server = Server::open(ServerOptions {
+        expected_instance: None,
         binary: binary.to_owned(),
         directory: directory.to_owned(),
         project_scope: options.project_scope.clone(),

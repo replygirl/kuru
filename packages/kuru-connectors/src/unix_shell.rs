@@ -460,7 +460,6 @@ impl ShellRegistry {
         }
     }
 
-    #[cfg(test)]
     pub(crate) async fn execute<F>(
         &self,
         root_guard: Arc<Directory>,
@@ -487,6 +486,66 @@ impl ShellRegistry {
         duration: Duration,
         environment: F,
         progress: Option<crate::ShellProgress>,
+    ) -> Result<String>
+    where
+        F: FnOnce() -> Vec<(std::ffi::OsString, std::ffi::OsString)>
+            + Send
+            + 'static
+            + std::panic::UnwindSafe,
+    {
+        self.execute_with_progress_and_lifetime(
+            root_guard,
+            root,
+            command,
+            duration,
+            environment,
+            progress,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_held<F>(
+        &self,
+        root_guard: Arc<Directory>,
+        root: PathBuf,
+        command: String,
+        duration: Duration,
+        environment: F,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<String>
+    where
+        F: FnOnce() -> Vec<(std::ffi::OsString, std::ffi::OsString)>
+            + Send
+            + 'static
+            + std::panic::UnwindSafe,
+    {
+        self.execute_with_progress_and_lifetime(
+            root_guard,
+            root,
+            command,
+            duration,
+            environment,
+            None,
+            hold,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "native worker captures reviewed root, bounded command, private preview and immutable ownership independently"
+    )]
+    pub(crate) async fn execute_with_progress_and_lifetime<F>(
+        &self,
+        root_guard: Arc<Directory>,
+        root: PathBuf,
+        command: String,
+        duration: Duration,
+        environment: F,
+        progress: Option<crate::ShellProgress>,
+        hold: Option<crate::InvocationHold>,
     ) -> Result<String>
     where
         F: FnOnce() -> Vec<(std::ffi::OsString, std::ffi::OsString)>
@@ -533,6 +592,7 @@ impl ShellRegistry {
         let weak = Arc::downgrade(&self.inner);
         let request = WorkerRequest {
             root_guard,
+            hold,
             root,
             command,
             environment: Box::new(environment),
@@ -735,6 +795,7 @@ impl Drop for ShellRegistry {
 
 struct WorkerRequest {
     root_guard: Arc<Directory>,
+    hold: Option<crate::InvocationHold>,
     root: PathBuf,
     command: String,
     environment: Box<
@@ -755,6 +816,7 @@ struct WorkerRequest {
 fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request: WorkerRequest) {
     let WorkerRequest {
         root_guard,
+        hold: _hold,
         root,
         command,
         environment,
@@ -1725,6 +1787,14 @@ mod tests {
 
     #[test]
     fn retained_owner_holds_process_wide_admission_across_dropped_registries() {
+        struct Hold(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hold: crate::InvocationHold = Arc::new(Hold(released.clone()));
         let root = tempfile::tempdir().unwrap();
         let admission = Arc::new(ShellAdmission::new(1));
         let registry = ShellRegistry::with_admission(admission.clone());
@@ -1737,12 +1807,13 @@ mod tests {
             .unwrap();
 
         let error = runtime
-            .block_on(registry.execute(
+            .block_on(registry.execute_held(
                 retained_root(root.path()),
                 root.path().to_path_buf(),
                 "exec sleep 5".into(),
                 Duration::from_millis(25),
                 Vec::new,
+                Some(hold),
             ))
             .unwrap_err();
         assert_eq!(registry.test_hooks.launches(), 1);
@@ -1760,8 +1831,13 @@ mod tests {
             .expect("retained owner did not begin its retained cleanup");
         });
         assert_eq!(admission.in_use(), 1);
+        assert!(
+            !released.load(Ordering::Acquire),
+            "unconfirmed worker released its session barrier"
+        );
 
         drop(registry);
+        assert!(!released.load(Ordering::Acquire));
         let later_registry = ShellRegistry::with_admission(admission.clone());
         let overload = runtime
             .block_on(later_registry.execute(
@@ -1778,7 +1854,7 @@ mod tests {
         retained_cleanup.release();
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(2), async {
-                while admission.in_use() != 0 {
+                while admission.in_use() != 0 || !released.load(Ordering::Acquire) {
                     sleep(OBSERVE_INTERVAL).await;
                 }
             })

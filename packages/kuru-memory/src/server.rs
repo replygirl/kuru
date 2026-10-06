@@ -177,6 +177,9 @@ pub(crate) fn close_budget() -> Duration {
 
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
+    /// Existing-client startup is checked again by the owning supervisor
+    /// while its lifecycle lease is held, before identity or database creation.
+    pub expected_instance: Option<String>,
     pub binary: PathBuf,
     pub directory: PathBuf,
     pub project_scope: String,
@@ -422,6 +425,8 @@ struct Endpoint {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_instance: Option<String>,
     binary: PathBuf,
     directory: PathBuf,
     project_scope: String,
@@ -598,12 +603,18 @@ impl Server {
             !options.project_scope.is_empty() && options.project_scope.len() <= 4096,
             "invalid memory project scope"
         );
-        prepare_directory(&options.directory, options.read_only)
-            .context("prepare private memory directory before startup")?;
+        prepare_directory(
+            &options.directory,
+            options.read_only || options.expected_instance.is_some(),
+        )
+        .context("prepare private memory directory before startup")?;
         let directory = fs::canonicalize(&options.directory)
             .context("resolve private memory directory before startup")?;
         LifecycleLease::validate_root(&directory, options.lifecycle_root.as_deref())
             .context("validate memory lifecycle directory before startup")?;
+        if let Some(expected) = &options.expected_instance {
+            require_existing_instance(&directory, &options.project_scope, expected)?;
+        }
         if let Some(identity) = load_identity(&directory, &options.project_scope)
             .context("read memory identity before supervisor startup")?
         {
@@ -631,6 +642,7 @@ impl Server {
         }
 
         let request = Request {
+            expected_instance: options.expected_instance.clone(),
             binary: options.binary.clone(),
             directory: directory.clone(),
             project_scope: options.project_scope.clone(),
@@ -1835,6 +1847,26 @@ fn load_identity(directory: &Path, project_scope: &str) -> Result<Option<Identit
     Ok(identity)
 }
 
+/// The caller holds the store's startup lock through this check and open.
+/// Missing or replaced identity is refusal, never permission to create it.
+pub(crate) fn require_existing_instance(
+    directory: &Path,
+    project_scope: &str,
+    expected: &str,
+) -> Result<()> {
+    ensure!(
+        Uuid::parse_str(expected)?.to_string() == expected,
+        "invalid expected memory instance"
+    );
+    let identity = load_identity(directory, project_scope)?
+        .context("the previous memory store is absent; this client cannot initialize it")?;
+    ensure!(
+        identity.instance == expected && identity.initialized,
+        "memory store identity changed; this client cannot open a replacement"
+    );
+    Ok(())
+}
+
 fn validate_identity(identity: &Identity) -> Result<()> {
     ensure!(identity.version == 1, "memory project identity mismatch");
     Uuid::parse_str(&identity.instance).context("invalid memory instance identity")?;
@@ -2938,7 +2970,10 @@ async fn supervise_with_port_hook<
         request.timeout_millis > 0 && request.timeout_millis <= 300_000,
         "invalid supervisor startup timeout"
     );
-    prepare_directory(&request.directory, request.read_only)?;
+    prepare_directory(
+        &request.directory,
+        request.read_only || request.expected_instance.is_some(),
+    )?;
     ensure!(
         fs::canonicalize(&request.directory)? == request.directory,
         "memory directory must be canonical"
@@ -2981,6 +3016,9 @@ async fn supervise_with_port_hook<
             }
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
+    }
+    if let Some(expected) = &request.expected_instance {
+        require_existing_instance(&request.directory, &request.project_scope, expected)?;
     }
     let mut identity = match load_identity(&request.directory, &request.project_scope)? {
         Some(identity) => identity,
@@ -3781,6 +3819,7 @@ pub(crate) mod adoption_fault {
     /// records the stage's quiescence itself.
     pub(crate) async fn supervise_once(options: &ServerOptions, fault: Fault) -> Result<Outcome> {
         let request = Request {
+            expected_instance: None,
             binary: options.binary.clone(),
             directory: fs::canonicalize(&options.directory)?,
             project_scope: options.project_scope.clone(),

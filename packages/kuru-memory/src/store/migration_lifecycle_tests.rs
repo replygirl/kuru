@@ -91,6 +91,7 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
         let _gate = crate::spawn_gate::spawning().await;
         Server::open_with_guard(
             ServerOptions {
+                expected_instance: None,
                 binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt"))
                     .await?,
                 directory: directory.clone(),
@@ -228,6 +229,7 @@ async fn inspection_owned_old_schema_blocks_writer_without_mutation() -> Result<
     super::tests::released_v1(&options).await?;
     let directory = project_directory(&options.data_dir, &scope)?;
     let inspector = Server::open(ServerOptions {
+        expected_instance: None,
         binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?,
         directory,
         project_scope: scope,

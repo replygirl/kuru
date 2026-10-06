@@ -400,6 +400,7 @@ async fn framing_is_bounded_and_diagnostics_keep_only_a_tail() -> Result<()> {
 async fn supervisor_rejects_bad_configuration_and_parent_eof_without_spawning() -> Result<()> {
     let root = fixture()?;
     let request = || Request {
+        expected_instance: None,
         binary: "/unexecuted".into(),
         directory: fs::canonicalize(root.path()).expect("fixture canonical path"),
         project_scope: "project/test".into(),
@@ -450,6 +451,7 @@ async fn supervisor_rejects_bad_configuration_and_parent_eof_without_spawning() 
 async fn open_rejects_invalid_options_before_executable_lookup() -> Result<()> {
     let root = fixture()?;
     let options = || ServerOptions {
+        expected_instance: None,
         binary: "/unexecuted".into(),
         directory: root.path().to_path_buf(),
         project_scope: "project/test".into(),
@@ -552,6 +554,7 @@ async fn waiting_supervisor_refuses_recreated_stage_after_original_lock_moves() 
     private_directory(&stage)?;
     let owner = Server::quiescence(&stage, Duration::from_secs(1)).await?;
     let request = Request {
+        expected_instance: None,
         binary: "/unexecuted".into(),
         directory: stage.clone(),
         project_scope: "project/test".into(),
@@ -601,6 +604,7 @@ async fn closing_an_attached_handle_does_not_establish_quiescence() -> Result<()
         crate::provision::provision(&config, &crate::store::test_cache()).await?
     };
     let options = ServerOptions {
+        expected_instance: None,
         binary,
         directory: directory.clone(),
         project_scope: "project/test".into(),
@@ -649,6 +653,7 @@ async fn closing_an_attached_handle_does_not_establish_quiescence() -> Result<()
 
 fn collision_request(root: &Path, binary: PathBuf) -> Result<Request> {
     Ok(Request {
+        expected_instance: None,
         binary,
         directory: fs::canonicalize(root)?.join("collision-memory"),
         project_scope: "project/selected-port-collision".into(),
@@ -1350,6 +1355,7 @@ async fn supervisor_readiness_deadline_names_its_part() -> Result<()> {
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
     let directory = root.path().join("store");
     let options = ServerOptions {
+        expected_instance: None,
         binary: "/unexecuted".into(),
         directory: directory.clone(),
         project_scope: "project/silent".into(),

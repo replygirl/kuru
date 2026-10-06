@@ -796,6 +796,7 @@ async fn opening_first_acquire_outlasting_the_floor_is_one_working_session() -> 
     let server = {
         let _gate = crate::spawn_gate::spawning().await;
         crate::server::Server::open(crate::server::ServerOptions {
+            expected_instance: None,
             binary,
             directory: root.path().join("opening-first-acquire"),
             project_scope: "project/opening-first-acquire".into(),

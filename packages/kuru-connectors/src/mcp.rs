@@ -893,16 +893,33 @@ impl McpHosts {
     }
 
     pub(crate) async fn catalog(&self) -> Result<McpCatalog> {
-        self.catalog_selected(None).await
+        self.catalog_selected_held(None, None).await
+    }
+
+    pub(crate) async fn catalog_held(
+        &self,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<McpCatalog> {
+        self.catalog_selected_held(None, hold).await
     }
 
     async fn catalog_selected(&self, selected: Option<&str>) -> Result<McpCatalog> {
+        self.catalog_selected_held(selected, None).await
+    }
+
+    async fn catalog_selected_held(
+        &self,
+        selected: Option<&str>,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<McpCatalog> {
         ensure_open(&self.admission)?;
-        let discoveries =
-            self.clients
-                .iter()
-                .filter(|(alias, _)| selected.is_none_or(|selected| alias.as_str() == selected))
-                .map(|(alias, client)| async move {
+        let discoveries = self
+            .clients
+            .iter()
+            .filter(|(alias, _)| selected.is_none_or(|selected| alias.as_str() == selected))
+            .map(|(alias, client)| {
+                let hold = hold.clone();
+                async move {
                     let mut state = client.state.lock().await;
                     ensure_open(&self.admission)?;
                     let mut disable = DisableOnDrop::new(&client.available);
@@ -932,7 +949,7 @@ impl McpHosts {
                     {
                         Ok(headers) => headers,
                         Err(error) => {
-                            let _ = close_transport(&mut state).await;
+                            let _ = close_transport_held(&mut state, hold.clone()).await;
                             self.routes
                                 .write()
                                 .await
@@ -954,7 +971,14 @@ impl McpHosts {
                     let cached = self.load_cache(alias, context).await;
                     let mut cache_invalid = cached.is_err();
                     let mut cached = cached.ok().flatten();
-                    let mut listed = client.list(&mut state, headers.clone()).await;
+                    let mut listed = match &hold {
+                        Some(hold) => {
+                            client
+                                .list_held(&mut state, headers.clone(), Some(hold.clone()))
+                                .await
+                        }
+                        None => client.list(&mut state, headers.clone()).await,
+                    };
                     if listed.as_ref().is_err_and(|error| {
                         error
                             .downcast_ref::<McpHttpAuthorizationFailure>()
@@ -976,7 +1000,7 @@ impl McpHosts {
                                 let refreshed_cache = self.load_cache(alias, context).await;
                                 cache_invalid = refreshed_cache.is_err();
                                 cached = refreshed_cache.ok().flatten();
-                                listed = client.list(&mut state, headers).await;
+                                listed = client.list_held(&mut state, headers, hold.clone()).await;
                             }
                             Err(error) => listed = Err(error),
                         }
@@ -985,7 +1009,7 @@ impl McpHosts {
                         Ok(tools) => tools,
                         Err(error) => {
                             if !state.close_attempted {
-                                let _ = close_transport(&mut state).await;
+                                let _ = close_transport_held(&mut state, hold.clone()).await;
                             }
                             state.diagnostic.get_or_insert_with(|| error.to_string());
                             self.routes
@@ -1024,7 +1048,7 @@ impl McpHosts {
                             }) {
                                 routes.retain(|_, (owner, _)| owner != alias);
                                 drop(routes);
-                                let _ = close_transport(&mut state).await;
+                                let _ = close_transport_held(&mut state, hold.clone()).await;
                                 return Ok::<_, anyhow::Error>((
                                     Vec::new(),
                                     BTreeMap::new(),
@@ -1055,7 +1079,7 @@ impl McpHosts {
                             ))
                         }
                         Err(_) => {
-                            let _ = close_transport(&mut state).await;
+                            let _ = close_transport_held(&mut state, hold.clone()).await;
                             self.routes
                                 .write()
                                 .await
@@ -1078,7 +1102,8 @@ impl McpHosts {
                             ))
                         }
                     }
-                });
+                }
+            });
         let mut specs = Vec::new();
         let mut selectors = BTreeMap::new();
         let mut statuses = self
@@ -1144,6 +1169,15 @@ impl McpHosts {
         name: &str,
         arguments: Value,
     ) -> std::result::Result<McpExecution, McpCallFailure> {
+        self.execute_held(name, arguments, None).await
+    }
+
+    pub(crate) async fn execute_held(
+        &self,
+        name: &str,
+        arguments: Value,
+        hold: Option<crate::InvocationHold>,
+    ) -> std::result::Result<McpExecution, McpCallFailure> {
         let route = self.routes.read().await.get(name).cloned();
         let (alias, original) = route.ok_or_else(|| {
             McpCallFailure::route(anyhow::anyhow!(
@@ -1161,7 +1195,14 @@ impl McpHosts {
             return Err(McpCallFailure::call(&alias));
         }
         let mut disable = DisableOnDrop::new(&client.available);
-        let result = client.call(&mut state, &original, arguments).await;
+        let result = match hold {
+            Some(hold) => {
+                client
+                    .call_held(&mut state, &original, arguments, Some(hold))
+                    .await
+            }
+            None => client.call(&mut state, &original, arguments).await,
+        };
         let result = match result {
             Ok(result) => {
                 disable.disarm();
@@ -1192,12 +1233,22 @@ impl McpHosts {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown_held(None).await
+    }
+
+    pub(crate) async fn shutdown_held(&self, hold: Option<crate::InvocationHold>) -> Result<()> {
         self.admission.close_admission();
         let mut clients = tokio::task::JoinSet::new();
         for client in self.clients.values() {
             client.stop.notify_waiters();
             let client = Arc::clone(client);
-            clients.spawn(async move { client.close().await });
+            let hold = hold.clone();
+            clients.spawn(async move {
+                match hold {
+                    Some(hold) => client.close_held(Some(hold)).await,
+                    None => client.close().await,
+                }
+            });
         }
         let mut first_error = None;
         let joined = tokio::time::timeout(IO_TIMEOUT, async {
@@ -1562,7 +1613,12 @@ impl McpClient {
         }
     }
 
-    async fn initialize(&self, state: &mut ClientState, headers: HeaderMap) -> Result<()> {
+    async fn initialize(
+        &self,
+        state: &mut ClientState,
+        headers: HeaderMap,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<()> {
         state.transport = Some(if let Some(url) = &self.config.url {
             Transport::Http(HttpRpc {
                 client: http::client()?,
@@ -1573,7 +1629,7 @@ impl McpClient {
                 next_id: 0,
             })
         } else {
-            Transport::Stdio(Box::new(Rpc::spawn(
+            Transport::Stdio(Box::new(Rpc::spawn_held(
                 self.config
                     .command
                     .as_deref()
@@ -1583,6 +1639,7 @@ impl McpClient {
                 &self.root,
                 self.root_guard.clone(),
                 self.admission.clone(),
+                hold.clone(),
             )?))
         });
         state.close_attempted = false;
@@ -1592,21 +1649,31 @@ impl McpClient {
                 .as_mut()
                 .context("MCP initialization failed")?;
             self.while_open(transport.ready()).await?;
-            let result = self.while_open(transport.request("initialize", json!({"protocolVersion":VERSION,"capabilities":{},"clientInfo":{"name":"kuru","version":env!("CARGO_PKG_VERSION")}}))).await?;
+            let result = self.while_open(transport.request_held("initialize", json!({"protocolVersion":VERSION,"capabilities":{},"clientInfo":{"name":"kuru","version":env!("CARGO_PKG_VERSION")}}), hold.clone())).await?;
             let version = result["protocolVersion"].as_str().context("MCP initialize lacks protocolVersion")?;
             ensure!(SUPPORTED.contains(&version), "unsupported MCP protocol version: {version}");
             ensure!(result["capabilities"]["tools"].is_object(), "MCP server did not advertise tools capability");
             if let Transport::Http(http) = &mut *transport { http.version = Some(version.into()); }
-            self.while_open(transport.notify("notifications/initialized", json!({}))).await
+            self.while_open(transport.notify_held("notifications/initialized", json!({}), hold.clone())).await
         }.await;
         if let Err(error) = initialization {
-            let _ = close_transport(state).await;
+            let _ = close_transport_held(state, hold.clone()).await;
             return Err(error);
         }
         Ok(())
     }
 
     async fn request(&self, state: &mut ClientState, method: &str, params: Value) -> Result<Value> {
+        self.request_held(state, method, params, None).await
+    }
+
+    async fn request_held(
+        &self,
+        state: &mut ClientState,
+        method: &str,
+        params: Value,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<Value> {
         ensure!(
             state.transport.is_some(),
             "MCP route is not initialized; rediscover its catalog"
@@ -1617,20 +1684,29 @@ impl McpClient {
                     .transport
                     .as_mut()
                     .context("MCP initialization failed")?
-                    .request(method, params),
+                    .request_held(method, params, hold.clone()),
             )
             .await;
         if result.is_err() {
             // Never automatically retry a tool mutation. A subsequent explicit
             // call may establish a fresh session after a failed transport.
-            let _ = close_transport(state).await;
+            let _ = close_transport_held(state, hold).await;
         }
         result
     }
 
     async fn list(&self, state: &mut ClientState, headers: HeaderMap) -> Result<Vec<Value>> {
+        self.list_held(state, headers, None).await
+    }
+
+    async fn list_held(
+        &self,
+        state: &mut ClientState,
+        headers: HeaderMap,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<Vec<Value>> {
         if !self.available.load(Ordering::Acquire) {
-            close_transport(state).await?;
+            close_transport_held(state, hold.clone()).await?;
         }
         state.diagnostic = None;
         if state
@@ -1638,10 +1714,10 @@ impl McpClient {
             .as_ref()
             .is_some_and(|transport| !transport.matches_http_headers(&headers))
         {
-            close_transport(state).await?;
+            close_transport_held(state, hold.clone()).await?;
         }
         if state.transport.is_none() {
-            self.initialize(state, headers).await?;
+            self.initialize(state, headers, hold.clone()).await?;
         }
         let mut cursor = Value::Null;
         let mut seen = BTreeSet::new();
@@ -1652,7 +1728,13 @@ impl McpClient {
             } else {
                 json!({"cursor":cursor})
             };
-            let result = self.request(state, "tools/list", params).await?;
+            let result = match &hold {
+                Some(hold) => {
+                    self.request_held(state, "tools/list", params, Some(hold.clone()))
+                        .await?
+                }
+                None => self.request(state, "tools/list", params).await?,
+            };
             tools.extend(
                 result["tools"]
                     .as_array()
@@ -1676,18 +1758,33 @@ impl McpClient {
     }
 
     async fn call(&self, state: &mut ClientState, name: &str, arguments: Value) -> Result<Value> {
-        self.request(
+        self.call_held(state, name, arguments, None).await
+    }
+
+    async fn call_held(
+        &self,
+        state: &mut ClientState,
+        name: &str,
+        arguments: Value,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<Value> {
+        self.request_held(
             state,
             "tools/call",
             json!({"name":name,"arguments":arguments}),
+            hold,
         )
         .await
     }
 
     async fn close(&self) -> Result<()> {
+        self.close_held(None).await
+    }
+
+    async fn close_held(&self, hold: Option<crate::InvocationHold>) -> Result<()> {
         self.available.store(false, Ordering::Release);
         let mut state = self.state.lock().await;
-        close_transport(&mut state).await
+        close_transport_held(&mut state, hold).await
     }
 }
 
@@ -1899,12 +1996,22 @@ fn static_header_value(environment: &str, value: std::ffi::OsString) -> Result<H
 }
 
 async fn close_transport(state: &mut ClientState) -> Result<()> {
+    close_transport_held(state, None).await
+}
+
+async fn close_transport_held(
+    state: &mut ClientState,
+    hold: Option<crate::InvocationHold>,
+) -> Result<()> {
     let Some(transport) = state.transport.as_mut() else {
         state.close_attempted = false;
         return Ok(());
     };
     state.close_attempted = true;
-    let result = transport.close().await;
+    let result = match hold {
+        Some(hold) => transport.close_held(Some(hold)).await,
+        None => transport.close().await,
+    };
     state.diagnostic = transport.stderr_diagnostic();
     result?;
     state.transport.take();
@@ -1951,11 +2058,42 @@ impl Transport {
                 .context("MCP HTTP request timed out")?,
         }
     }
-    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+
+    async fn request_held(
+        &mut self,
+        method: &str,
+        params: Value,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<Value> {
+        if hold.is_none() {
+            return self.request(method, params).await;
+        }
+        match self {
+            Self::Stdio(rpc) => match hold {
+                Some(hold) => {
+                    rpc.request_held(method, params, IO_TIMEOUT, Some(hold))
+                        .await
+                }
+                None => rpc.request(method, params, IO_TIMEOUT).await,
+            },
+            Self::Http(rpc) => tokio::time::timeout(IO_TIMEOUT, rpc.request(method, params))
+                .await
+                .context("MCP HTTP request timed out")?,
+        }
+    }
+    async fn notify_held(
+        &mut self,
+        method: &str,
+        params: Value,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<()> {
         match self {
             Self::Stdio(rpc) => {
-                rpc.send(json!({"jsonrpc":"2.0","method":method,"params":params}))
-                    .await
+                let message = json!({"jsonrpc":"2.0","method":method,"params":params});
+                match hold {
+                    Some(hold) => rpc.send_held(message, Some(hold)).await,
+                    None => rpc.send(message).await,
+                }
             }
             Self::Http(rpc) => tokio::time::timeout(IO_TIMEOUT, async {
                 http::body(
@@ -1972,8 +2110,15 @@ impl Transport {
         }
     }
     async fn close(&mut self) -> Result<()> {
+        self.close_held(None).await
+    }
+
+    async fn close_held(&mut self, hold: Option<crate::InvocationHold>) -> Result<()> {
         match self {
-            Self::Stdio(rpc) => rpc.close().await,
+            Self::Stdio(rpc) => match hold {
+                Some(hold) => rpc.close_held(Some(hold)).await,
+                None => rpc.close().await,
+            },
             Self::Http(rpc) => {
                 if let Some(session) = rpc.session.clone() {
                     let mut request = rpc

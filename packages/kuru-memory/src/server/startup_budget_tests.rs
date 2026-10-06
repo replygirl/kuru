@@ -14,6 +14,7 @@ async fn initial_authentication_uses_remaining_startup_budget_and_reaps_on_expir
     let supervisor = crate::store::test_supervisor()?;
     let lifecycle_root = cfg!(windows).then(|| root.path().join("leases"));
     let options = |directory: PathBuf, timeout: Duration| ServerOptions {
+        expected_instance: None,
         binary: binary.clone(),
         directory,
         project_scope: "project/startup-budget".into(),
@@ -100,6 +101,7 @@ async fn opening_pool_identity_rejection_is_terminal() -> Result<()> {
     let server = {
         let _gate = crate::spawn_gate::spawning().await;
         Server::open(ServerOptions {
+            expected_instance: None,
             binary,
             directory: root.path().join("identity"),
             project_scope: "project/opening-identity".into(),

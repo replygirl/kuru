@@ -637,6 +637,7 @@ impl PreparedRead {
                         None,
                         &mut instructions,
                         None,
+                        None,
                     ) => result,
             };
         }
@@ -692,6 +693,7 @@ impl PreparedRead {
                         ToolInvocationOrigin::Actor(&self.context),
                         self.target.as_ref(),
                         &mut instructions,
+                        None,
                         None,
                     )
                     .await;

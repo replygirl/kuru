@@ -22,10 +22,17 @@ use uuid::Uuid;
 
 mod candidate_reconciliation;
 mod public_transcript_proof;
+mod session_claims;
 use public_transcript_proof::PublicTranscriptProof;
 mod state_read_cut;
 pub use candidate_reconciliation::{
     CandidateReconciliationObservation, CandidateReconciliationResult,
+};
+pub(crate) use session_claims::SessionClaimHandle;
+pub(crate) use session_claims::validate_selection as validate_session_driver_selection;
+pub use session_claims::{
+    LiveSessionDriver, SessionDriverOutcome, SessionDriverProof, SessionDriverRefusal,
+    SessionDriverRejected, SessionDriverSelection, SessionDriverTarget,
 };
 pub(crate) fn validate_reconciliation_heads(from: &str, live: &str) -> Result<()> {
     candidate_reconciliation::commit(from)?;
@@ -148,6 +155,9 @@ pub struct OpenOptions {
     /// on its own only after an attachment has presented this token; it is
     /// not a secret and grants nothing else.
     pub(crate) starter_token: Option<Uuid>,
+    /// Recovery of an existing client must never initialize a replacement
+    /// store. Checked while holding the stable startup lock, before creation.
+    pub(crate) expected_instance: Option<String>,
     #[cfg(test)]
     migration_hooks: Option<Arc<migrations::MigrationRunnerHooks>>,
     #[cfg(test)]
@@ -222,6 +232,7 @@ impl OpenOptions {
             read_only: false,
             supervisor: None,
             starter_token: None,
+            expected_instance: None,
             #[cfg(test)]
             migration_hooks: None,
             #[cfg(test)]
@@ -293,6 +304,7 @@ struct Shared {
     read_only: bool,
     write: Arc<Mutex<()>>,
     dream: Arc<Mutex<()>>,
+    claims: Arc<session_claims::SessionClaims>,
     uncertain: StdMutex<Option<Pending>>,
     usage_pool: StdMutex<Option<Arc<MemoryPool>>>,
     /// The usage branch's `state` table hash that this open validated, or
@@ -414,6 +426,7 @@ pub struct MemoryStore {
     pool: Arc<MemoryPool>,
     branch: String,
     logical_receipt: Option<LogicalReceipt>,
+    session_caller: Option<session_claims::SessionCaller>,
     public_transcript_proof: Arc<StdMutex<Option<PublicTranscriptProof>>>,
 }
 
@@ -1840,6 +1853,18 @@ impl MemoryStore {
         &self.branch
     }
 
+    pub(crate) fn owns_session_presence(&self) -> bool {
+        !self.shared.read_only
+    }
+
+    pub(crate) fn driver_data_root(&self) -> Result<&Path> {
+        self.shared
+            .directory
+            .parent()
+            .and_then(Path::parent)
+            .context("checked memory directory has no owning data root")
+    }
+
     /// Attach a caller-retained identity to this one view clone. The compact
     /// digest binds the method, pinned branch, store and encoded arguments;
     /// no request body is copied into the receipt row.
@@ -2046,6 +2071,9 @@ impl MemoryStore {
         lock_directory.verify(name, lock.as_ref().expect("startup lock"))?;
         open_timeline::stamp(open_timeline::Event::StartupLock);
         purge::ensure_open_allowed(&options.data_dir, &options.project_scope)?;
+        if let Some(expected) = &options.expected_instance {
+            crate::server::require_existing_instance(&directory, &options.project_scope, expected)?;
+        }
         let binary = provision::provision_observed(
             &options.config,
             &options.data_dir.join("tools/dolt"),
@@ -2065,6 +2093,7 @@ impl MemoryStore {
         // this open's own counter.
         let ticks = progress.ticks().cloned();
         let make_options = |path: PathBuf, read_only| ServerOptions {
+            expected_instance: options.expected_instance.clone(),
             binary: binary.clone(),
             directory: path,
             project_scope: options.project_scope.clone(),
@@ -2281,6 +2310,7 @@ impl MemoryStore {
             read_only: options.read_only,
             write: Arc::new(Mutex::new(())),
             dream: Arc::new(Mutex::new(())),
+            claims: Arc::new(session_claims::SessionClaims::default()),
             uncertain: StdMutex::new(None),
             usage_pool: StdMutex::new(None),
             usage_validated: StdMutex::new(None),
@@ -2299,6 +2329,7 @@ impl MemoryStore {
             pool,
             branch: "main".into(),
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         };
         if !options.read_only {
@@ -2472,6 +2503,7 @@ impl MemoryStore {
             pool,
             branch: usage_ledger::BRANCH.into(),
             logical_receipt: self.logical_receipt.clone(),
+            session_caller: self.session_caller.clone(),
             public_transcript_proof: Default::default(),
         }))
     }
@@ -3020,6 +3052,7 @@ impl MemoryStore {
     ) -> Result<SessionLifecycleOutcome> {
         self.writable()?;
         let guard = self.shared.write.clone().lock_owned().await;
+        self.check_session_lifecycle_claim(&mutation)?;
         // One write budget, taken once this write holds the write lock and
         // before its first pool acquisition, bounds the reads before its
         // pending record, its acquisition, the fork validation, the write and
@@ -3045,6 +3078,7 @@ impl MemoryStore {
         .await
         .context("session lifecycle write deadline exceeded")??;
         if let Some(outcome) = receipted {
+            self.note_session_catalog_outcome(&outcome)?;
             return Ok(outcome);
         }
         let store = self.clone();
@@ -3108,12 +3142,16 @@ impl MemoryStore {
             if let Ok(Ok(outcome)) = result {
                 *store.shared.uncertain.lock().expect("uncertain lock") = None;
                 connection.settle_receipted(deadline).await;
+                store.note_session_catalog_outcome(&outcome)?;
                 return Ok(outcome);
             }
             // Not a receipted success: end the session before reconciling.
             drop(connection);
             if store.resolve_uncertain().await? == Some(true) {
-                return load_session_lifecycle_outcome(&store.pool, &operation, &session_id).await;
+                let outcome =
+                    load_session_lifecycle_outcome(&store.pool, &operation, &session_id).await?;
+                store.note_session_catalog_outcome(&outcome)?;
+                return Ok(outcome);
             }
             result.context("session lifecycle write deadline exceeded")??;
             bail!("session lifecycle mutation did not produce its durable receipt")
@@ -4016,6 +4054,7 @@ impl MemoryStore {
     async fn mutate(&self, label: &str, mutation: Mutation) -> Result<()> {
         self.writable()?;
         let guard = self.shared.write.clone().lock_owned().await;
+        self.check_mutation_claim(&mutation)?;
         // One write budget, taken once this write holds the write lock and
         // before its first pool acquisition, bounds the reads before its
         // pending record, its acquisition, the write and its session's
@@ -4590,6 +4629,7 @@ impl MemoryStore {
             pool,
             branch,
             logical_receipt: None,
+            session_caller: self.session_caller.clone(),
             public_transcript_proof: Default::default(),
         };
         Ok(Candidate {
@@ -11478,6 +11518,7 @@ mod tests {
         let binary =
             provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?;
         let server = Server::open(ServerOptions {
+            expected_instance: None,
             binary,
             directory: directory.clone(),
             project_scope: options.project_scope.clone(),
@@ -11513,6 +11554,7 @@ mod tests {
 
     async fn released_server_at(options: &OpenOptions, directory: PathBuf) -> Result<Server> {
         Server::open(ServerOptions {
+            expected_instance: None,
             binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt"))
                 .await?,
             directory,
@@ -11823,6 +11865,7 @@ mod tests {
             pool: old_pool.clone(),
             branch: branch.clone(),
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         };
         sqlx::query("CREATE TABLE historical_dirty_probe (id INT PRIMARY KEY)")
@@ -11893,6 +11936,7 @@ mod tests {
             pool: preserved.clone(),
             branch,
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         };
         assert_eq!(revision(&preserved).await?, candidate_head);
@@ -12224,6 +12268,7 @@ mod tests {
                 read_only: true,
                 write: Arc::new(Mutex::new(())),
                 dream: Arc::new(Mutex::new(())),
+                claims: Arc::new(session_claims::SessionClaims::default()),
                 uncertain: StdMutex::new(None),
                 usage_pool: StdMutex::new(None),
                 usage_validated: StdMutex::new(None),
@@ -12237,6 +12282,7 @@ mod tests {
             pool: pool.clone(),
             branch,
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         };
         let error = history
@@ -14075,6 +14121,7 @@ mod tests {
             .await
             .unwrap();
         let owner = Server::open(ServerOptions {
+            expected_instance: None,
             binary,
             directory: stage.clone(),
             project_scope: scope,

@@ -32,10 +32,11 @@ use kuru_core::{
 };
 use kuru_memory::{
     Candidate, CandidateInventoryPage, CandidateRefStatus, CandidateTransitionResolution,
-    HistoryWindow, LegacySessionTurnResume, MemoryStatus, MemoryStore, PublicTranscriptEntry,
-    PublicTurnSettlement, Revision, SelectedAbandonResolution, SessionCatalogRecord,
-    SessionLifecycleOutcome, SessionLifecycleState, SessionModeCheckpoint, SessionTurnCheckpoint,
-    StateExpectation, StateStale, StoredNote, public_turn_node_id,
+    HistoryWindow, LegacySessionTurnResume, LiveSessionDriver, MemoryStatus, MemoryStore,
+    PublicTranscriptEntry, PublicTurnSettlement, Revision, SelectedAbandonResolution,
+    SessionCatalogRecord, SessionDriver, SessionDriverTarget, SessionLifecycleOutcome,
+    SessionLifecycleState, SessionModeCheckpoint, SessionTurnCheckpoint, StateExpectation,
+    StateStale, StoredNote, public_turn_node_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -135,6 +136,8 @@ pub struct SessionSummary {
     pub last_completed_speaker: Option<String>,
     #[serde(flatten)]
     pub catalog: SessionCatalogRecord,
+    pub live_driver: Option<LiveSessionDriver>,
+    pub live_presence_known: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,6 +533,27 @@ impl std::fmt::Display for CandidateResolutionRequired {
 
 impl std::error::Error for CandidateResolutionRequired {}
 
+struct PreparedSessionSelection {
+    config: Config,
+    profile: ModeProfile,
+    session: Session,
+    topology: Topology,
+    inventory: ReportInventory,
+    namespaces: BTreeMap<String, String>,
+}
+
+/// A finite operation observer owns notification metadata only. The actual
+/// native barrier is captured separately and transferred to native workers.
+pub(crate) struct DriverWork {
+    pub(crate) hold: kuru_connectors::InvocationHold,
+    watcher: tokio::task::JoinHandle<()>,
+}
+impl Drop for DriverWork {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
+
 pub struct Harness {
     pub config: Config,
     pub(crate) profile: ModeProfile,
@@ -537,6 +561,9 @@ pub struct Harness {
     pub session: Session,
     report_inventory: Option<ReportInventory>,
     pub(crate) memory: MemoryStore,
+    driver: SessionDriver,
+    pending_selection: Option<PreparedSessionSelection>,
+    reopening_driver: Option<(MemoryStore, SessionDriver)>,
     pub(crate) scope: String,
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) actors: BTreeMap<String, Actor>,
@@ -576,6 +603,8 @@ pub struct Harness {
     #[cfg(test)]
     publication_pause: Option<PublicationPause>,
     #[cfg(test)]
+    admission_reply_pause: Option<kuru_memory::test_support::ReplyBarrier>,
+    #[cfg(test)]
     pub(crate) annotation_reply_pause: std::sync::Mutex<
         Option<(
             kuru_memory::test_support::ReplyBarrier,
@@ -606,7 +635,8 @@ struct AbortedTurn {
     cancellation: CancellationToken,
 }
 
-/// Only a dropped foreground invocation can authorize same-Harness recovery.
+/// A dropped invocation or an admitted error whose terminal checkpoint did
+/// not settle retains its exact tuple for same-Harness recovery.
 struct TurnDropGuard {
     slot: Arc<Mutex<Option<AbortedTurn>>>,
     active: Arc<AtomicBool>,
@@ -662,7 +692,13 @@ pub(crate) enum PublicationProof {
 
 #[derive(Clone)]
 pub(crate) enum CandidatePromotionStatus {
-    Reconciling { from: String, live: String },
+    Reconciling {
+        from: String,
+        live: String,
+    },
+    /// The exact reconciliation outcome was recovered, but promotion has
+    /// not been sent. Retain this proof across fresh-claim recovery awaits.
+    Reconciled,
     Pending,
     Confirmed(String),
     OpenUnchanged,
@@ -681,6 +717,23 @@ struct ConstructorAuthority {
     profile: Option<ModeProfile>,
 }
 
+/// An accepted session claim held before provider authentication or model
+/// discovery. Dropping it releases its dedicated presence and native barrier.
+pub struct HarnessAdmission {
+    memory: MemoryStore,
+    driver: SessionDriver,
+    cwd: PathBuf,
+    target: SessionDriverTarget,
+}
+
+impl HarnessAdmission {
+    /// End setup that failed before construction; await the concrete presence
+    /// close rather than relying on a later database cleanup to discover EOF.
+    pub async fn close(self) -> Result<()> {
+        self.driver.close().await
+    }
+}
+
 #[cfg(test)]
 struct PublicationPause {
     reached: oneshot::Sender<()>,
@@ -688,6 +741,54 @@ struct PublicationPause {
 }
 
 impl Harness {
+    /// Claim the exact existing session, or reserve a fresh session, without
+    /// reading private context or starting providers, actors or tools.
+    pub async fn admit_session(
+        memory: MemoryStore,
+        cwd: &Path,
+        resume: Option<&str>,
+    ) -> Result<HarnessAdmission> {
+        let cwd = cwd.canonicalize()?;
+        memory.ensure_project_scope(&project_scope(&cwd)?)?;
+        let (memory, driver) = memory.bind_project_driver(&cwd).await?;
+        let selection = async {
+            let target = match resume {
+                Some(id) => {
+                    let catalog = memory
+                        .session_catalog_record(id)
+                        .await?
+                        .context("session is absent from the durable catalog")?;
+                    ensure!(
+                        catalog.lifecycle_state == SessionLifecycleState::Active,
+                        "session is removed; restore it before resuming"
+                    );
+                    SessionDriverTarget::Catalog(Box::new(catalog))
+                }
+                None => SessionDriverTarget::Absent(Uuid::new_v4().to_string()),
+            };
+            driver.select(target.clone()).await?;
+            Ok::<_, anyhow::Error>(target)
+        }
+        .await;
+        let target =
+            match selection {
+                Ok(target) => target,
+                Err(error) => {
+                    return match driver.close().await {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(error
+                            .context(format!("session admission close also failed: {cleanup:#}"))),
+                    };
+                }
+            };
+        Ok(HarnessAdmission {
+            memory,
+            driver,
+            cwd,
+            target,
+        })
+    }
+
     pub async fn new(
         config: Config,
         cwd: &Path,
@@ -734,13 +835,28 @@ impl Harness {
         resume: Option<&str>,
         tools: ToolHost,
     ) -> Result<Self> {
+        config.validate()?;
+        let admission = Self::admit_session(memory, cwd, resume).await?;
+        Self::with_admission_and_instructions(config, cwd, instructions, admission, provider, tools)
+            .await
+    }
+
+    /// Consume the caller's already accepted claim after provider setup. This
+    /// retains the exact selected catalog and never releases/reclaims it.
+    pub async fn with_admission_and_instructions(
+        config: Config,
+        cwd: &Path,
+        instructions: String,
+        admission: HarnessAdmission,
+        provider: Arc<dyn Provider>,
+        tools: ToolHost,
+    ) -> Result<Self> {
         Self::construct(
             config,
             cwd,
             instructions,
-            memory,
+            admission,
             provider,
-            resume,
             ConstructorAuthority {
                 tools,
                 profile: None,
@@ -761,13 +877,13 @@ impl Harness {
         let cwd = cwd.canonicalize()?;
         let tools = ToolHost::new(&cwd, &config)?;
         let instructions = load_instructions(&cwd)?;
+        let admission = Self::admit_session(memory, &cwd, resume).await?;
         Self::construct(
             config,
             &cwd,
             instructions,
-            memory,
+            admission,
             provider,
-            resume,
             ConstructorAuthority {
                 tools,
                 profile: Some(profile),
@@ -780,9 +896,30 @@ impl Harness {
         config: Config,
         cwd: &Path,
         instructions: String,
-        memory: MemoryStore,
+        admission: HarnessAdmission,
         provider: Arc<dyn Provider>,
-        resume: Option<&str>,
+        authority: ConstructorAuthority,
+    ) -> Result<Self> {
+        let driver = admission.driver.clone();
+        let result =
+            Self::construct_inner(config, cwd, instructions, admission, provider, authority).await;
+        match result {
+            Ok(harness) => Ok(harness),
+            Err(error) => match driver.close().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("session admission close also failed: {cleanup:#}")))
+                }
+            },
+        }
+    }
+
+    async fn construct_inner(
+        config: Config,
+        cwd: &Path,
+        instructions: String,
+        admission: HarnessAdmission,
+        provider: Arc<dyn Provider>,
         authority: ConstructorAuthority,
     ) -> Result<Self> {
         let ConstructorAuthority {
@@ -797,39 +934,50 @@ impl Harness {
             "injected tool host root does not match the canonical workspace"
         );
         let scope = project_scope(&cwd)?;
+        ensure!(
+            admission.cwd == cwd,
+            "session admission belongs to a different workspace"
+        );
+        let HarnessAdmission {
+            memory,
+            driver,
+            target,
+            ..
+        } = admission;
         memory.ensure_project_scope(&scope)?;
-        let session = if let Some(id) = resume {
-            let catalog = memory
-                .session_catalog_record(id)
-                .await?
-                .context("session is absent from the durable catalog")?;
-            ensure!(
-                catalog.lifecycle_state == SessionLifecycleState::Active,
-                "session is removed; restore it before resuming"
-            );
-            match memory.get(&format!("{scope}/session/{id}")).await? {
-                Some(value) => {
-                    let mut session: Session = serde_json::from_value(value)?;
-                    ensure!(
-                        catalog.mode == session.mode,
-                        "session catalog mode differs from its retained runtime state"
-                    );
-                    session.label = catalog.label;
-                    session.lifecycle_generation = catalog.lifecycle_generation;
-                    session
+        let is_new = matches!(target, SessionDriverTarget::Absent(_));
+        let selected_id = match &target {
+            SessionDriverTarget::Catalog(catalog) => &catalog.session_id,
+            SessionDriverTarget::Absent(id) => id,
+        };
+        let _construction_hold = driver.invocation_hold_for_session(selected_id)?;
+        let session = match target {
+            SessionDriverTarget::Catalog(catalog) => {
+                let catalog = *catalog;
+                let id = &catalog.session_id;
+                match memory.get(&format!("{scope}/session/{id}")).await? {
+                    Some(value) => {
+                        let mut session: Session = serde_json::from_value(value)?;
+                        ensure!(
+                            catalog.mode == session.mode,
+                            "session catalog mode differs from its retained runtime state"
+                        );
+                        session.label = catalog.label;
+                        session.lifecycle_generation = catalog.lifecycle_generation;
+                        session
+                    }
+                    None => session_from_catalog(&memory, catalog).await?,
                 }
-                None => session_from_catalog(&memory, catalog).await?,
             }
-        } else {
-            Session {
-                id: Uuid::new_v4().to_string(),
+            SessionDriverTarget::Absent(id) => Session {
+                id,
                 mode: config.mode,
                 turns: 0,
                 label: String::new(),
                 last_completed_speaker: None,
                 lifecycle_generation: 0,
                 focus: None,
-            }
+            },
         };
         let mut config = config;
         config.mode = session.mode;
@@ -876,7 +1024,7 @@ impl Harness {
         // store may still supply matching persistent grants after this reset.
         tools.permission_service().reset_session()?;
         let ledger = memory.usage_ledger()?;
-        if resume.is_none() {
+        if is_new {
             memory
                 .create_session(&session.id, session.mode, &session.label)
                 .await?;
@@ -893,6 +1041,9 @@ impl Harness {
             session,
             report_inventory: Some(snapshot.inventory),
             memory,
+            driver,
+            pending_selection: None,
+            reopening_driver: None,
             scope,
             provider,
             actors: BTreeMap::new(),
@@ -920,6 +1071,8 @@ impl Harness {
             #[cfg(test)]
             publication_pause: None,
             #[cfg(test)]
+            admission_reply_pause: None,
+            #[cfg(test)]
             annotation_reply_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             resume_publication_pause: None,
@@ -936,7 +1089,6 @@ impl Harness {
             #[cfg(test)]
             step_timings: crate::step_timings::StepTimings::default(),
         };
-        harness.sync_actors_with(&actor_namespaces);
         harness
             .persist_state_with_scope(
                 harness.config.clone(),
@@ -946,6 +1098,9 @@ impl Harness {
                 PublicationScope::Session,
             )
             .await?;
+        // No actor task exists across fallible constructor persistence. Once
+        // the accepted state is durable, publishing workers has no await.
+        harness.sync_actors_with(&actor_namespaces);
         Ok(harness)
     }
 
@@ -966,7 +1121,11 @@ impl Harness {
     /// Inspect the current filtered tool catalog and MCP alias state without
     /// making a provider request. Stale metadata never creates a live route.
     pub async fn tool_catalog(&self) -> Result<kuru_connectors::ToolCatalog> {
-        self.tools.catalog().await
+        self.tools
+            .catalog_with_lifetime(Some(
+                self.driver.invocation_hold_for_session(&self.session.id)?,
+            ))
+            .await
     }
 
     pub async fn begin_mcp_oauth_browser(&self, alias: &str) -> Result<McpBrowserLogin> {
@@ -1196,7 +1355,31 @@ impl Harness {
             actor.wait().await;
         }
         let memory_cleanup = self.reconcile().await;
-        let tool_cleanup = self.tools.shutdown().await;
+        let tool_cleanup = match self.driver.retain_for_cleanup() {
+            Ok(hold) => self.tools.shutdown_with_lifetime(hold).await,
+            Err(error) => Err(error),
+        };
+        // Retained native workers own their exact immutable barriers if a
+        // bounded cleanup refusal remains. Presence is ended intentionally.
+        let driver_cleanup = self.driver.close().await;
+        let driver_cleanup = if let Some((_, reopening)) = &self.reopening_driver {
+            match (driver_cleanup, reopening.close().await) {
+                (Ok(()), result) => result,
+                (Err(error), Ok(())) => Err(error),
+                (Err(error), Err(other)) => {
+                    Err(error.context(format!("reopening driver close also failed: {other:#}")))
+                }
+            }
+        } else {
+            driver_cleanup
+        };
+        let tool_cleanup = match (tool_cleanup, driver_cleanup) {
+            (Ok(()), result) => result,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(driver)) => {
+                Err(error.context(format!("driver close also failed: {driver:#}")))
+            }
+        };
         match (result, memory_cleanup, tool_cleanup) {
             (Ok(()), Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(()), Ok(())) => Err(error),
@@ -1286,6 +1469,13 @@ impl Harness {
     /// boundary while persistent grants remain available through the checked
     /// permission store.
     pub async fn resume_session(&mut self, session_id: &str) -> Result<()> {
+        if self.driver.is_lost() || self.reopening_driver.is_some() {
+            self.reopen_session_after_owner_loss().await?;
+            if session_id == self.session.id {
+                return Ok(());
+            }
+        }
+        self.recover_aborted_turn().await?;
         self.reconcile().await?;
         let catalog = self
             .memory
@@ -1339,30 +1529,59 @@ impl Harness {
         self.tools.revalidate_root()?;
         #[cfg(test)]
         self.pause_before_resume_publication().await?;
-        ensure!(
-            self.memory
-                .session_catalog_record(session_id)
-                .await?
-                .as_ref()
-                == Some(&catalog),
-            "session catalog changed while resuming"
-        );
+        self.pending_selection = Some(PreparedSessionSelection {
+            config,
+            profile,
+            topology,
+            session,
+            inventory: snapshot.inventory,
+            namespaces,
+        });
+        match self
+            .driver
+            .select(SessionDriverTarget::Catalog(Box::new(catalog)))
+            .await
+        {
+            Ok(_) => self.publish_session_selection(),
+            Err(error) => {
+                if self.driver.ensure_ready().is_ok() {
+                    self.pending_selection = None;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn publish_session_selection(&mut self) -> Result<()> {
+        let pending = self
+            .pending_selection
+            .as_ref()
+            .context("session selection is not staged")?;
+        self.driver
+            .invocation_hold_for_session(&pending.session.id)?;
+        // A failure leaves the accepted selection explicitly staged, so the
+        // next reconciliation cannot resume the old private session by guess.
         self.tools.permission_service().reset_session()?;
-        self.config = config;
-        self.profile = profile;
-        self.topology = topology;
-        self.session = session;
-        self.report_inventory = Some(snapshot.inventory);
+        let pending = self
+            .pending_selection
+            .take()
+            .expect("checked staged selection");
+        self.config = pending.config;
+        self.profile = pending.profile;
+        self.topology = pending.topology;
+        self.session = pending.session;
+        self.report_inventory = Some(pending.inventory);
         self.operation_id = Uuid::new_v4().to_string();
-        self.tool_cards.clear();
         self.invocation_ordinal.store(0, Ordering::Release);
-        self.sync_actors_with(&namespaces);
+        self.tool_cards.clear();
+        self.sync_actors_with(&pending.namespaces);
         self.reset_context_snapshot();
         Ok(())
     }
 
     /// Create and select one fresh session without invoking a provider.
     pub async fn new_session(&mut self) -> Result<String> {
+        self.recover_aborted_turn().await?;
         self.reconcile_with_refresh(false).await?;
         let session = Session {
             id: Uuid::new_v4().to_string(),
@@ -1380,13 +1599,7 @@ impl Harness {
             .usage_ledger()?
             .mark_new_session(&session.id)
             .await?;
-        self.tools.permission_service().reset_session()?;
-        self.session = session;
-        self.topology.focus = None;
-        self.operation_id = Uuid::new_v4().to_string();
-        self.tool_cards.clear();
-        self.invocation_ordinal.store(0, Ordering::Release);
-        self.reset_context_snapshot();
+        self.resume_session(&session.id).await?;
         self.save().await?;
         Ok(self.session.id.clone())
     }
@@ -1447,6 +1660,7 @@ impl Harness {
         source_node_id: &str,
         label: &str,
     ) -> Result<String> {
+        self.recover_aborted_turn().await?;
         self.reconcile().await?;
         let source = self
             .memory
@@ -1516,6 +1730,43 @@ impl Harness {
             bail!(
                 "previous selected candidate abandonment resolved as {previous:?}; inspect the exact ref before another action"
             );
+        }
+        // An explicit discard must not enter generic recovery that starts a
+        // new promotion after a proved merge. Already-sent transitions retain
+        // their existing exact recovery below.
+        if let Some(PublicationProof::CandidatePromotion { status, .. }) = self
+            .pending_publication
+            .as_ref()
+            .map(|pending| &pending.proof)
+        {
+            match status {
+                CandidatePromotionStatus::Reconciling { .. } => {
+                    return Err(CandidateResolutionRequired(
+                        "dream reconciliation must settle before explicit abandonment",
+                    )
+                    .into());
+                }
+                CandidatePromotionStatus::Reconciled
+                    if self.pending_candidate_resolution
+                        != PendingCandidateResolution::AbandonSent =>
+                {
+                    let _hold = self.driver.invocation_hold_for_session(&self.session.id)?;
+                    let _lease = self.memory.acquire_dream_lease().await?;
+                    self.memory.reconcile().await?;
+                    self.rebind_main_if_retired().await?;
+                    self.driver.ensure_ready()?;
+                    let retained = self
+                        .pending_candidate
+                        .as_ref()
+                        .context("reconciled dream candidate lost its checked handle")?;
+                    ensure!(
+                        retained.branch() == branch,
+                        "another dream candidate is still active"
+                    );
+                    return self.abandon_pending_dream_exact(branch, base, head).await;
+                }
+                _ => {}
+            }
         }
         match self.reconcile().await {
             Err(error) if error.is::<CandidateResolutionRequired>() => {}
@@ -1651,7 +1902,17 @@ impl Harness {
                             expected_journal,
                         })
                 });
-            self.memory
+            // Once this exact checkpoint can be sent, an error or dropped
+            // reply cannot classify the invocation as never admitted.
+            #[cfg(test)]
+            if let Some(barrier) = self.admission_reply_pause.take() {
+                self.memory
+                    .fixture_pause_next_service_reply(&barrier)
+                    .await?;
+            }
+            self.active_turn.store(true, Ordering::Release);
+            let admission = self
+                .memory
                 .checkpoint_session_turn(
                     &self.checked_transcript_key()?,
                     &self.session.id,
@@ -1663,7 +1924,14 @@ impl Harness {
                         legacy,
                     },
                 )
-                .await?;
+                .await;
+            if admission.as_ref().is_err_and(|error| {
+                error.is::<kuru_memory::SessionTurnRejected>()
+                    || error.is::<kuru_memory::SessionDriverRejected>()
+            }) {
+                self.active_turn.store(false, Ordering::Release);
+            }
+            admission?;
             return Ok(TurnAdmission::Run {
                 key,
                 journal,
@@ -1710,7 +1978,15 @@ impl Harness {
             .label
             .is_empty()
             .then(|| prompt.chars().take(80).collect::<String>());
-        self.memory
+        #[cfg(test)]
+        if let Some(barrier) = self.admission_reply_pause.take() {
+            self.memory
+                .fixture_pause_next_service_reply(&barrier)
+                .await?;
+        }
+        self.active_turn.store(true, Ordering::Release);
+        let admission = self
+            .memory
             .checkpoint_session_turn(
                 &transcript_key,
                 &self.session.id,
@@ -1723,7 +1999,14 @@ impl Harness {
                     expected_transcript_rows: Some(expected_transcript_rows),
                 },
             )
-            .await?;
+            .await;
+        if admission.as_ref().is_err_and(|error| {
+            error.is::<kuru_memory::SessionTurnRejected>()
+                || error.is::<kuru_memory::SessionDriverRejected>()
+        }) {
+            self.active_turn.store(false, Ordering::Release);
+        }
+        admission?;
         if let Some(label) = admission_label {
             self.session.label = label;
         }
@@ -2785,6 +3068,11 @@ impl Harness {
     }
 
     #[cfg(test)]
+    pub(crate) async fn disconnect_driver_presence_for_test(&self) -> Result<()> {
+        self.driver.disconnect_presence_for_test().await
+    }
+
+    #[cfg(test)]
     pub(crate) fn pause_after_next_dream_transition_frame(
         &mut self,
     ) -> kuru_memory::test_support::ReplyBarrier {
@@ -2885,9 +3173,285 @@ impl Harness {
         self.reconcile_with_refresh(true).await
     }
 
+    /// Explicitly reclaim the same session after owner loss. No provider/tool
+    /// operation is replayed. Retained native workers can refuse this claim
+    /// as Draining until their exact cleanup actually releases the lock.
+    pub async fn reopen_session_after_owner_loss(&mut self) -> Result<()> {
+        ensure!(
+            self.pending_selection.is_none(),
+            "a pending session switch needs its exact outcome; owner loss cannot infer its selection"
+        );
+        if self.reopening_driver.is_none() {
+            ensure!(
+                self.driver.is_lost(),
+                "session driver presence is still live"
+            );
+            if let Some(aborted) = self
+                .aborted_turn
+                .lock()
+                .expect("aborted turn lock poisoned")
+                .as_ref()
+            {
+                aborted.cancellation.cancel();
+            }
+            tokio::time::timeout(
+                ABORTED_TURN_DRAIN_TIMEOUT,
+                join_all(self.actors.values().map(Actor::drain)),
+            )
+            .await
+            .context("owner-loss actor cleanup exceeded 30 seconds")?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+            self.tools.hook_host().quiesce().await?;
+        }
+        self.rebind_main_if_retired().await?;
+        let dream_lease = if self.pending_candidate.is_some()
+            || self.pending_publication.as_ref().is_some_and(|pending| {
+                matches!(pending.proof, PublicationProof::CandidatePromotion { .. })
+            }) {
+            Some(self.memory.acquire_dream_lease().await?)
+        } else {
+            None
+        };
+        if self.reopening_driver.is_none() {
+            self.settle_owner_loss_candidate_proofs().await?;
+            let reopened = self.driver.reopen_after_loss(&self.memory).await?;
+            self.reopening_driver = Some(reopened);
+        }
+        let (memory, driver) = self
+            .reopening_driver
+            .as_ref()
+            .expect("retained reopen")
+            .clone();
+        if driver.reconcile_selection().await?.is_none() && driver.proof()?.is_none() {
+            let catalog = memory
+                .session_catalog_record(&self.session.id)
+                .await?
+                .context("selected session is absent after owner loss")?;
+            ensure!(
+                catalog.lifecycle_state == SessionLifecycleState::Active,
+                "selected session is removed after owner loss"
+            );
+            driver
+                .select(SessionDriverTarget::Catalog(Box::new(catalog)))
+                .await?;
+        }
+        let _hold = driver.invocation_hold_for_session(&self.session.id)?;
+        if let Some(candidate) = &self.pending_candidate
+            && !self.pending_publication.as_ref().is_some_and(|pending| {
+                matches!(
+                    pending.proof,
+                    PublicationProof::CandidatePromotion {
+                        status: CandidatePromotionStatus::Confirmed(_),
+                        ..
+                    }
+                )
+            })
+        {
+            let inspected = memory.candidate_ref_status(candidate.branch()).await?;
+            ensure!(
+                inspected.base.as_deref() == Some(candidate.base())
+                    && matches!(
+                        inspected.state,
+                        kuru_memory::CandidateRefState::OpenUnchanged
+                            | kuru_memory::CandidateRefState::OpenConflict
+                    ),
+                "retained candidate is not an exact open ref after owner loss"
+            );
+            let head = inspected
+                .head
+                .context("retained candidate has no checked head")?;
+            self.pending_candidate = Some(candidate.reattach_checked(&head).await?);
+        }
+        let catalog = memory
+            .session_catalog_record(&self.session.id)
+            .await?
+            .context("selected session catalog disappeared after reclaim")?;
+        let mut session = match memory
+            .get(&format!("{}/session/{}", self.scope, self.session.id))
+            .await?
+        {
+            Some(value) => serde_json::from_value::<Session>(value)?,
+            None => session_from_catalog(&memory, catalog.clone()).await?,
+        };
+        ensure!(
+            session.mode == catalog.mode,
+            "reclaimed session catalog mode differs from runtime state"
+        );
+        session.label = catalog.label;
+        session.lifecycle_generation = catalog.lifecycle_generation;
+        let mut config = self.config.clone();
+        config.mode = session.mode;
+        config.validate()?;
+        let profile = if config.mode == self.profile.mode {
+            self.profile.clone()
+        } else {
+            ModeProfile::builtin(config.mode)
+        };
+        profile.validate(config.max_parts)?;
+        let snapshot = topology_state::load(
+            &memory,
+            &checked_state_keys(&self.scope, &profile)?,
+            &profile,
+            Some(&format!("{}/session/{}", self.scope, session.id)),
+            None,
+        )
+        .await?;
+        validate_topology_with_profile(&snapshot.topology, &config, &profile)?;
+        let namespaces = prepared_actor_namespaces(&self.scope, &profile, &snapshot.topology)?;
+        self.tools.revalidate_root()?;
+        self.tools.validate_permission_context(&config)?;
+        self.pending_selection = Some(PreparedSessionSelection {
+            config,
+            profile,
+            session,
+            topology: snapshot.topology,
+            inventory: snapshot.inventory,
+            namespaces,
+        });
+        // Neither the successor identity nor its private context is published
+        // until the exact claim and checked reload above are both complete.
+        self.memory = memory;
+        self.driver = driver;
+        self.reopening_driver = None;
+        self.publish_session_selection()?;
+        drop(dream_lease);
+        self.recover_aborted_turn().await?;
+        self.reconcile().await
+    }
+
+    /// Read exact receipts while the old driver remains fenced. Publishing,
+    /// promoting or abandoning waits for the new checked session claim.
+    async fn settle_owner_loss_candidate_proofs(&mut self) -> Result<()> {
+        if let Some(candidate) = self.memory.recover_candidate_begin().await? {
+            ensure!(
+                self.pending_candidate.is_none(),
+                "a second candidate began during owner recovery"
+            );
+            self.pending_candidate = Some(candidate);
+            self.rebind_main_if_retired().await?;
+        }
+        if let Some(unit) = self.memory.recover_candidate_unit().await? {
+            self.pending_candidate = Some(unit.candidate);
+            self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
+            self.rebind_main_if_retired().await?;
+        }
+        if let Some(PublicationProof::CandidatePromotion {
+            status: CandidatePromotionStatus::Reconciling { from, live },
+            ..
+        }) = self
+            .pending_publication
+            .as_ref()
+            .map(|pending| pending.proof.clone())
+        {
+            let candidate = self
+                .pending_candidate
+                .as_ref()
+                .context("pending reconciliation lost its candidate")?
+                .clone();
+            if let Err(error) = self
+                .recover_dream_reconciliation(&candidate, &from, &live)
+                .await
+                && error
+                    .downcast_ref::<CandidateResolutionRequired>()
+                    .is_none()
+            {
+                return Err(error);
+            }
+            // A definite NotCommitted result remains explicitly open;
+            // it does not prevent checked ownership recovery.
+            self.rebind_main_if_retired().await?;
+        }
+        if let Some(outcome) = self.memory.recover_candidate_transition().await? {
+            match outcome.resolution {
+                CandidateTransitionResolution::Promoted(revision) => {
+                    let Some(PendingPublication {
+                        proof: PublicationProof::CandidatePromotion { target, status, .. },
+                        ..
+                    }) = &mut self.pending_publication
+                    else {
+                        bail!("recovered promotion has no retained publication proof");
+                    };
+                    ensure!(
+                        *target == revision
+                            && self.pending_candidate_resolution
+                                != PendingCandidateResolution::AbandonSent,
+                        "recovered promotion differs from retained intent"
+                    );
+                    *status = CandidatePromotionStatus::Confirmed(revision);
+                }
+                CandidateTransitionResolution::OpenUnchanged
+                | CandidateTransitionResolution::OpenConflict => {
+                    let conflict = matches!(
+                        outcome.resolution,
+                        CandidateTransitionResolution::OpenConflict
+                    );
+                    self.pending_candidate = Some(
+                        outcome
+                            .candidate
+                            .context("open candidate outcome lost its checked handle")?,
+                    );
+                    self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
+                    if let Some(PendingPublication {
+                        proof: PublicationProof::CandidatePromotion { status, .. },
+                        ..
+                    }) = &mut self.pending_publication
+                    {
+                        *status = if conflict {
+                            CandidatePromotionStatus::OpenConflict
+                        } else {
+                            CandidatePromotionStatus::OpenUnchanged
+                        };
+                    }
+                }
+                CandidateTransitionResolution::Abandoned => {
+                    ensure!(
+                        self.pending_candidate_resolution
+                            == PendingCandidateResolution::AbandonSent,
+                        "candidate was abandoned outside retained intent"
+                    );
+                    self.pending_candidate = None;
+                    self.pending_publication = None;
+                    self.pending_candidate_resolution =
+                        PendingCandidateResolution::AutomaticCleanup;
+                }
+                CandidateTransitionResolution::PreservedConflict => {
+                    bail!("candidate was resolved outside retained intent")
+                }
+            }
+            self.rebind_main_if_retired().await?;
+        }
+        Ok(())
+    }
+
     /// Turn admission checks immutable completed output before loading a new
     /// shared topology; ordinary commands consume any deferred refresh here.
     async fn reconcile_with_refresh(&mut self, refresh: bool) -> Result<()> {
+        if let Some(pending) = &self.pending_selection {
+            let target = pending.session.id.clone();
+            match self.driver.reconcile_selection().await {
+                Ok(_) => {
+                    if self
+                        .driver
+                        .proof()?
+                        .is_some_and(|proof| proof.session_id == target)
+                    {
+                        self.publish_session_selection()?;
+                    } else {
+                        bail!(
+                            "session selection is staged but not accepted; reconcile its exact outcome"
+                        );
+                    }
+                }
+                Err(error) => {
+                    if self.driver.ensure_ready().is_ok() {
+                        self.pending_selection = None;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.driver.invocation_hold_for_session(&self.session.id)?;
         self.rebind_main_if_retired().await?;
         // A cancelled dream releases its lease, but its accepted merge may still
         // need exact recovery. Reacquire serialization before touching that proof.
@@ -2958,6 +3522,12 @@ impl Harness {
                 CandidatePromotionStatus::Reconciling { .. } => {
                     bail!("dream reconciliation must settle before abandonment")
                 }
+                CandidatePromotionStatus::Reconciled if !abandonment => {
+                    self.drive_dream_promotion(false, &CancellationToken::new())
+                        .await?;
+                    self.publish_recovered_dream(&report).await?;
+                    return Ok(());
+                }
                 CandidatePromotionStatus::Confirmed(revision) => {
                     ensure!(revision == target, "dream promoted a different revision");
                     self.publish_recovered_dream(&report).await?;
@@ -2976,6 +3546,7 @@ impl Harness {
                     .into());
                 }
                 CandidatePromotionStatus::Pending
+                | CandidatePromotionStatus::Reconciled
                 | CandidatePromotionStatus::OpenUnchanged
                 | CandidatePromotionStatus::OpenConflict => {}
             }
@@ -3730,6 +4301,7 @@ impl Harness {
         identity: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<Vec<String>> {
+        let _driver_work = self.driver_work(cancellation)?;
         cancellation.check()?;
         let topology = read_topology_with_profile(&self.memory, &self.scope, &self.profile).await?;
         validate_topology_with_profile(&topology, &self.config, &self.profile)?;
@@ -4081,6 +4653,26 @@ impl Harness {
     ///
     /// An exact completed retry returns its stored output. A changed request or
     /// an incomplete turn that may have dispatched work fails without replay.
+    pub(crate) fn driver_work(&self, cancellation: &CancellationToken) -> Result<DriverWork> {
+        ensure!(
+            self.pending_selection.is_none(),
+            "session selection is pending; reconcile it before dispatch"
+        );
+        ensure!(
+            self.reopening_driver.is_none(),
+            "session owner recovery is pending; no work was admitted"
+        );
+        let hold = self.driver.invocation_hold_for_session(&self.session.id)?;
+        let presence = self.driver.presence();
+        let cancellation = cancellation.clone();
+        let watcher = tokio::spawn(async move {
+            if presence.lost().await {
+                cancellation.cancel();
+            }
+        });
+        Ok(DriverWork { hold, watcher })
+    }
+
     pub async fn run_controlled(
         &mut self,
         prompt: &str,
@@ -4110,6 +4702,7 @@ impl Harness {
         cancellation: &CancellationToken,
         reviews: TurnReviewChannels<'_>,
     ) -> Result<ControlledTurnOutput> {
+        let driver_work = self.driver_work(cancellation)?;
         self.recover_aborted_turn().await?;
         let mut guard = TurnDropGuard {
             slot: self.aborted_turn.clone(),
@@ -4130,10 +4723,16 @@ impl Harness {
                 remember_local,
                 cancellation,
                 reviews,
+                driver_work.hold.clone(),
             )
             .await;
         self.tool_cards.end_turn(&self.session.id, turn_id);
-        guard.turn = None;
+        // An admitted failure may also have failed to persist interruption
+        // after owner loss. Its exact tuple must survive until checked
+        // ownership and durable terminal settlement are recovered.
+        if result.is_ok() || !self.active_turn.load(Ordering::Acquire) {
+            guard.turn = None;
+        }
         result
     }
 
@@ -4179,7 +4778,12 @@ impl Harness {
                 let journal =
                     decode_turn_journal(value).context("aborted turn journal is invalid")?;
                 journal.validate(&aborted.turn_id)?;
-                if journal.output.is_none() {
+                if journal.output.is_none() && journal.interruption_marker {
+                    // The terminal checkpoint can win a dropped-reply race.
+                    // Reuse the existing exact current-head proof rather than
+                    // demanding a pending node that settlement already cleared.
+                    self.record_interruption(&key, journal).await?;
+                } else if journal.output.is_none() {
                     let pending = self
                         .memory
                         .public_transcript_page(&self.session.id, None, 1)
@@ -4217,6 +4821,10 @@ impl Harness {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the turn's immutable native hold remains separate from review authority"
+    )]
     async fn run_controlled_inner_impl(
         &mut self,
         prompt: &str,
@@ -4225,6 +4833,7 @@ impl Harness {
         remember_local: bool,
         cancellation: &CancellationToken,
         reviews: TurnReviewChannels<'_>,
+        native_hold: kuru_connectors::InvocationHold,
     ) -> Result<ControlledTurnOutput> {
         self.reconcile_with_refresh(false).await?;
         ensure!(
@@ -4269,6 +4878,7 @@ impl Harness {
                 &mut journal,
                 cancellation,
                 reviews,
+                native_hold,
             )
             .instrument(span.clone()),
         )
@@ -4278,7 +4888,12 @@ impl Harness {
         self.await_hook_cleanup().await;
         match result {
             Err(error) => {
-                if let Some(output) = self.record_interruption(&key, journal).await? {
+                let settled = self.record_interruption(&key, journal).await?;
+                if self.active_turn.swap(false, Ordering::AcqRel) {
+                    self.deferred_topology_refresh
+                        .store(true, Ordering::Release);
+                }
+                if let Some(output) = settled {
                     tracing::info!(target: "kuru.runtime", parent: &span, status = "interrupted", elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
                     Ok(ControlledTurnOutput {
                         output,
@@ -4333,6 +4948,7 @@ impl Harness {
         journal: &mut TurnJournal,
         cancellation: &CancellationToken,
         reviews: TurnReviewChannels<'_>,
+        native_hold: kuru_connectors::InvocationHold,
     ) -> Result<TurnOutput> {
         self.active_turn.store(true, Ordering::Release);
         self.trace.clear();
@@ -4365,7 +4981,7 @@ impl Harness {
             );
         }
         let hook_host = self.tools.hook_host();
-        let hook_budget = hook_host.budget();
+        let hook_budget = hook_host.budget_with_lifetime(native_hold.clone());
         let mut rewriting_hooks = Vec::new();
         let effective_prompt = if hook_host.configured(HookEvent::PreTurn) {
             let run = cancellation
@@ -4728,7 +5344,9 @@ impl Harness {
             serde_json::to_string(&shared)?
         ));
         let mut tools = cognition_tools();
-        let catalog = cancellation.wait(self.tools.catalog()).await?;
+        let catalog = cancellation
+            .wait(self.tools.catalog_with_lifetime(Some(native_hold.clone())))
+            .await?;
         for status in catalog.mcp() {
             if !status.available() {
                 self.emit_event(Event::Mcp {
@@ -5026,7 +5644,7 @@ impl Harness {
                             .wait(async {
                                 Ok(self
                                     .tools
-                                    .execute_for_actor_with_context_and_progress(
+                                    .execute_for_actor_with_context_progress_and_lifetime(
                                         &call.name,
                                         call.arguments.clone(),
                                         reviews.permission,
@@ -5039,6 +5657,7 @@ impl Harness {
                                             call_id: call.id.clone(),
                                         },
                                         card.as_ref().and_then(|card| card.progress.as_ref()),
+                                        Some(native_hold.clone()),
                                     )
                                     .await)
                             })
@@ -5578,6 +6197,7 @@ async fn session_summaries_inner(
             .await
             .context("session listing publication pause was dropped")?;
     }
+    let live = memory.live_session_drivers().await?;
     let mut summaries = Vec::with_capacity(catalog.len());
     for record in &catalog {
         let mut session = match memory
@@ -5607,6 +6227,11 @@ async fn session_summaries_inner(
             turns: session.turns,
             last_completed_speaker: session.last_completed_speaker,
             catalog: record.clone(),
+            live_presence_known: memory.session_presence_known(),
+            live_driver: live
+                .iter()
+                .find(|driver| driver.proof.session_id == record.session_id)
+                .cloned(),
         });
     }
     ensure!(
@@ -6286,7 +6911,8 @@ mod publication_tests {
             .await
             .unwrap();
             let session_id = harness.session.id.clone();
-            memory
+            harness
+                .memory
                 .rename_session(&session_id, 0, "renamed")
                 .await
                 .unwrap();
@@ -6322,6 +6948,7 @@ mod publication_tests {
             );
             harness.reconcile().await.unwrap();
             assert!(harness.pending_publication.is_none());
+            harness.shutdown(false).await.unwrap();
             drop(harness);
             let resumed = Harness::new(
                 config,
@@ -7366,7 +7993,8 @@ mod publication_tests {
             let PublicTranscriptEntry::Turn { record: selected } = &parent_page.records[0] else {
                 panic!("parent must have one settled public turn");
             };
-            memory
+            parent
+                .memory
                 .fork_session(
                     &parent_id,
                     parent.session.lifecycle_generation,
@@ -7392,7 +8020,8 @@ mod publication_tests {
                 (&actor_namespace, "parent-private-actor-only"),
                 (&relation_namespace, "parent-private-relationship-only"),
             ] {
-                memory
+                parent
+                    .memory
                     .append_session_message(namespace, &parent_id, &Message::text("note", sentinel))
                     .await
                     .unwrap();
@@ -7560,15 +8189,73 @@ mod publication_tests {
             release.send(()).unwrap();
             let error = running.await.unwrap().unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("session catalog changed while resuming"),
+                matches!(
+                    error.downcast_ref::<kuru_memory::SessionDriverRejected>(),
+                    Some(kuru_memory::SessionDriverRejected(
+                        kuru_memory::SessionDriverRefusal::CatalogChanged
+                    ))
+                ),
                 "unexpected stale resume error: {error:#}"
             );
+            let mut selected_harness = harness.lock().await;
+            assert_eq!(selected_harness.session.id, selected);
+            assert_eq!(selected_harness.operation_id, operation);
+            assert_ne!(selected_harness.session.id, "resume-race");
+            let old_proof = selected_harness.driver.proof().unwrap();
+            let (created, release) = selected_harness.pause_before_next_resume_publication();
+            drop(selected_harness);
+            let creating = tokio::spawn({
+                let harness = harness.clone();
+                async move { harness.lock().await.new_session().await }
+            });
+            tokio::time::timeout(crate::tests::turn_admission_deadline(), created)
+                .await
+                .unwrap()
+                .unwrap();
+            let orphan = memory
+                .session_catalog_page(None, None, None, 16)
+                .await
+                .unwrap()
+                .records
+                .into_iter()
+                .find(|record| record.session_id != selected && record.session_id != "resume-race")
+                .expect("new session catalog is durable before target selection");
+            memory
+                .rename_session(
+                    &orphan.session_id,
+                    orphan.lifecycle_generation,
+                    "retained orphan",
+                )
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            let error = creating.await.unwrap().unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<kuru_memory::SessionDriverRejected>(),
+                Some(kuru_memory::SessionDriverRejected(
+                    kuru_memory::SessionDriverRefusal::CatalogChanged
+                ))
+            ));
             let mut harness = harness.lock().await;
             assert_eq!(harness.session.id, selected);
             assert_eq!(harness.operation_id, operation);
-            assert_ne!(harness.session.id, "resume-race");
+            assert_eq!(harness.driver.proof().unwrap(), old_proof);
+            harness.driver.ensure_ready().unwrap();
+            assert!(harness.pending_selection.is_none());
+            assert_eq!(
+                memory
+                    .session_catalog_record(&orphan.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .label,
+                "retained orphan"
+            );
+            let public = memory
+                .public_transcript_page(&orphan.session_id, None, 16)
+                .await
+                .unwrap();
+            assert!(public.records.is_empty() && public.pending.is_none());
             harness.shutdown(false).await.unwrap();
             drop(harness);
             memory.close().await.unwrap();
@@ -7917,6 +8604,640 @@ mod publication_tests {
                     .filter(|message| message.role == INTERRUPTION_ROLE)
                     .count(),
                 1
+            );
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn simultaneous_managed_sessions_share_policy_context_without_raw_history() -> Result<()>
+    {
+        kuru_memory::test_support::closing(async {
+            use futures::FutureExt as _;
+
+            let project_directory = tempfile::tempdir()?;
+            let project = project_directory.path().canonicalize()?;
+            let data = kuru_memory::test_support::tempdir()?;
+            let options = kuru_memory::test_support::warmed_open_options(
+                data.path().to_owned(),
+                crate::project_scope(&project)?,
+            )
+            .await?;
+            let executable = options
+                .supervisor
+                .clone()
+                .context("fixture supervisor absent")?;
+            let mut opened = Vec::new();
+            let mut retained = Vec::new();
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let memory = MemoryStore::open_managed_observed(
+                    options.clone(),
+                    project.clone(),
+                    executable,
+                )
+                .1
+                .await?;
+                opened.push(memory.clone());
+                for mode in Mode::ALL {
+                    let provider = Arc::new(CountingProvider::default());
+                    let config = Config {
+                        mode,
+                        provider: "demo".into(),
+                        model: "demo".into(),
+                        max_parallel: 1,
+                        dream_every: 0,
+                        dream_on_exit: false,
+                        ..Config::default()
+                    };
+                    let mut first = Harness::new(
+                        config.clone(),
+                        &project,
+                        memory.clone(),
+                        provider.clone(),
+                        None,
+                    )
+                    .await?;
+                    let relation = first
+                        .relate(
+                            RelationshipKind::Alliance,
+                            first.topology.parts[..2]
+                                .iter()
+                                .map(|part| part.id.clone())
+                                .collect(),
+                        )
+                        .await?;
+                    retained.push(first);
+                    retained.push(
+                        Harness::new(config, &project, memory.clone(), provider.clone(), None)
+                            .await?,
+                    );
+                    let start = retained.len() - 2;
+                    let pair = &mut retained[start..];
+                    let (first_slice, second_slice) = pair.split_at_mut(1);
+                    let first = &mut first_slice[0];
+                    let second = &mut second_slice[0];
+                    ensure!(first.session.id != second.session.id);
+                    let actor = first.topology.parts[0].id.clone();
+                    let other_actor = first.topology.parts[1].id.clone();
+                    for identity in [&actor, &relation.id] {
+                        let namespace = first.checked_namespace(identity)?;
+                        first
+                            .memory
+                            .append_session_message(
+                                &namespace,
+                                &first.session.id,
+                                &Message::text("user", "FIRST_RAW_PRIVATE_SENTINEL"),
+                            )
+                            .await?;
+                        first
+                            .memory
+                            .append_session_message(
+                                &namespace,
+                                &first.session.id,
+                                &Message::tool_result(
+                                    "first-opaque",
+                                    json!({"private":"FIRST_STRUCTURED_PRIVATE_SENTINEL"}),
+                                    false,
+                                ),
+                            )
+                            .await?;
+                        second
+                            .memory
+                            .append_session_message(
+                                &namespace,
+                                &second.session.id,
+                                &Message::text("user", "SECOND_RAW_PRIVATE_SENTINEL"),
+                            )
+                            .await?;
+                        second
+                            .memory
+                            .append_session_message(
+                                &namespace,
+                                &second.session.id,
+                                &Message::tool_result(
+                                    "second-opaque",
+                                    json!({"private":"SECOND_STRUCTURED_PRIVATE_SENTINEL"}),
+                                    false,
+                                ),
+                            )
+                            .await?;
+                        first
+                            .memory
+                            .append(
+                                &format!("{namespace}/notes"),
+                                "note",
+                                "APPROVED_SAME_IDENTITY_NOTE",
+                            )
+                            .await?;
+                        let notices = first
+                            .compact_controlled(Some(identity), &CancellationToken::new())
+                            .await?;
+                        ensure!(notices.len() == 1 && notices[0].contains("Compacted"));
+                        let summaries = first
+                            .memory
+                            .context_summary_window(
+                                &namespace,
+                                &crate::context_compaction::summary_namespace(&namespace),
+                                Some(&first.session.id),
+                                Some(&namespace),
+                                16,
+                            )
+                            .await?;
+                        ensure!(
+                            summaries.records.len() == 1
+                                && summaries.records[0].record.summary == "durable answer"
+                        );
+                    }
+                    first
+                        .memory
+                        .append(
+                            &format!("{}/notes", first.checked_namespace(&other_actor)?),
+                            "note",
+                            "OTHER_IDENTITY_NOTE_MUST_NOT_CROSS",
+                        )
+                        .await?;
+                    let request_start = provider
+                        .messages
+                        .lock()
+                        .expect("provider messages lock")
+                        .len();
+                    for identity in [&actor, &relation.id] {
+                        second
+                            .run_controlled(
+                                "SECOND_SESSION_REQUEST",
+                                Some(identity),
+                                &format!("policy-{identity}"),
+                                &CancellationToken::new(),
+                            )
+                            .await?;
+                    }
+                    {
+                        let messages = provider.messages.lock().expect("provider messages lock");
+                        let instructions = provider
+                            .instructions
+                            .lock()
+                            .expect("provider instructions lock");
+                        ensure!(messages.len() > request_start);
+                        let mut saw_shared_note = false;
+                        let mut saw_shared_summary = false;
+                        let mut saw_own_private = false;
+                        for (messages, instructions) in messages[request_start..]
+                            .iter()
+                            .zip(&instructions[request_start..])
+                        {
+                            let text =
+                                format!("{instructions}\n{}", serde_json::to_string(messages)?);
+                            ensure!(
+                                !text.contains("FIRST_RAW_PRIVATE_SENTINEL")
+                                    && !text.contains("FIRST_STRUCTURED_PRIVATE_SENTINEL"),
+                                "{mode} provider received another session's raw private history"
+                            );
+                            ensure!(
+                                !text.contains("OTHER_IDENTITY_NOTE_MUST_NOT_CROSS"),
+                                "{mode} policy crossed an unrelated identity's notes"
+                            );
+                            saw_shared_note |= text.contains("APPROVED_SAME_IDENTITY_NOTE");
+                            saw_shared_summary |= text.contains("Cross-session rolling summary")
+                                && text.contains("durable answer");
+                            saw_own_private |= text.contains("SECOND_RAW_PRIVATE_SENTINEL")
+                                || text.contains("SECOND_STRUCTURED_PRIVATE_SENTINEL");
+                        }
+                        ensure!(
+                            saw_shared_note && saw_shared_summary && saw_own_private,
+                            "{mode} discarded authorized shared records or its own private context"
+                        );
+                    }
+                    let first_public = first.history().await?;
+                    let second_public = second.history().await?;
+                    ensure!(first.dream().await?.summaries > 0);
+                    let report = first
+                        .apply_dream(vec![crate::dream::DreamProposal::Add {
+                            name: "policy continuity peer".into(),
+                            role: first.topology.parts[0].role.clone(),
+                            instruction: "Retain the same equal-peer privacy and memory policy."
+                                .into(),
+                        }])
+                        .await?;
+                    ensure!(
+                        report.accepted.len() == 1,
+                        "valid membership change was not accepted"
+                    );
+                    first.undo_dream().await?;
+                    ensure!(
+                        first.history().await? == first_public
+                            && second.history().await? == second_public,
+                        "dream/undo rewrote private session transcripts"
+                    );
+                    for identity in [&actor, &relation.id] {
+                        let namespace = first.checked_namespace(identity)?;
+                        for (harness, own, foreign) in [
+                            (
+                                &*first,
+                                "FIRST_STRUCTURED_PRIVATE_SENTINEL",
+                                "SECOND_STRUCTURED_PRIVATE_SENTINEL",
+                            ),
+                            (
+                                &*second,
+                                "SECOND_STRUCTURED_PRIVATE_SENTINEL",
+                                "FIRST_STRUCTURED_PRIVATE_SENTINEL",
+                            ),
+                        ] {
+                            let history = harness
+                                .memory
+                                .session_history_window(&namespace, &harness.session.id, 64)
+                                .await?;
+                            let stored = serde_json::to_string(&history.messages)?;
+                            ensure!(
+                                stored.contains(own) && !stored.contains(foreign),
+                                "{mode} dream/undo lost or mixed private identity history"
+                            );
+                        }
+                    }
+                    first.shutdown(false).await?;
+                    second.shutdown(false).await?;
+                    opened.push(first.memory.clone());
+                    opened.push(second.memory.clone());
+                    // Completed pairs have already awaited their owned
+                    // shutdown; retain only attachments for final close.
+                    retained.truncate(start);
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .catch_unwind()
+            .await;
+            let mut cleanup = Vec::new();
+            for harness in &mut retained {
+                if let Err(error) = harness.shutdown(false).await {
+                    cleanup.push(format!("harness: {error:#}"));
+                }
+                opened.push(harness.memory.clone());
+                if let Some(candidate) = &harness.pending_candidate {
+                    opened.push(candidate.view());
+                }
+            }
+            for memory in opened {
+                if let Err(error) = memory.close().await {
+                    cleanup.push(format!("attachment: {error:#}"));
+                }
+            }
+            if let Err(error) = kuru_memory::test_support::await_managed_quiescence(&options).await
+            {
+                cleanup.push(format!("owner reap: {error:#}"));
+            }
+            let result = match outcome {
+                Ok(result) => match (result, cleanup.is_empty()) {
+                    (result, true) => result,
+                    (Err(error), false) => {
+                        Err(error.context(format!("cleanup also failed: {}", cleanup.join("; "))))
+                    }
+                    (Ok(()), false) => Err(anyhow::anyhow!(cleanup.join("; "))),
+                },
+                Err(panic) => {
+                    if !cleanup.is_empty() {
+                        eprintln!("policy context fixture cleanup: {}", cleanup.join("; "));
+                    }
+                    std::panic::resume_unwind(panic)
+                }
+            };
+            data.release(result)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn lost_admission_reply_recovers_before_dispatch_and_exact_retry() -> Result<()> {
+        kuru_memory::test_support::closing(async {
+            use futures::FutureExt as _;
+
+            let project_directory = tempfile::tempdir()?;
+            let project = project_directory.path().canonicalize()?;
+            let data = kuru_memory::test_support::tempdir()?;
+            let options = kuru_memory::test_support::warmed_open_options(
+                data.path().to_owned(), crate::project_scope(&project)?,
+            ).await?;
+            let executable = options.supervisor.clone().context("fixture supervisor absent")?;
+            let mut opened = Vec::new();
+            let mut retained = None;
+            let mut paused_selection = None;
+            let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(
+                ABORTED_TURN_DRAIN_TIMEOUT.saturating_mul(4), async {
+                let memory = MemoryStore::open_managed_observed(
+                    options.clone(), project.clone(), executable,
+                ).1.await?;
+                opened.push(memory.clone());
+                let provider = Arc::new(CountingProvider::default());
+                retained = Some(Harness::new(Config {
+                    provider: "demo".into(), model: "demo".into(), max_parallel: 1,
+                    dream_every: 0, dream_on_exit: false, ..Config::default()
+                }, &project, memory, provider.clone(), None).await?);
+                let harness = retained.as_mut().context("fixture harness absent")?;
+                let session = harness.session.id.clone();
+                let target = harness.topology.parts[0].id.clone();
+                let barrier = kuru_memory::test_support::ReplyBarrier::default();
+                harness.admission_reply_pause = Some(barrier.clone());
+                let cancellation = CancellationToken::new();
+                {
+                    let operation = harness.run_controlled(
+                        "ACCEPTED_ADMISSION_PRIVATE_SENTINEL", Some(&target),
+                        "lost-admission", &cancellation,
+                    );
+                    tokio::pin!(operation);
+                    tokio::select! {
+                        () = barrier.wait_replied() => {},
+                        result = &mut operation => bail!("admission completed before reply barrier: {result:?}"),
+                    }
+                    ensure!(provider.calls.load(Ordering::SeqCst) == 0,
+                        "provider dispatched before the accepted admission reply");
+                    // Dropping this exact borrowed invocation loses only its
+                    // reply; the owner has already settled the receipt.
+                }
+                ensure!(harness.aborted_turn.lock().expect("aborted turn lock").is_some());
+                let accepted = harness.memory.public_transcript_page(&session, None, 16).await?;
+                ensure!(accepted.pending.is_some(), "accepted admission lacks its pending public node");
+                ensure!(harness.memory.put("must-remain-fenced", &json!(true)).await.is_err(),
+                    "uncertain admission did not fence further writes");
+                let output = harness.run_controlled(
+                    "ACCEPTED_ADMISSION_PRIVATE_SENTINEL", Some(&target),
+                    "lost-admission", &CancellationToken::new(),
+                ).await?;
+                let sends = provider.calls.load(Ordering::SeqCst);
+                ensure!(sends > 0 && harness.aborted_turn.lock().expect("aborted turn lock").is_none());
+                let public = harness.memory.public_transcript_page(&session, None, 16).await?;
+                ensure!(public.pending.is_none());
+                ensure!(matches!(public.records.as_slice(),
+                    [PublicTranscriptEntry::Turn { record }]
+                        if record.turn_id == "lost-admission"
+                            && record.settlement == PublicTurnSettlement::Completed
+                            && record.user_entry == Some(user("ACCEPTED_ADMISSION_PRIVATE_SENTINEL"))));
+                let retry = harness.run_controlled(
+                    "ACCEPTED_ADMISSION_PRIVATE_SENTINEL", Some(&target),
+                    "lost-admission", &CancellationToken::new(),
+                ).await?;
+                ensure!(serde_json::to_value(output)? == serde_json::to_value(retry)?);
+                ensure!(provider.calls.load(Ordering::SeqCst) == sends, "completed retry replayed inference");
+                ensure!(harness.history().await?.iter().filter(|message|
+                    message.plain_text() == Some("ACCEPTED_ADMISSION_PRIVATE_SENTINEL")).count() == 1);
+                harness.new_session().await?;
+                ensure!(harness.session.id != session && harness.history().await?.is_empty());
+                let old_selection = harness.session.id.clone();
+                let old_operation = harness.operation_id.clone();
+                let selection_reply = kuru_memory::test_support::ReplyBarrier::default();
+                paused_selection = Some(selection_reply.clone());
+                harness.driver.pause_next_selection_reply_for_test(&selection_reply).await?;
+                {
+                    let selection = harness.resume_session(&session);
+                    tokio::pin!(selection);
+                    tokio::select! {
+                        () = selection_reply.wait_replied() => {},
+                        result = &mut selection => bail!("session selection escaped its completed reply barrier: {result:?}"),
+                    }
+                }
+                ensure!(harness.session.id == old_selection && harness.operation_id == old_operation,
+                    "accepted-but-cancelled switch published private local state early");
+                ensure!(harness.pending_selection.as_ref().is_some_and(|pending| pending.session.id == session));
+                ensure!(harness.run_controlled("must stay fenced", Some(&target),
+                    "pending-switch", &CancellationToken::new()).await.is_err());
+                ensure!(provider.calls.load(Ordering::SeqCst) == sends,
+                    "pending selection dispatched a provider request");
+                selection_reply.release();
+                harness.reconcile().await?;
+                ensure!(harness.pending_selection.is_none() && harness.session.id == session);
+                ensure!(harness.driver.proof()?.is_some_and(|proof| proof.session_id == session));
+                harness.run_controlled("ACCEPTED_SELECTION_PRIVATE_SENTINEL", Some(&target),
+                    "after-accepted-switch", &CancellationToken::new()).await?;
+                ensure!(provider.calls.load(Ordering::SeqCst) > sends);
+                let prior = harness.memory.public_transcript_page(&old_selection, None, 16).await?;
+                ensure!(prior.pending.is_none() && prior.records.is_empty(),
+                    "fenced switch persisted a turn into the prior local selection");
+                Ok::<(), anyhow::Error>(())
+            })).catch_unwind().await;
+            let outcome = outcome.map(|result| result.context("lost admission fixture exceeded its operation bound")?);
+            if let Some(barrier) = paused_selection { barrier.release(); }
+            let mut cleanup = Vec::new();
+            if let Some(harness) = &mut retained {
+                if let Err(error) = harness.shutdown(false).await { cleanup.push(format!("harness: {error:#}")); }
+                opened.push(harness.memory.clone());
+            }
+            for memory in opened {
+                if let Err(error) = memory.close().await { cleanup.push(format!("attachment: {error:#}")); }
+            }
+            if let Err(error) = kuru_memory::test_support::await_managed_quiescence(&options).await {
+                cleanup.push(format!("owner reap: {error:#}"));
+            }
+            let result = match outcome {
+                Ok(result) => match (result, cleanup.is_empty()) {
+                    (result, true) => result,
+                    (Err(error), false) => Err(error.context(format!("cleanup also failed: {}", cleanup.join("; ")))),
+                    (Ok(()), false) => Err(anyhow::anyhow!(cleanup.join("; "))),
+                },
+                Err(panic) => { if !cleanup.is_empty() { eprintln!("lost admission fixture cleanup: {}", cleanup.join("; ")); } std::panic::resume_unwind(panic) }
+            };
+            data.release(result)
+        }).await
+    }
+
+    #[tokio::test]
+    async fn lost_owner_cancels_held_provider_and_checked_reopen_keeps_session_private()
+    -> Result<()> {
+        kuru_memory::test_support::closing(async {
+            use futures::FutureExt as _;
+
+            let project_directory = tempfile::tempdir()?;
+            let project = project_directory.path().canonicalize()?;
+            let data = kuru_memory::test_support::tempdir()?;
+            let options = kuru_memory::test_support::warmed_open_options(
+                data.path().to_owned(), crate::project_scope(&project)?,
+            ).await?;
+            let executable = options.supervisor.clone().context("fixture supervisor absent")?;
+            let mut opened = Vec::new();
+            let mut retained = None;
+            let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(
+                ABORTED_TURN_DRAIN_TIMEOUT.saturating_mul(4), async {
+                let memory = MemoryStore::open_managed_observed(
+                    options.clone(), project.clone(), executable.clone(),
+                ).1.await?;
+                opened.push(memory.clone());
+                let provider = Arc::new(BlockingOnceProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0), started: Notify::new(),
+                });
+                retained = Some(Harness::new(Config {
+                    provider: "demo".into(), model: "demo".into(), max_parallel: 1,
+                    dream_every: 0, dream_on_exit: false, ..Config::default()
+                }, &project, memory.clone(), provider.clone(), None).await?);
+                let harness = retained.as_mut().context("fixture harness absent")?;
+                let session = harness.session.id.clone();
+                let driver = harness.driver.clone();
+                let original = driver.proof()?.context("selected proof absent")?;
+                let bound_memory = harness.memory.clone();
+                opened.push(bound_memory.clone());
+                let cancellation = CancellationToken::new();
+                {
+                    let started = provider.started.notified();
+                    tokio::pin!(started);
+                    let operation = harness.run_controlled(
+                        "OLD_OWNER_PRIVATE_SENTINEL", None, "owner-loss-turn", &cancellation,
+                    );
+                    tokio::pin!(operation);
+                    tokio::select! {
+                        _ = &mut started => {},
+                        result = &mut operation => bail!("held provider completed before owner loss: {result:?}"),
+                    }
+                    driver.disconnect_presence_for_test().await?;
+                    cancellation.cancelled().await;
+                    ensure!(driver.is_lost());
+                    memory.close_transport_for_test().await?;
+                    bound_memory.close_transport_for_test().await?;
+                    // All actual connections have EOF. Await the original
+                    // owner's reap; no maintenance permit or stale PID kill
+                    // substitutes for its shutdown ownership.
+                    kuru_memory::test_support::await_owner_release(&options).await?;
+                    let successor = MemoryStore::open_managed_observed(
+                        options.clone(), project.clone(), executable.clone(),
+                    ).1.await?;
+                    opened.push(successor.clone());
+                    let (competing, competitor) = successor.bind_project_driver(&project).await?;
+                    opened.push(competing.clone());
+                    let target = successor.session_catalog_record(&session).await?.context("retained catalog absent")?;
+                    let refusal = competitor.select(SessionDriverTarget::Catalog(Box::new(target))).await.unwrap_err();
+                    ensure!(matches!(refusal.downcast_ref::<kuru_memory::SessionDriverRejected>(),
+                        Some(kuru_memory::SessionDriverRejected(kuru_memory::SessionDriverRefusal::Draining { .. }))));
+                    competitor.close().await?;
+                    ensure!(provider.calls.load(Ordering::SeqCst) == 1,
+                        "owner loss dispatched another provider request");
+                    ensure!(operation.await.is_err(), "lost owner published an answer");
+                }
+                ensure!(harness.run_controlled("must refuse", None, "lost-no-dispatch", &CancellationToken::new()).await.is_err());
+                ensure!(provider.calls.load(Ordering::SeqCst) == 1);
+                // Existing explicit resume is the user recovery path. Fresh
+                // checked claim and context reload precede any further work.
+                harness.resume_session(&session).await?;
+                let reclaimed = harness.driver.proof()?.context("reclaimed proof absent")?;
+                ensure!(reclaimed.session_id == session && reclaimed.service_generation != original.service_generation);
+                let before_retry = provider.calls.load(Ordering::SeqCst);
+                ensure!(harness.run_controlled("OLD_OWNER_PRIVATE_SENTINEL", None, "owner-loss-turn", &CancellationToken::new()).await.is_err());
+                ensure!(provider.calls.load(Ordering::SeqCst) == before_retry, "uncertain old work was replayed");
+                let target = harness.topology.parts[0].id.clone();
+                harness.run_controlled("NEW_OWNER_PRIVATE_SENTINEL", Some(&target), "after-reclaim", &CancellationToken::new()).await?;
+                ensure!(harness.history().await?.iter().any(|message| message.plain_text() == Some("NEW_OWNER_PRIVATE_SENTINEL")));
+                Ok::<(), anyhow::Error>(())
+            })).catch_unwind().await;
+            let outcome = outcome.map(|result| result.context("held provider owner-loss fixture exceeded its operation bound")?);
+            let mut cleanup = Vec::new();
+            if let Some(harness) = &mut retained {
+                if let Err(error) = harness.shutdown(false).await { cleanup.push(format!("harness: {error:#}")); }
+                opened.push(harness.memory.clone());
+                if let Some((memory, _)) = &harness.reopening_driver { opened.push(memory.clone()); }
+            }
+            for memory in opened {
+                if let Err(error) = memory.close().await { cleanup.push(format!("attachment: {error:#}")); }
+            }
+            if let Err(error) = kuru_memory::test_support::await_managed_quiescence(&options).await {
+                cleanup.push(format!("owner reap: {error:#}"));
+            }
+            let result = match outcome {
+                Ok(result) => match (result, cleanup.is_empty()) {
+                    (result, true) => result,
+                    (Err(error), false) => Err(error.context(format!("cleanup also failed: {}", cleanup.join("; ")))),
+                    (Ok(()), false) => Err(anyhow::anyhow!(cleanup.join("; "))),
+                },
+                Err(panic) => { if !cleanup.is_empty() { eprintln!("owner-loss fixture cleanup: {}", cleanup.join("; ")); } std::panic::resume_unwind(panic) }
+            };
+            data.release(result)
+        }).await
+    }
+
+    #[tokio::test]
+    async fn dropped_provider_turn_is_drained_before_selecting_a_new_session() {
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir().unwrap();
+            let memory = MemoryStore::temporary().await.unwrap();
+            let provider = Arc::new(BlockingOnceProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                started: Notify::new(),
+            });
+            let mut harness = Harness::new(
+                Config {
+                    mode: Mode::Ifs,
+                    provider: "demo".into(),
+                    model: "demo".into(),
+                    max_parallel: 1,
+                    dream_every: 0,
+                    dream_on_exit: false,
+                    ..Config::default()
+                },
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let original = harness.session.id.clone();
+            let original_transcript = harness.checked_transcript_key().unwrap();
+            let key = harness.turn_journal_key("dropped-before-switch");
+            let cancellation = CancellationToken::new();
+            {
+                let started = provider.started.notified();
+                tokio::pin!(started);
+                let operation = harness.run_controlled(
+                    "OLD_PRIVATE_SENTINEL",
+                    None,
+                    "dropped-before-switch",
+                    &cancellation,
+                );
+                tokio::pin!(operation);
+                tokio::select! {
+                    _ = &mut started => {},
+                    result = &mut operation => panic!("held provider completed early: {result:?}"),
+                }
+            }
+            // The future is dropped while actual provider work is held. The
+            // selection call must settle that work and its old journal before
+            // publishing a different private session.
+            let next = harness.new_session().await.unwrap();
+            assert_ne!(next, original);
+            assert_eq!(harness.session.id, next);
+            assert!(cancellation.is_cancelled());
+            assert!(harness.aborted_turn.lock().unwrap().is_none());
+            assert!(harness.history().await.unwrap().is_empty());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            let journal = decode_turn_journal(memory.get(&key).await.unwrap().unwrap()).unwrap();
+            assert!(
+                journal
+                    .transitions
+                    .iter()
+                    .any(|transition| matches!(transition, TurnTransition::Interrupted))
+            );
+            assert!(journal.output.is_none());
+            let old = memory
+                .history_window(&original_transcript, 16)
+                .await
+                .unwrap();
+            assert!(
+                old.messages
+                    .iter()
+                    .any(|message| message.plain_text() == Some("OLD_PRIVATE_SENTINEL"))
+            );
+            assert_eq!(harness.driver.proof().unwrap().unwrap().session_id, next);
+            let target = harness.topology.parts[0].id.clone();
+            harness
+                .run_controlled(
+                    "NEW_PRIVATE_SENTINEL",
+                    Some(&target),
+                    "new-session-turn",
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                harness
+                    .history()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|message| message.plain_text() != Some("OLD_PRIVATE_SENTINEL"))
             );
             harness.shutdown(false).await.unwrap();
             memory.close().await.unwrap();

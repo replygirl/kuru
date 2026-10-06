@@ -355,6 +355,7 @@ fn startup_timeout() -> Duration {
 async fn start(data_dir: &Path, store: &Path, scope: &str, read_only: bool) -> Result<Server> {
     let binary = crate::test_support::warm_runtime_cache().await?;
     let options = ServerOptions {
+        expected_instance: None,
         binary,
         directory: store.to_owned(),
         project_scope: scope.to_owned(),

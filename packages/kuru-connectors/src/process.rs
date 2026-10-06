@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, ffi::OsString, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use kuru_platform::windows::process::{self, NativeChild, NativeSpawnSpec};
+pub(crate) const CLEANUP: Duration = Duration::from_secs(5);
 
 pub(crate) fn configured(
     program: &str,
@@ -44,7 +45,7 @@ pub(crate) fn configured_finite(
 pub(crate) async fn stop(child: &mut NativeChild) -> Result<()> {
     child.terminate()?;
     child
-        .wait(Duration::from_secs(5))
+        .wait(CLEANUP)
         .await
         .context("Windows subprocess tree did not terminate")?;
     Ok(())

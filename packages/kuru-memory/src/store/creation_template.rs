@@ -1164,6 +1164,7 @@ async fn build(
         Err(error) => return Err((Some(lock), CreationFailure::Io(error))),
     };
     let make_options = |directory: PathBuf, read_only: bool| ServerOptions {
+        expected_instance: None,
         binary: engine.binary.clone(),
         directory,
         project_scope: TEMPLATE_SCOPE.to_owned(),
