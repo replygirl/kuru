@@ -5411,6 +5411,12 @@ mod tests {
                 };
                 let managed = open().await?;
                 let sibling = open().await?;
+                let (claimed, driver) = managed.bind_project_driver(&project).await?;
+                managed.close().await?;
+                let managed = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    managed.session_catalog_record("legacy-session").await?.context("migrated session catalog")?
+                ))).await?;
                 let barrier = crate::test_support::ReplyBarrier::default();
                 managed.fixture_pause_next_service_reply(&barrier).await?;
                 let mut resume = tokio::spawn({
@@ -5475,6 +5481,7 @@ mod tests {
                     "migrated safe-journal resume completed before its reply was lost"
                 );
                 ensure!(managed.reconcile().await? == Some(true));
+                driver.close().await?;
                 managed.close().await?;
                 sibling.close().await?;
                 Ok::<(), anyhow::Error>(())

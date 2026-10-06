@@ -66,7 +66,10 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
     args.extend(["run".into(), "hello".into(), "--json".into()]);
     let blocked = observed(&fixture).args(&args).output().unwrap();
     assert!(!blocked.status.success());
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("active Kuru writer"));
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr)
+            .contains("project maintenance ownership is unavailable")
+    );
     // Even a read command needs the writer lease before importing a legacy file.
     // An invalid marker proves the lease error precedes any attempt to parse it.
     let legacy = data.join("memory.sqlite3");

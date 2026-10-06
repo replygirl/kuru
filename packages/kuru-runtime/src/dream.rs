@@ -1014,6 +1014,7 @@ mod cancellation_tests {
                 let (left, right) = harnesses.split_at_mut(1);
                 let first = &mut left[0];
                 let second = &mut right[0];
+                let second_bound = second.memory.clone();
                 let participants = first.topology.parts.len();
                 let mut first_work = Box::pin(first.dream());
                 for _ in 0..participants {
@@ -1027,7 +1028,7 @@ mod cancellation_tests {
                 let mut second_work = Box::pin(second.dream());
                 tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
                     tokio::select! {
-                        result = second_memory.fixture_wait_for_dream_lease_refusal() => result,
+                        result = second_bound.fixture_wait_for_dream_lease_refusal() => result,
                         result = &mut second_work => anyhow::bail!("second dream returned before owned lease refusal: {result:?}"),
                         result = &mut first_work => anyhow::bail!("first held dream unexpectedly returned: {result:?}"),
                     }

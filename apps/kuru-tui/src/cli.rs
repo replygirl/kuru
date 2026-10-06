@@ -1212,12 +1212,23 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         Err(error) => return Err(error).context("cannot inspect legacy memory"),
     };
     let migrate = legacy && !exists;
-    let mut project_maintenance = if !purge && ((writer && !runtime_owner) || migrate) {
+    if !purge && (writer || migrate) {
         if let Err(error) = Directory::ensure_private(&data) {
             return Err(data_directory_error(&data, error));
         }
         ensure_outside_workspace(&data, &cwd)?;
+        if runtime_owner {
+            Directory::ensure_private(&data.join("locks"))
+                .context("project lock directory must be a private regular directory")?;
+        }
+    }
+    let mut project_maintenance = if !purge && ((writer && !runtime_owner) || migrate) {
         Some(project_lease(&data, &cwd)?)
+    } else {
+        None
+    };
+    let mut project_startup = if runtime_owner && !migrate {
+        Some(project_startup_lease(&data, &cwd)?)
     } else {
         None
     };
@@ -1530,9 +1541,12 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
             }
         };
         memory_to_close = Some(memory.clone());
-        // Legacy activation is complete. Conversation admission owns a native
-        // session barrier instead of excluding every driver in this project.
-        if runtime_owner { project_maintenance.take(); }
+        // Legacy activation is complete. Retain shared maintenance exclusion
+        // before session admission without excluding independent conversations.
+        if runtime_owner && project_maintenance.is_some() {
+            drop(project_maintenance.take());
+            project_startup = Some(project_startup_lease(&data, &cwd)?);
+        }
         let resume = if cli.continue_session {
             Some(Harness::continuation_session(&memory, &cwd).await?)
         } else if let Some(session_id) = cli.resume.as_deref() {
@@ -1737,6 +1751,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         (Err(error), Ok(())) => Err(error),
     };
     // The stdout-only worker cannot extend the project writer lifetime.
+    drop(project_startup);
     drop(project_maintenance);
     if let Some(delivery) = run_delivery {
         delivery.finish(settled).await
@@ -2115,6 +2130,14 @@ fn ensure_outside_workspace(data: &Path, workspace: &Path) -> Result<()> {
 }
 
 fn project_lease(data: &Path, cwd: &Path) -> Result<ProjectLease> {
+    checked_project_lease(data, cwd, false)
+}
+
+fn project_startup_lease(data: &Path, cwd: &Path) -> Result<ProjectLease> {
+    checked_project_lease(data, cwd, true)
+}
+
+fn checked_project_lease(data: &Path, cwd: &Path, shared: bool) -> Result<ProjectLease> {
     let directory = Directory::ensure_private(&data.join("locks"))
         .context("project lock directory must be a private regular directory")?;
     let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
@@ -2126,11 +2149,17 @@ fn project_lease(data: &Path, cwd: &Path) -> Result<ProjectLease> {
     let file = directory
         .lock_file(&name)
         .context("cannot open the project writer lock")?;
-    file.try_lock().map_err(|error| {
-        anyhow::anyhow!(
-            "project already has an active Kuru writer, or its lock could not be acquired: {error}"
-        )
-    })?;
+    if shared {
+        file.try_lock_shared().map_err(|error| {
+            anyhow::anyhow!("project maintenance ownership is unavailable: {error}")
+        })?;
+    } else {
+        file.try_lock().map_err(|error| {
+            anyhow::anyhow!(
+                "project already has an active Kuru writer, or its lock could not be acquired: {error}"
+            )
+        })?;
+    }
     directory.verify(&name, &file)?;
     Ok(ProjectLease {
         _file: file,

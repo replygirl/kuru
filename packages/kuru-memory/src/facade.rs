@@ -1645,6 +1645,44 @@ impl MemoryStore {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    /// A separate fixture exchange owner for the same authenticated driver.
+    /// No claim is minted and no pending mutation is transferred.
+    pub async fn fixture_independent_driver_exchange(&self) -> Result<Self> {
+        let backend = match &self.backend {
+            Backend::Local(store) => {
+                ensure!(
+                    store.owns_session_presence() && store.pinned_view() == "main",
+                    "fixture exchange requires writable live memory"
+                );
+                self.reconcile().await?;
+                Backend::Local(store.clone())
+            }
+            Backend::Remote(remote) => {
+                ensure!(
+                    !remote.read_only && remote.candidate.is_none() && remote.pinned_view == "main",
+                    "fixture exchange requires writable live memory"
+                );
+                remote.ensure_writable()?;
+                ensure!(
+                    remote.attachment.lock().await.has_complete_exchange(),
+                    "fixture exchange requires a settled attachment"
+                );
+                let attachment = remote.session.factory.connect().await?;
+                Backend::Remote(RemoteSession::new_view(
+                    attachment,
+                    remote.session.options.clone(),
+                    remote.session.project.clone(),
+                    remote.session.executable.clone(),
+                )?)
+            }
+        };
+        Ok(Self {
+            backend,
+            ..self.clone()
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn fixture_pause_next_service_reply(
         &self,
         barrier: &crate::test_support::ReplyBarrier,
@@ -4506,6 +4544,17 @@ mod tests {
                         memory
                             .create_session(session, Mode::Ifs, "fork parent")
                             .await?;
+                        let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                        memory.close().await?;
+                        let memory = claimed;
+                        driver
+                            .select(crate::SessionDriverTarget::Catalog(Box::new(
+                                memory
+                                    .session_catalog_record(session)
+                                    .await?
+                                    .context("fixture session catalog")?,
+                            )))
+                            .await?;
                         memory
                             .checkpoint_session_turn(
                                 &namespace,
@@ -4681,6 +4730,7 @@ mod tests {
                         );
                         candidate.abandon().await?;
 
+                        driver.close().await?;
                         memory.close().await?;
                         sibling.close().await?;
                         Ok::<(), anyhow::Error>(())
@@ -4745,6 +4795,12 @@ mod tests {
                 let sibling = open().await?;
                 let session = "managed-mode";
                 memory.create_session(session, Mode::Ifs, "").await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record(session).await?.context("fixture session catalog")?
+                ))).await?;
                 let before = memory.revision().await?;
                 let namespace = format!("{scope}/transcript/{session}");
                 let state_key = format!("{scope}/session/{session}");
@@ -4877,6 +4933,7 @@ mod tests {
                         .is_empty(),
                     "mode checkpoint fabricated a public turn"
                 );
+                driver.close().await?;
                 memory.close().await?;
                 sibling.close().await?;
                 Ok::<(), anyhow::Error>(())
@@ -4944,6 +5001,12 @@ mod tests {
                         memory
                             .create_session("managed-turn", Mode::Ifs, "")
                             .await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record("managed-turn").await?.context("fixture session catalog")?
+                ))).await?;
                         let Backend::Remote(remote) = &memory.backend else {
                             bail!("managed turn fixture did not attach to the service")
                         };
@@ -5095,6 +5158,7 @@ mod tests {
                             "managed public turn duplicated its raw transcript"
                         );
 
+                        driver.select(crate::SessionDriverTarget::Absent("candidate-turn".into())).await?;
                         let candidate = memory.begin_candidate("public turn candidate").await?;
                         candidate
                             .view()
@@ -5131,6 +5195,9 @@ mod tests {
                             "candidate public-turn admission leaked into main"
                         );
                         candidate.abandon().await?;
+                        driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                            memory.session_catalog_record("managed-turn").await?.context("main session catalog")?
+                        ))).await?;
 
                         memory
                             .checkpoint_session_turn(
@@ -5314,7 +5381,8 @@ mod tests {
                             "older continuation changed the fork's settled prefix"
                         );
 
-                        memory.close().await?;
+                        driver.close().await?;
+                memory.close().await?;
                         sibling.close().await?;
                         Ok::<(), anyhow::Error>(())
                     }
@@ -5447,6 +5515,12 @@ mod tests {
                         };
                         let memory = open().await?;
                         let sibling = open().await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record("legacy-managed").await?.context("fixture session catalog")?
+                ))).await?;
                         let barrier = crate::test_support::ReplyBarrier::default();
                         memory.fixture_pause_next_service_reply(&barrier).await?;
                         let resume = tokio::spawn({
@@ -5518,7 +5592,8 @@ mod tests {
                             "legacy continuation duplicated its retained user row"
                         );
 
-                        memory.close().await?;
+                        driver.close().await?;
+                memory.close().await?;
                         sibling.close().await?;
                         Ok::<(), anyhow::Error>(())
                     }
@@ -6420,6 +6495,13 @@ mod tests {
                 };
                 let memory = open().await?;
                 let sibling = open().await?;
+                memory.create_session("session", Mode::Ifs, "fixture").await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record("session").await?.context("fixture session catalog")?
+                ))).await?;
                 let Backend::Remote(remote) = &memory.backend else {
                     bail!("reasoning summary fixture did not attach to the managed service")
                 };
@@ -6499,6 +6581,7 @@ mod tests {
                 later.summary_index = 1;
                 later.text = "later settled private summary".into();
                 memory.put_reasoning_summaries(&[later]).await?;
+                driver.close().await?;
                 memory.close().await?;
                 sibling.close().await?;
                 Ok::<(), anyhow::Error>(())
@@ -6560,6 +6643,13 @@ mod tests {
                 };
                 let memory = open().await?;
                 let inspector = open().await?;
+                memory.create_session("session-a", Mode::Ifs, "fixture").await?;
+                let (claimed, driver) = memory.bind_project_driver(&project).await?;
+                memory.close().await?;
+                let memory = claimed;
+                driver.select(crate::SessionDriverTarget::Catalog(Box::new(
+                    memory.session_catalog_record("session-a").await?.context("fixture session catalog")?
+                ))).await?;
                 let actor = "project/example/ifs/identity/actor";
                 memory
                     .append_message(actor, &Message::text("user", "legacy"))
@@ -6917,6 +7007,7 @@ mod tests {
                     "candidate row leaked into main session history"
                 );
                 candidate.abandon().await?;
+                driver.close().await?;
                 memory.close().await?;
                 inspector.close().await?;
                 Ok::<(), anyhow::Error>(())
@@ -8804,6 +8895,8 @@ mod tests {
                 &mut events,
                 &[
                     AttachmentAccepted { active: 2 },
+                    AttachmentAccepted { active: 3 },
+                    AttachmentJoined { remaining: 2 },
                     AttachmentJoined { remaining: 1 },
                 ],
             )
@@ -9282,7 +9375,15 @@ mod tests {
                     memory.reconcile().await? == Some(true),
                     "the successor did not prove the pending write"
                 );
-                expect_serve_events(&mut events, &[AttachmentAccepted { active: 1 }]).await?;
+                expect_serve_events(
+                    &mut events,
+                    &[
+                        AttachmentAccepted { active: 1 },
+                        AttachmentAccepted { active: 2 },
+                        AttachmentJoined { remaining: 1 },
+                    ],
+                )
+                .await?;
                 expect_no_serve_event(&mut events, "a successor after checked recovery")?;
                 if reopen {
                     let reopened = memory
@@ -9341,7 +9442,15 @@ mod tests {
                 ..
             } = retire_with_pending_write(&options, &project, gate).await?;
             ensure!(memory.reconcile().await? == Some(true));
-            expect_serve_events(&mut events, &[AttachmentAccepted { active: 1 }]).await?;
+            expect_serve_events(
+                &mut events,
+                &[
+                    AttachmentAccepted { active: 1 },
+                    AttachmentAccepted { active: 2 },
+                    AttachmentJoined { remaining: 1 },
+                ],
+            )
+            .await?;
             // The kept attachment counts: another client is not the sole one.
             let other = open_retiring(&options, &project).await?;
             expect_serve_events(&mut events, &[AttachmentAccepted { active: 2 }]).await?;

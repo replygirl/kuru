@@ -6911,7 +6911,8 @@ mod publication_tests {
             .await
             .unwrap();
             let session_id = harness.session.id.clone();
-            memory
+            harness
+                .memory
                 .rename_session(&session_id, 0, "renamed")
                 .await
                 .unwrap();
@@ -6947,6 +6948,7 @@ mod publication_tests {
             );
             harness.reconcile().await.unwrap();
             assert!(harness.pending_publication.is_none());
+            harness.shutdown(false).await.unwrap();
             drop(harness);
             let resumed = Harness::new(
                 config,
@@ -7991,7 +7993,8 @@ mod publication_tests {
             let PublicTranscriptEntry::Turn { record: selected } = &parent_page.records[0] else {
                 panic!("parent must have one settled public turn");
             };
-            memory
+            parent
+                .memory
                 .fork_session(
                     &parent_id,
                     parent.session.lifecycle_generation,
@@ -8017,7 +8020,8 @@ mod publication_tests {
                 (&actor_namespace, "parent-private-actor-only"),
                 (&relation_namespace, "parent-private-relationship-only"),
             ] {
-                memory
+                parent
+                    .memory
                     .append_session_message(namespace, &parent_id, &Message::text("note", sentinel))
                     .await
                     .unwrap();

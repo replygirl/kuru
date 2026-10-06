@@ -1811,7 +1811,18 @@ async fn real_pty_public_pages_literal_search_and_deep_item_anchor_at_120_and_80
             PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
         );
         let memory = opening.await?;
+        let (claimed, driver) = memory.bind_project_driver(&sandbox.project).await?;
+        memory.close().await?;
+        let memory = claimed;
         let seeded: Result<()> = async {
+            driver
+                .select(kuru_memory::SessionDriverTarget::Catalog(Box::new(
+                    memory
+                        .session_catalog_record(&session)
+                        .await?
+                        .context("navigation claim catalog")?,
+                )))
+                .await?;
             let generation = memory
                 .session_catalog_record(&session)
                 .await?
@@ -1871,9 +1882,11 @@ async fn real_pty_public_pages_literal_search_and_deep_item_anchor_at_120_and_80
             Ok(())
         }
         .await;
+        let released = driver.close().await;
         let closed = memory.close().await;
         let quiesced = kuru_memory::test_support::await_managed_quiescence(&options).await;
         seeded?;
+        released?;
         closed?;
         quiesced?;
         let mut command = sandbox.command("demo");
@@ -2429,12 +2442,24 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
             .to_owned();
         ensure!(cli_action(&["sessions", "remove", &cli_pending])?["lifecycle_state"] == "removed");
         ensure!(cli_action(&["sessions", "restore", &cli_pending])?["lifecycle_state"] == "active");
+        let options = memory_options(&sandbox)?;
         let (_, opening) = MemoryStore::open_managed_observed(
-            memory_options(&sandbox)?,
+            options.clone(),
             sandbox.project.canonicalize()?,
             PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
         );
         let memory = opening.await.context("attach managed CLI catalog")?;
+        let (claimed, driver) = memory.bind_project_driver(&sandbox.project).await?;
+        memory.close().await?;
+        let memory = claimed;
+        driver
+            .select(kuru_memory::SessionDriverTarget::Catalog(Box::new(
+                memory
+                    .session_catalog_record(&cli_pending)
+                    .await?
+                    .context("pending claim catalog")?,
+            )))
+            .await?;
         let generation = memory
             .session_catalog_record(&cli_pending)
             .await?
@@ -2458,7 +2483,9 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
                 },
             )
             .await?;
+        driver.close().await?;
         memory.close().await?;
+        kuru_memory::test_support::await_managed_quiescence(&options).await?;
 
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&requests);
@@ -2729,7 +2756,7 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
         ensure!(
             reopened_picker
                 .lines()
-                .any(|line| { line.contains(&child_id) && line.contains("active fork") }),
+                .any(|line| { line.contains(&child_id) && line.contains("live fork") }),
             "fresh TUI lost the fork identity or provenance: {reopened_picker}"
         );
         ensure!(

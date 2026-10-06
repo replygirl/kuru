@@ -1078,6 +1078,11 @@ mod tests {
                         ensure!(MemoryStore::purge(options.clone()).await.is_err());
                         driver.close().await?;
                         peer.close().await?;
+                        // Local close disposes the socket; only the owner's
+                        // inventory proves both EOF handlers released claims.
+                        while !memory.live_session_drivers().await?.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
                         ensure!(memory.live_session_drivers().await?.is_empty());
                         first.close().await?;
                         second.close().await?;
