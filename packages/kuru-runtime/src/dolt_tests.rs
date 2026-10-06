@@ -45,6 +45,7 @@ struct HeldPeriodicDream {
 
 struct StalePeriodicDream {
     live: MemoryStore,
+    membership: String,
     calls: std::sync::atomic::AtomicUsize,
     wrote: AtomicBool,
 }
@@ -69,12 +70,29 @@ impl Provider for StalePeriodicDream {
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if request.instructions.contains("Phase: dream") {
-            if !self.wrote.swap(true, Ordering::SeqCst) {
+            let first = !self.wrote.swap(true, Ordering::SeqCst);
+            if first {
                 self.live
                     .append("post-answer-live", "user", "force stale dream")
                     .await?;
+                let membership = self.live.get(&self.membership).await?.unwrap();
+                self.live.put(&self.membership, &membership).await?;
             }
-            Ok(Completion::from_legacy("candidate summary", vec![], 0, 0))
+            let proposals = if first {
+                vec![ToolCall {
+                    id: "overlapping-membership".into(),
+                    name: "dream_suggest".into(),
+                    arguments: json!({"action":"add","name":"Observer","role":"ego","instruction":"Consider overlooked details"}),
+                }]
+            } else {
+                vec![]
+            };
+            Ok(Completion::from_legacy(
+                "candidate summary",
+                proposals,
+                0,
+                0,
+            ))
         } else {
             Ok(Completion::from_legacy(
                 "answer before failed maintenance",
@@ -328,9 +346,20 @@ async fn periodic_dream_cancellation_preserves_the_exact_completed_output() {
 async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
     kuru_memory::test_support::closing(async {
         let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
+        let data = kuru_memory::test_support::tempdir().unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(
+            data.path().into(),
+            crate::project_scope(project.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let memory = MemoryStore::open(options).await.unwrap();
         let provider = Arc::new(StalePeriodicDream {
             live: memory.clone(),
+            membership: format!(
+                "{}/freudian/membership",
+                crate::project_scope(project.path()).unwrap()
+            ),
             calls: std::sync::atomic::AtomicUsize::new(0),
             wrote: AtomicBool::new(false),
         });
@@ -378,6 +407,7 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
                 target: proof_target,
                 report,
                 status,
+                ..
             } => {
                 assert!(matches!(status, CandidatePromotionStatus::OpenConflict));
                 (
@@ -415,6 +445,7 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
                     target: retry_target,
                     report: retry_report,
                     status: retry_status,
+                    ..
                 },
             ..
         } = harness
@@ -477,6 +508,8 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
 struct ConcurrentWriter {
     memory: MemoryStore,
     wrote: AtomicBool,
+    membership: Option<String>,
+    calls: std::sync::atomic::AtomicUsize,
 }
 #[async_trait]
 impl Provider for ConcurrentWriter {
@@ -495,10 +528,15 @@ impl Provider for ConcurrentWriter {
         Ok(vec![])
     }
     async fn complete(&self, _request: CompletionRequest) -> Result<Completion> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         if !self.wrote.swap(true, Ordering::SeqCst) {
             self.memory
                 .append("concurrent-chat", "user", "A later live message")
                 .await?;
+            if let Some(key) = &self.membership {
+                let value = self.memory.get(key).await?.unwrap();
+                self.memory.put(key, &value).await?;
+            }
             Ok(Completion::from_legacy(
                 "Candidate summary",
                 vec![ToolCall {
@@ -521,13 +559,77 @@ impl Provider for ConcurrentWriter {
 }
 
 #[tokio::test]
+async fn moved_live_dream_keeps_actual_inference_count_and_later_owned_rows() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let project = tempfile::tempdir()?;
+        let memory = MemoryStore::temporary().await?;
+        let provider = Arc::new(ConcurrentWriter {
+            memory: memory.clone(), wrote: AtomicBool::new(false), membership: None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut harness = Harness::new(config(), project.path(), memory.clone(), provider.clone(), None).await?;
+        let original_parts = harness.topology.parts.len();
+        let keys = crate::engine::checked_state_keys(&harness.scope, &harness.profile)?;
+        let report_identity = harness.topology.parts[0].id.clone();
+        let report_key = keys.state_report(&report_identity);
+        let (staged, release) = harness.pause_before_next_dream_promotion();
+        let mut dream = Box::pin(harness.dream());
+        tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+            tokio::select! {
+                result = staged => { result?; Ok::<(), anyhow::Error>(()) },
+                result = &mut dream => anyhow::bail!("dream returned before candidate staging: {result:?}"),
+            }
+        }).await??;
+        let inference_count = provider.calls.load(Ordering::SeqCst);
+        assert_eq!(inference_count, original_parts);
+        assert_eq!(memory.history("concurrent-chat", 10).await?.len(), 1);
+        let later_report = crate::topology_state::report_value(
+            &report_identity, &crate::StateReport { activation: 0.7, note: "after candidate snapshot".into() },
+        )?;
+        // Use an exact report-row identity, and a distinct session-owned row;
+        // both must survive candidate reconciliation and compensating undo.
+        memory.put(&report_key, &later_report).await?;
+        memory.put("sibling/session", &json!({"focus":"later"})).await?;
+        memory.append("concurrent-chat", "user", "After inference completed").await?;
+        release.send(()).map_err(|_| anyhow::anyhow!("dream stage receiver disappeared"))?;
+        let report = dream.await?;
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), inference_count);
+        assert_eq!(harness.topology.parts.len(), original_parts + 1);
+        assert!(harness.pending_candidate.is_none() && harness.pending_publication.is_none());
+        assert_eq!(memory.history("concurrent-chat", 10).await?.len(), 2);
+        assert_eq!(memory.get(&report_key).await?, Some(later_report.clone()));
+        assert_eq!(memory.get("sibling/session").await?, Some(json!({"focus":"later"})));
+        harness.undo_dream().await?;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), inference_count);
+        assert_eq!(harness.topology.parts.iter().filter(|part| part.active).count(), original_parts);
+        assert_eq!(memory.get(&report_key).await?, Some(later_report));
+        assert_eq!(memory.history("concurrent-chat", 10).await?.len(), 2);
+        harness.shutdown(false).await?;
+        memory.close().await
+    }).await
+}
+
+#[tokio::test]
 async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effects() {
     kuru_memory::test_support::closing(async {
         let project = tempfile::tempdir().unwrap();
-        let memory = MemoryStore::temporary().await.unwrap();
+        let data = kuru_memory::test_support::tempdir().unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(
+            data.path().into(),
+            crate::project_scope(project.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let memory = MemoryStore::open(options).await.unwrap();
         let provider = Arc::new(ConcurrentWriter {
             memory: memory.clone(),
             wrote: AtomicBool::new(false),
+            membership: Some(format!(
+                "{}/freudian/membership",
+                crate::project_scope(project.path()).unwrap()
+            )),
+            calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut harness = Harness::new(config(), project.path(), memory.clone(), provider, None)
             .await
@@ -598,6 +700,7 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
                     target: proof_target,
                     report,
                     status,
+                    ..
                 },
             ..
         } = pending
@@ -617,6 +720,7 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
         let output = harness.run("Continue after failed dream").await.unwrap();
         assert_eq!(output.text, "Another candidate summary");
         harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
     })
     .await
 }

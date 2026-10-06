@@ -20,7 +20,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
 use uuid::Uuid;
 
+mod candidate_reconciliation;
 mod state_read_cut;
+pub use candidate_reconciliation::{
+    CandidateReconciliationObservation, CandidateReconciliationResult,
+};
+pub(crate) fn validate_reconciliation_heads(from: &str, live: &str) -> Result<()> {
+    candidate_reconciliation::commit(from)?;
+    candidate_reconciliation::commit(live)
+}
 pub(crate) mod versioned_state;
 pub use state_read_cut::{StateReadCursor, StateReadCut, StateReadPage, StateReadProvenance};
 pub use versioned_state::{
@@ -42,6 +50,9 @@ use crate::{
 #[path = "store/recovery_tests.rs"]
 mod recovery_tests;
 
+#[cfg(test)]
+#[path = "store/candidate_reconciliation_tests.rs"]
+mod candidate_reconciliation_tests;
 #[cfg(test)]
 #[path = "store/engine_contract_tests.rs"]
 mod engine_contract_tests;
@@ -369,6 +380,11 @@ enum Receipt {
     Promotion {
         base: String,
         target: String,
+    },
+    CandidateReconciliation {
+        branch: String,
+        from: String,
+        live: String,
     },
     CandidateTransition {
         source: String,
@@ -4015,6 +4031,15 @@ impl MemoryStore {
                     );
                     observed == target
                 }
+                Receipt::CandidateReconciliation { branch, from, live } => {
+                    match candidate_reconciliation::observe(self, &branch, &from, &live).await? {
+                        CandidateReconciliationObservation::Committed { .. } => true,
+                        CandidateReconciliationObservation::NotCommitted => false,
+                        CandidateReconciliationObservation::StillUncertain => {
+                            bail!("candidate reconciliation outcome remains uncertain");
+                        }
+                    }
+                }
                 Receipt::CandidateTransition {
                     source,
                     status,
@@ -4160,8 +4185,9 @@ impl MemoryStore {
             return Ok(CandidateLookup::Missing);
         }
         // For an unresolved open ref, main remains an append-only history.
-        // Its exact common ancestor is the original candidate creation base,
-        // including after both heads advance. A resolved ref is rejected above.
+        // Its exact common ancestor is the effective promotion base, including
+        // a proved private reconciliation. Prior creation/request proofs keep
+        // their original immutable coordinates. Resolved refs are rejected above.
         let base = crate::pool::within(
             QUERY_TIMEOUT,
             sqlx::query_scalar::<_, String>("SELECT DOLT_MERGE_BASE(?, ?)")

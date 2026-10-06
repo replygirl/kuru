@@ -15,7 +15,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use kuru_connectors::{
-    ApprovalSender, CheckpointSummary, HookBudget, HookHost,
+    ApprovalSender, CheckpointDiff, CheckpointSummary, HookBudget, HookHost,
     HookObservation as ConnectorHookObservation, HookOutcomeKind, InstructionReviewSender,
     McpBrowserLogin, McpDeviceLogin, McpOAuthAliasStatus, McpOAuthLogout, ParallelReadAdmission,
     ParallelReadCancellation, PermissionService, PostHookRun, PreHookOutcome, PreToolValue,
@@ -51,6 +51,7 @@ use crate::{
     context_compaction::CompactionNotices,
     event::{Event, HookObservation, ToolObservation, ToolOutcome, TurnLimitReason},
     progress::{ContextSnapshot, FacingProgress, ProgressDescriptor, ProgressTurn},
+    tool_cards::{ToolCardBinding, ToolCardFeed, ToolCards},
     topology_state::{self, MembershipRecord, ReportInventory},
 };
 
@@ -189,6 +190,7 @@ struct CancellationState {
 struct TurnCancelled;
 
 struct CognitiveSettlement {
+    card: Option<ToolCardBinding>,
     admitted: std::time::Instant,
     observe: bool,
     speaking: bool,
@@ -506,7 +508,7 @@ pub struct ForgetNoteResult {
 }
 
 #[derive(Debug)]
-pub(crate) struct CandidateResolutionRequired(&'static str);
+pub(crate) struct CandidateResolutionRequired(pub(crate) &'static str);
 
 impl std::fmt::Display for CandidateResolutionRequired {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -532,6 +534,7 @@ pub struct Harness {
     instructions: String,
     events: broadcast::Sender<Event>,
     compaction_notices: CompactionNotices,
+    tool_cards: ToolCards,
     progress: watch::Sender<Option<FacingProgress>>,
     context: watch::Sender<ContextSnapshot>,
     context_epoch: Arc<AtomicU64>,
@@ -641,11 +644,13 @@ pub(crate) enum PublicationProof {
         target: String,
         report: crate::dream::DreamReport,
         status: CandidatePromotionStatus,
+        reconciliation_attempts: usize,
     },
 }
 
 #[derive(Clone)]
 pub(crate) enum CandidatePromotionStatus {
+    Reconciling { from: String, live: String },
     Pending,
     Confirmed(String),
     OpenUnchanged,
@@ -884,6 +889,7 @@ impl Harness {
             instructions,
             events,
             compaction_notices: CompactionNotices::default(),
+            tool_cards: ToolCards::new(),
             progress,
             context,
             context_epoch: Arc::new(AtomicU64::new(0)),
@@ -929,6 +935,10 @@ impl Harness {
             )
             .await?;
         Ok(harness)
+    }
+
+    pub fn tool_card_feed(&self) -> ToolCardFeed {
+        self.tool_cards.feed()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -1010,6 +1020,14 @@ impl Harness {
 
     pub fn file_checkpoint(&self, id: &str) -> Result<Option<CheckpointSummary>> {
         self.tools.inspect_file_checkpoint(id)
+    }
+
+    pub fn file_checkpoint_diff(&self, id: &str) -> Result<CheckpointDiff> {
+        self.tools.file_checkpoint_diff(id)
+    }
+
+    pub fn file_checkpoint_diff_reader(&self) -> Option<kuru_connectors::CheckpointDiffReader> {
+        self.tools.file_checkpoint_diff_reader()
     }
 
     pub fn prune_file_checkpoint(&self, id: &str, discard_uncertain: bool) -> Result<bool> {
@@ -1310,6 +1328,7 @@ impl Harness {
         self.session = session;
         self.report_inventory = Some(snapshot.inventory);
         self.operation_id = Uuid::new_v4().to_string();
+        self.tool_cards.clear();
         self.invocation_ordinal.store(0, Ordering::Release);
         self.sync_actors_with(&namespaces);
         self.reset_context_snapshot();
@@ -1339,6 +1358,7 @@ impl Harness {
         self.session = session;
         self.topology.focus = None;
         self.operation_id = Uuid::new_v4().to_string();
+        self.tool_cards.clear();
         self.invocation_ordinal.store(0, Ordering::Release);
         self.reset_context_snapshot();
         self.save().await?;
@@ -2120,6 +2140,7 @@ impl Harness {
         let mut running = FuturesUnordered::new();
         let wave_cancellation = ParallelReadCancellation::default();
         for prepared in wave {
+            let card = self.admit_tool_card(actor, invocation_id, turn_id, &prepared.call, false);
             self.emit_event(Event::ToolStarted {
                 actor: actor.into(),
                 call_id: prepared.call.id.clone(),
@@ -2150,6 +2171,7 @@ impl Harness {
                     prepared.admitted,
                     outcome.result,
                     hooks,
+                    card,
                 )
             });
         }
@@ -2169,14 +2191,21 @@ impl Harness {
                     settled = running.next() => settled,
                 }
             };
-            let Some((position, call, admitted, result, hooks)) = settled else {
+            let Some((position, call, admitted, result, hooks, card)) = settled else {
                 continue;
             };
             if cancelled {
                 let cancelled_result: Result<String> = Err(TurnCancelled.into());
-                self.observe_tool(actor, &call, &cancelled_result, admitted, false);
+                self.observe_tool(
+                    actor,
+                    &call,
+                    &cancelled_result,
+                    admitted,
+                    false,
+                    card.as_ref(),
+                );
             } else {
-                self.observe_tool(actor, &call, &result, admitted, false);
+                self.observe_tool(actor, &call, &result, admitted, false, card.as_ref());
             }
             results[position] = Some((call, result, hooks));
         }
@@ -2201,6 +2230,42 @@ impl Harness {
         Ok(ordered)
     }
 
+    fn admit_tool_card(
+        &mut self,
+        actor: &str,
+        invocation_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        metadata_only: bool,
+    ) -> Option<ToolCardBinding> {
+        self.tool_cards.admit(
+            &kuru_connectors::ToolInvocationContext {
+                session_id: self.session.id.clone(),
+                turn_id: turn_id.into(),
+                actor_id: actor.into(),
+                invocation_id: invocation_id.into(),
+                call_id: call.id.clone(),
+            },
+            call,
+            metadata_only || is_cognitive(&call.name),
+        )
+    }
+
+    /// Model a missing transient observation in the existing caller-drop
+    /// recovery fixture. This creates no tool effect or durable event.
+    #[cfg(test)]
+    pub(crate) fn fixture_pending_tool_card(
+        &mut self,
+        turn: &str,
+        actor: &str,
+        call: &ToolCall,
+    ) -> Option<String> {
+        self.tool_cards
+            .begin(&self.session.id, self.memory.selected_view_name());
+        self.admit_tool_card(actor, "fixture-missing-observation", turn, call, false)
+            .map(|binding| binding.id)
+    }
+
     fn observe_tool(
         &mut self,
         actor: &str,
@@ -2208,6 +2273,7 @@ impl Harness {
         result: &Result<String>,
         admitted: std::time::Instant,
         project_receipt: bool,
+        card: Option<&ToolCardBinding>,
     ) {
         let (outcome, receipt) = match result {
             Ok(output)
@@ -2233,6 +2299,11 @@ impl Harness {
                 Some(projected_tool_receipt(result, project_receipt)),
             ),
         };
+        self.tool_cards.settle(
+            card,
+            outcome,
+            receipt.as_ref().and_then(Value::as_str).map(str::to_owned),
+        );
         self.emit_event(Event::ToolSettled {
             actor: actor.into(),
             observation: ToolObservation::from_projected_receipt(
@@ -2793,6 +2864,15 @@ impl Harness {
     /// shared topology; ordinary commands consume any deferred refresh here.
     async fn reconcile_with_refresh(&mut self, refresh: bool) -> Result<()> {
         self.rebind_main_if_retired().await?;
+        // A cancelled dream releases its lease, but its accepted merge may still
+        // need exact recovery. Reacquire serialization before touching that proof.
+        let _dream_lease = if self.pending_publication.as_ref().is_some_and(|pending| {
+            matches!(pending.proof, PublicationProof::CandidatePromotion { .. })
+        }) {
+            Some(self.memory.acquire_dream_lease().await?)
+        } else {
+            None
+        };
         if let Some(candidate) = self.memory.recover_candidate_begin().await? {
             ensure!(
                 self.pending_candidate.is_none(),
@@ -2809,25 +2889,23 @@ impl Harness {
             self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
             self.rebind_main_if_retired().await?;
         }
-        if let Some(candidate) = &self.pending_candidate {
-            // Preserve the existing candidate recovery ordering; no new mutable
-            // candidate authority is retained by the notice collection.
-            let view = candidate.view();
-            if self
-                .compaction_notices
-                .has_unresolved(Some(candidate.branch()))
-            {
-                view.reconcile().await?;
-                self.compaction_notices
-                    .confirm_on(&view, candidate.branch(), &self.events)
-                    .await?;
-            }
+        if !self.pending_publication.as_ref().is_some_and(|pending| {
+            matches!(
+                pending.proof,
+                PublicationProof::CandidatePromotion {
+                    status: CandidatePromotionStatus::Reconciling { .. },
+                    ..
+                }
+            )
+        }) {
+            self.confirm_candidate_compaction_notices().await?;
         }
         if let Some(PublicationProof::CandidatePromotion {
             base,
             target,
             report,
             status,
+            ..
         }) = self
             .pending_publication
             .as_ref()
@@ -2842,6 +2920,19 @@ impl Harness {
                 .clone();
             ensure!(candidate.base() == base, "dream candidate base changed");
             match status {
+                CandidatePromotionStatus::Reconciling { from, live } if !abandonment => {
+                    self.recover_dream_reconciliation(&candidate, &from, &live)
+                        .await?;
+                    self.rebind_main_if_retired().await?;
+                    self.confirm_candidate_compaction_notices().await?;
+                    self.drive_dream_promotion(false, &CancellationToken::new())
+                        .await?;
+                    self.publish_recovered_dream(&report).await?;
+                    return Ok(());
+                }
+                CandidatePromotionStatus::Reconciling { .. } => {
+                    bail!("dream reconciliation must settle before abandonment")
+                }
                 CandidatePromotionStatus::Confirmed(revision) => {
                     ensure!(revision == target, "dream promoted a different revision");
                     self.publish_recovered_dream(&report).await?;
@@ -3091,6 +3182,23 @@ impl Harness {
         Ok(())
     }
 
+    async fn confirm_candidate_compaction_notices(&self) -> Result<()> {
+        if let Some(candidate) = &self.pending_candidate
+            && self
+                .compaction_notices
+                .has_unresolved(Some(candidate.branch()))
+        {
+            // Exact typed candidate recovery must settle before this generic
+            // view fence and body-free selected-branch confirmation.
+            let view = candidate.view();
+            view.reconcile().await?;
+            self.compaction_notices
+                .confirm_on(&view, candidate.branch(), &self.events)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn rebind_main_if_retired(&mut self) -> Result<()> {
         if let Some(fresh) = self.memory.reopen_after_checked_recovery().await? {
             self.memory = fresh;
@@ -3101,13 +3209,21 @@ impl Harness {
         Ok(())
     }
 
-    async fn publish_recovered_dream(&mut self, report: &crate::dream::DreamReport) -> Result<()> {
-        // Typed promotion recovery may have retired the old generation. Use
-        // its checked successor before publishing or reading shared state.
+    pub(crate) async fn publish_pending_dream(&mut self) -> Result<()> {
+        // Typed transition recovery may have retired the old main session.
+        // Bind its checked successor before consuming staged publication, so a
+        // failed rebind keeps the exact accepted proof available for retry.
         self.rebind_main_if_retired().await?;
         self.publish_pending();
         self.report_inventory = None;
-        self.refresh_topology_for_turn().await?;
+        self.refresh_topology_for_turn().await
+    }
+
+    pub(crate) async fn publish_recovered_dream(
+        &mut self,
+        report: &crate::dream::DreamReport,
+    ) -> Result<()> {
+        self.publish_pending_dream().await?;
         self.emit_event(Event::Dream {
             actor: "pool".into(),
             detail: format!(
@@ -3991,6 +4107,7 @@ impl Harness {
                 reviews,
             )
             .await;
+        self.tool_cards.end_turn(&self.session.id, turn_id);
         guard.turn = None;
         result
     }
@@ -4066,6 +4183,8 @@ impl Harness {
                 "aborted invocation lacks its pending turn journal"
             ),
         }
+        self.tool_cards
+            .end_turn(&aborted.session_id, &aborted.turn_id);
         *self
             .aborted_turn
             .lock()
@@ -4104,6 +4223,9 @@ impl Harness {
                 resolved_target,
             } => (key, journal, resolved_target),
         };
+        // Completed-turn reuse above neither dispatches nor invents new cards.
+        let source_view = self.memory.selected_view_name().to_owned();
+        self.tool_cards.begin(&self.session.id, &source_view);
         let turn = self.turn_correlation(turn_id);
         let span = tracing::info_span!(
             target: "kuru.runtime",
@@ -4438,6 +4560,7 @@ impl Harness {
                         ToolHookAdmission::Dispatch(call) => (call, None),
                         ToolHookAdmission::Settled(call, result) => (call, Some(result)),
                     };
+                    let card = self.admit_tool_card(&id, &invocation_id, turn_id, &call, true);
                     let result = if let Some(result) = pre_settled {
                         used += 1;
                         self.emit_event(Event::ToolStarted {
@@ -4446,7 +4569,7 @@ impl Harness {
                             name: call.name.clone(),
                         });
                         trace_settled_admission(&call, &result, admitted);
-                        self.observe_tool(&id, &call, &result, admitted, true);
+                        self.observe_tool(&id, &call, &result, admitted, true, card.as_ref());
                         result
                     } else if used >= self.config.max_tool_calls {
                         limited = true;
@@ -4458,7 +4581,7 @@ impl Harness {
                             });
                         }
                         let result = Err(anyhow::anyhow!("turn tool budget exhausted"));
-                        self.observe_tool(&id, &call, &result, admitted, true);
+                        self.observe_tool(&id, &call, &result, admitted, true, card.as_ref());
                         result
                     } else {
                         used += 1;
@@ -4468,6 +4591,7 @@ impl Harness {
                             &mut pending,
                             cancellation,
                             CognitiveSettlement {
+                                card: card.clone(),
                                 admitted,
                                 observe: true,
                                 speaking: false,
@@ -4764,6 +4888,15 @@ impl Harness {
                         (call, None)
                     }
                 };
+                let card = self.admit_tool_card(
+                    &speaker,
+                    &invocation_id,
+                    turn_id,
+                    &call,
+                    pre_settled.is_some()
+                        || used >= self.config.max_tool_calls
+                        || instructions_refreshed,
+                );
                 let result = if let Some(result) = pre_settled {
                     used += 1;
                     self.emit_event(Event::ToolStarted {
@@ -4772,7 +4905,7 @@ impl Harness {
                         name: call.name.clone(),
                     });
                     trace_settled_admission(&call, &result, admitted);
-                    self.observe_tool(&speaker, &call, &result, admitted, true);
+                    self.observe_tool(&speaker, &call, &result, admitted, true, card.as_ref());
                     result
                 } else if used >= self.config.max_tool_calls {
                     limited = true;
@@ -4786,7 +4919,7 @@ impl Harness {
                     let result = Err(anyhow::anyhow!(
                         "turn tool budget exhausted; finish with available evidence"
                     ));
-                    self.observe_tool(&speaker, &call, &result, admitted, true);
+                    self.observe_tool(&speaker, &call, &result, admitted, true, card.as_ref());
                     result
                 } else {
                     used += 1;
@@ -4797,7 +4930,7 @@ impl Harness {
                     });
                     if instructions_refreshed {
                         let result = Ok("New path-specific instructions were activated. Replan this call before executing it; the original call made no change.".to_owned());
-                        self.observe_tool(&speaker, &call, &result, admitted, true);
+                        self.observe_tool(&speaker, &call, &result, admitted, true, card.as_ref());
                         result
                     } else if is_cognitive(&call.name) {
                         let mut mail = BTreeMap::new();
@@ -4808,6 +4941,7 @@ impl Harness {
                                 &mut mail,
                                 cancellation,
                                 CognitiveSettlement {
+                                    card: card.clone(),
                                     admitted,
                                     observe: false,
                                     speaking: true,
@@ -4853,7 +4987,7 @@ impl Harness {
                                 }
                             }
                         }
-                        self.observe_tool(&speaker, &call, &result, admitted, true);
+                        self.observe_tool(&speaker, &call, &result, admitted, true, card.as_ref());
                         result
                     } else {
                         let span = tracing::info_span!(
@@ -4867,7 +5001,7 @@ impl Harness {
                             .wait(async {
                                 Ok(self
                                     .tools
-                                    .execute_for_actor_with_context(
+                                    .execute_for_actor_with_context_and_progress(
                                         &call.name,
                                         call.arguments.clone(),
                                         reviews.permission,
@@ -4879,6 +5013,7 @@ impl Harness {
                                             invocation_id: invocation_id.clone(),
                                             call_id: call.id.clone(),
                                         },
+                                        card.as_ref().and_then(|card| card.progress.as_ref()),
                                     )
                                     .await)
                             })
@@ -4893,7 +5028,7 @@ impl Harness {
                             });
                         let status = tool_diagnostic_status(&call, &result);
                         tracing::info!(target: "kuru.tool", parent: &span, status, elapsed_ms = started.elapsed().as_millis() as u64, "external tool finished");
-                        self.observe_tool(&speaker, &call, &result, admitted, false);
+                        self.observe_tool(&speaker, &call, &result, admitted, false, card.as_ref());
                         result
                     }
                 };
@@ -5158,7 +5293,14 @@ impl Harness {
             "cognitive tool finished"
         );
         if settlement.observe {
-            self.observe_tool(sender, call, &result, settlement.admitted, true);
+            self.observe_tool(
+                sender,
+                call,
+                &result,
+                settlement.admitted,
+                true,
+                settlement.card.as_ref(),
+            );
         }
         result
     }
@@ -8048,6 +8190,7 @@ mod publication_tests {
                         &mut BTreeMap::new(),
                         &CancellationToken::new(),
                         CognitiveSettlement {
+                            card: None,
                             admitted: std::time::Instant::now(),
                             observe: true,
                             speaking: false,

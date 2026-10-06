@@ -636,6 +636,7 @@ impl PreparedRead {
                         ToolInvocationOrigin::Actor(&self.context),
                         None,
                         &mut instructions,
+                        None,
                     ) => result,
             };
         }
@@ -691,6 +692,7 @@ impl PreparedRead {
                         ToolInvocationOrigin::Actor(&self.context),
                         self.target.as_ref(),
                         &mut instructions,
+                        None,
                     )
                     .await;
                 if let Some(CapturedTarget::Directory(captured)) = &self.captured_target

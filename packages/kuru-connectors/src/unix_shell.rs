@@ -460,6 +460,7 @@ impl ShellRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute<F>(
         &self,
         root_guard: Arc<Directory>,
@@ -467,6 +468,25 @@ impl ShellRegistry {
         command: String,
         duration: Duration,
         environment: F,
+    ) -> Result<String>
+    where
+        F: FnOnce() -> Vec<(std::ffi::OsString, std::ffi::OsString)>
+            + Send
+            + 'static
+            + std::panic::UnwindSafe,
+    {
+        self.execute_with_progress(root_guard, root, command, duration, environment, None)
+            .await
+    }
+
+    pub(crate) async fn execute_with_progress<F>(
+        &self,
+        root_guard: Arc<Directory>,
+        root: PathBuf,
+        command: String,
+        duration: Duration,
+        environment: F,
+        progress: Option<crate::ShellProgress>,
     ) -> Result<String>
     where
         F: FnOnce() -> Vec<(std::ffi::OsString, std::ffi::OsString)>
@@ -519,6 +539,7 @@ impl ShellRegistry {
             deadline,
             cleanup_allowance,
             admission,
+            progress,
             #[cfg(test)]
             test_hooks: self.test_hooks.clone(),
             #[cfg(test)]
@@ -724,6 +745,7 @@ struct WorkerRequest {
     deadline: Instant,
     cleanup_allowance: Duration,
     admission: ShellAdmissionPermit,
+    progress: Option<crate::ShellProgress>,
     #[cfg(test)]
     test_hooks: TestHooks,
     #[cfg(test)]
@@ -739,6 +761,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         deadline,
         cleanup_allowance,
         admission,
+        progress,
         #[cfg(test)]
         test_hooks,
         #[cfg(test)]
@@ -889,6 +912,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
             &mut stderr,
             &control,
             deadline,
+            progress.as_ref(),
             #[cfg(test)]
             &test_hooks,
         ));
@@ -1029,13 +1053,16 @@ async fn read_until_terminal(
     stderr: &mut tokio::process::ChildStderr,
     control: &Control,
     deadline: Instant,
+    progress: Option<&crate::ShellProgress>,
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> ShellRead {
     let mut stdout_capture = ShellCapture::new();
     let mut stderr_capture = ShellCapture::new();
     let mut category = {
-        let out_read = stdout_capture.read(stdout);
-        let err_read = stderr_capture.read(stderr);
+        let out_read =
+            stdout_capture.read_with_progress(stdout, progress, crate::ShellStream::Stdout);
+        let err_read =
+            stderr_capture.read_with_progress(stderr, progress, crate::ShellStream::Stderr);
         tokio::pin!(out_read);
         tokio::pin!(err_read);
         let mut out_done = false;
@@ -1354,6 +1381,106 @@ mod tests {
 
     fn retained_root(path: &Path) -> Arc<Directory> {
         Arc::new(Directory::open(path, Privacy::Inherited, NameRetention::Pinned).unwrap())
+    }
+
+    #[tokio::test]
+    async fn owned_shell_safe_preview_is_bounded_before_cancellation_cleanup() -> Result<()> {
+        use anyhow::Context as _;
+        let root = tempfile::tempdir()?;
+        let registry = Arc::new(ShellRegistry::new());
+        let progress = crate::ShellProgress::new();
+        let command = "printf 'SAFE_START sk-proj-abcdefgh'; : > first; while [ ! -f release ]; do sleep 0.01; done; printf 'ijklmnop0123456789\\n'; i=0; while [ \"$i\" -lt 400 ]; do printf 'SAFE_NOISY_FILLER_0123456789\\n'; i=$((i+1)); done; : > noisy; while [ ! -f finish ]; do sleep 0.01; done";
+        let call = tokio::spawn({
+            let registry = registry.clone();
+            let path = root.path().to_owned();
+            let progress = progress.clone();
+            async move {
+                registry
+                    .execute_with_progress(
+                        retained_root(&path),
+                        path,
+                        command.into(),
+                        Duration::from_secs(20),
+                        Vec::new,
+                        Some(progress),
+                    )
+                    .await
+            }
+        });
+        let outcome = timeout_at(
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            async {
+                loop {
+                    if root.path().join("first").exists()
+                        && progress
+                            .snapshot()
+                            .stdout
+                            .as_ref()
+                            .is_some_and(|preview| preview.text.contains("SAFE_START"))
+                    {
+                        break;
+                    }
+                    sleep(OBSERVE_INTERVAL).await;
+                }
+                ensure!(
+                    !progress
+                        .snapshot()
+                        .stdout
+                        .context("safe prefix absent")?
+                        .text
+                        .contains("sk-proj-"),
+                    "partial prefix exposed a secret"
+                );
+                std::fs::write(root.path().join("release"), b"")?;
+                // The consumer deliberately retains only the latest update while
+                // the real producer drains its noisy output to its causal marker.
+                loop {
+                    if root.path().join("noisy").exists()
+                        && progress
+                            .snapshot()
+                            .stdout
+                            .as_ref()
+                            .is_some_and(|preview| preview.truncated)
+                    {
+                        break;
+                    }
+                    sleep(OBSERVE_INTERVAL).await;
+                }
+                let preview = progress.snapshot().stdout.context("preview absent")?;
+                ensure!(preview.truncated && preview.text.contains("[REDACTED:recognized-secret]"));
+                ensure!(!preview.text.contains("sk-proj-"));
+                ensure!(preview.text.len() <= crate::MAX_SHELL_PREVIEW_BYTES);
+                ensure!(
+                    registry.owner_count() == 1 && !call.is_finished(),
+                    "preview waited for EOF"
+                );
+                Ok::<(), anyhow::Error>(())
+            },
+        )
+        .await;
+        // Retain the root and owner on every failure path until actual cleanup.
+        call.abort();
+        let joined = call.await;
+        let cleanup = timeout_at(
+            tokio::time::Instant::now() + Duration::from_secs(6),
+            registry.shutdown(),
+        )
+        .await;
+        let cleanup = cleanup
+            .context("preview shell cleanup exceeded its bound")
+            .and_then(|result| result);
+        if cleanup.is_err() || registry.owner_count() != 0 {
+            let retained = root.keep();
+            anyhow::bail!(
+                "preview shell cleanup unconfirmed; root retained at {retained:?}; cleanup: {cleanup:?}; observation: {outcome:?}"
+            );
+        }
+        outcome.context("safe shell preview did not reach its held marker")??;
+        ensure!(
+            joined.is_err_and(|error| error.is_cancelled()),
+            "held caller did not cancel"
+        );
+        Ok(())
     }
 
     struct RegistryWake {

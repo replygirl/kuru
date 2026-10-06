@@ -30,10 +30,12 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 #[derive(Default)]
 struct TranscriptCache {
+    view_identity: Option<uuid::Uuid>,
     source: Vec<(String, String)>,
     completion_metadata: BTreeMap<usize, String>,
     width: u16,
     lines: Vec<Line<'static>>,
+    tool_card_epoch: u64,
 }
 
 thread_local! {
@@ -47,9 +49,11 @@ fn style(color: Color) -> Style {
 }
 
 fn update_transcript_cache(cache: &mut TranscriptCache, view: &View, width: u16) {
-    if cache.width != width
+    if cache.view_identity != Some(view.tool_card_cache_identity.0)
+        || cache.width != width
         || cache.source != view.transcript
         || cache.completion_metadata != view.completion_metadata
+        || cache.tool_card_epoch != view.tool_card_epoch
     {
         cache.lines = wrap_lines(conversation_lines(view), usize::from(width.max(1)));
         cache.source.clone_from(&view.transcript);
@@ -57,6 +61,8 @@ fn update_transcript_cache(cache: &mut TranscriptCache, view: &View, width: u16)
             .completion_metadata
             .clone_from(&view.completion_metadata);
         cache.width = width;
+        cache.tool_card_epoch = view.tool_card_epoch;
+        cache.view_identity = Some(view.tool_card_cache_identity.0);
     }
 }
 
@@ -536,9 +542,135 @@ fn conversation_lines(view: &View) -> Vec<Line<'static>> {
                 style(MUTED),
             )));
         }
+        for card in view.tool_cards.iter().filter(|card| card.anchor == index) {
+            draw_card_lines(view, card, &mut lines);
+        }
         lines.push(Line::default());
     }
+    if !view.tool_cards.is_empty() || view.tool_cards_omitted > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Tool cards · F6 select · F7 expand/collapse{}",
+                if view.tool_cards_omitted > 0 {
+                    format!(" · {} older details unavailable", view.tool_cards_omitted)
+                } else {
+                    String::new()
+                }
+            ),
+            style(MUTED),
+        )));
+    }
     lines
+}
+
+fn card_detail(lines: &mut Vec<Line<'static>>, text: &str, limit: usize, color: Color) {
+    let safe = super::tool_cards::safe(text);
+    lines.extend(
+        safe.lines()
+            .take(limit)
+            .map(|line| Line::from(Span::styled(format!("    {line}"), style(color)))),
+    );
+    if safe.lines().count() > limit {
+        lines.push(Line::from(Span::styled(
+            "    [remaining lines omitted in this view]",
+            style(AMBER),
+        )));
+    }
+}
+
+fn draw_card_lines(
+    view: &View,
+    card: &super::tool_cards::CardView,
+    lines: &mut Vec<Line<'static>>,
+) {
+    use kuru_runtime::{ToolCardState, ToolOutcome};
+    let (state, color) = match card.card.state {
+        ToolCardState::Pending => ("Pending", AMBER),
+        ToolCardState::Settled(ToolOutcome::Ok) => ("Complete", MINT),
+        ToolCardState::Settled(ToolOutcome::Error) => ("Failed", ROSE),
+        ToolCardState::Settled(ToolOutcome::Denied) => ("Denied", AMBER),
+        ToolCardState::Settled(ToolOutcome::Cancelled) => ("Cancelled", AMBER),
+        ToolCardState::Interrupted => ("Interrupted · exact outcome unavailable", AMBER),
+    };
+    let selected = view.selected_tool_card.as_deref() == Some(card.card.id.as_str());
+    lines.push(Line::from(vec![
+        Span::styled(if selected { "  ▸ " } else { "  ▹ " }, style(color)),
+        Span::styled(super::tool_cards::safe(&card.card.name), bold(color)),
+        Span::styled(
+            format!(
+                " · #{} · {} · {state}",
+                card.card.ordinal,
+                super::tool_cards::safe(&short_name(view, &card.card.actor_id))
+            ),
+            style(MUTED),
+        ),
+    ]));
+    if !card.expanded {
+        return;
+    }
+    if card.card.source_view != "main" {
+        card_detail(
+            lines,
+            &format!("Candidate view: {}", card.card.source_view),
+            1,
+            MUTED,
+        );
+    }
+    if card.card.private_content {
+        card_detail(lines, "Arguments and result withheld", 1, MUTED);
+        return;
+    }
+    if let Some(arguments) = &card.card.arguments {
+        card_detail(lines, &format!("Arguments: {arguments}"), 8, MUTED);
+    }
+    if let Some(output) = &card.card.output {
+        card_detail(lines, output, 48, TEXT);
+    } else {
+        card_detail(
+            lines,
+            if card.card.state == ToolCardState::Pending {
+                "Settled result not available yet"
+            } else {
+                "No settled output available; no outcome is inferred from a partial preview"
+            },
+            2,
+            MUTED,
+        );
+    }
+    if !card.stdout.is_empty() {
+        card_detail(lines, "stdout (partial)", 1, MUTED);
+        card_detail(lines, &card.stdout, 24, TEXT);
+    }
+    if !card.stderr.is_empty() {
+        card_detail(lines, "stderr (partial)", 1, MUTED);
+        card_detail(lines, &card.stderr, 24, AMBER);
+    }
+    if card.gap {
+        card_detail(
+            lines,
+            "Partial preview truncated or updates omitted; settled result is authoritative",
+            2,
+            AMBER,
+        );
+    }
+    if let Some(diff) = &card.diff {
+        card_detail(lines, "checked recorded file diff", 1, MUTED);
+        match diff {
+            kuru_connectors::CheckpointDiff::Available { text, .. } => {
+                card_detail(lines, text, 64, TEXT)
+            }
+            kuru_connectors::CheckpointDiff::Unavailable { reason } => {
+                card_detail(lines, reason, 2, AMBER)
+            }
+        }
+    } else if card.card.checkpoint_id.is_some() {
+        card_detail(
+            lines,
+            "Checked file diff available after this operation settles",
+            2,
+            MUTED,
+        );
+    }
 }
 
 fn inline_spans(text: &str, color: Color) -> Vec<Span<'static>> {

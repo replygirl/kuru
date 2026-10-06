@@ -56,6 +56,7 @@ mod render;
 #[cfg(test)]
 mod runtime_tests;
 mod scene;
+mod tool_cards;
 pub use render::draw;
 
 const ACTIVITY_DRAIN_CAP: usize = 256;
@@ -222,9 +223,15 @@ pub struct InitialViewData {
 
 #[derive(Debug, Clone)]
 pub struct View {
+    tool_card_cache_identity: tool_cards::CacheIdentity,
     pub transcript: Vec<(String, String)>,
     completion_metadata: BTreeMap<usize, String>,
     compaction_notices_seen: BTreeSet<(String, String)>,
+    tool_cards: Vec<tool_cards::CardView>,
+    selected_tool_card: Option<String>,
+    tool_cards_omitted: u64,
+    tool_cards_hidden_through: u64,
+    tool_card_epoch: u64,
     pub input: String,
     pub cursor: usize,
     command_completion: Option<CommandCompletion>,
@@ -303,6 +310,11 @@ impl View {
         if self.session != session {
             self.cancel_recall();
             self.session = session;
+            self.tool_cards.clear();
+            self.selected_tool_card = None;
+            self.tool_cards_omitted = 0;
+            self.tool_cards_hidden_through = 0;
+            self.tool_card_epoch = self.tool_card_epoch.wrapping_add(1);
         }
     }
 
@@ -521,6 +533,12 @@ impl View {
         Self {
             completion_metadata: BTreeMap::new(),
             compaction_notices_seen: BTreeSet::new(),
+            tool_cards: Vec::new(),
+            tool_card_cache_identity: tool_cards::CacheIdentity::default(),
+            selected_tool_card: None,
+            tool_cards_omitted: 0,
+            tool_cards_hidden_through: 0,
+            tool_card_epoch: 0,
             transcript,
             input: String::new(),
             cursor: 0,
@@ -652,6 +670,15 @@ impl View {
     fn clear_visible_conversation(&mut self) {
         self.transcript.clear();
         self.completion_metadata.clear();
+        self.tool_cards_hidden_through = self
+            .tool_cards
+            .iter()
+            .map(|card| card.card.ordinal)
+            .max()
+            .unwrap_or(self.tool_cards_hidden_through);
+        self.tool_cards.clear();
+        self.selected_tool_card = None;
+        self.tool_card_epoch = self.tool_card_epoch.wrapping_add(1);
         self.scroll = 0;
         self.show_scene = true;
         self.status = "View cleared · stored history unchanged".into();
@@ -1337,6 +1364,12 @@ impl View {
             KeyCode::Tab if !self.busy => self.complete_command(false),
             KeyCode::BackTab if !self.busy => self.complete_command(true),
             KeyCode::F(5) if !self.busy => return Some("/permissions".into()),
+            KeyCode::F(6) if self.permission_prompt.is_none() && self.recall.is_none() => {
+                self.select_tool_card();
+            }
+            KeyCode::F(7) if self.permission_prompt.is_none() && self.recall.is_none() => {
+                self.toggle_tool_card();
+            }
             KeyCode::F(2) => {
                 self.open_picker(Picker::Models);
             }
@@ -2101,6 +2134,9 @@ enum LoopWake {
     Approval(Option<ApprovalRequest>),
     Instruction(Option<InstructionReviewRequest>),
     Context(Result<(), watch::error::RecvError>),
+    ToolCards(Result<kuru_runtime::ToolCardUpdate, broadcast::error::RecvError>),
+    ToolPreview(String, kuru_connectors::ShellPreviewSnapshot),
+    ToolDiff(std::result::Result<tool_cards::DiffResult, tokio::task::JoinError>),
     Regular(Wake),
 }
 
@@ -2415,6 +2451,9 @@ async fn apply_completion(
         let mut harness = harness.lock().await;
         let recovery = harness.reconcile_compaction_notices().await;
         let notices = harness.take_compaction_notices();
+        // The operation has actually returned. A final quit frame must show
+        // the same terminal card state as the ordinary next dirty frame.
+        view.refresh_tool_cards(harness.tool_card_feed().snapshot_for_session(&view.session));
         if let Err(error) = recovery {
             view.transcript.push((
                 "error".into(),
@@ -2644,6 +2683,12 @@ where
     let mut events = harness.subscribe();
     let mut progress = harness.subscribe_progress();
     let mut context = harness.subscribe_context();
+    let tool_feed = harness.tool_card_feed();
+    let diff_reader = harness.file_checkpoint_diff_reader();
+    let mut diff_job: Option<JoinHandle<tool_cards::DiffResult>> = None;
+    let mut diff_tag: Option<tool_cards::DiffResult> = None;
+    let mut tool_updates = tool_feed.subscribe();
+    let mut tool_cards_open = true;
     let harness = Arc::new(Mutex::new(harness));
     let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
     let mut job: Option<JoinHandle<()>> = None;
@@ -2669,6 +2714,25 @@ where
     let result: Result<()> = async {
         loop {
             if dirty {
+                view.refresh_tool_cards(tool_feed.snapshot_for_session(&view.session));
+                while !view.busy && diff_job.is_none()
+                    && let Some((card, receipt)) = view.next_diff()
+                {
+                    let request = tool_cards::DiffResult {
+                        session: view.session.clone(), card, receipt,
+                        diff: kuru_connectors::CheckpointDiff::Unavailable { reason: "Checked file diff unavailable" },
+                    };
+                    if let Some(reader) = diff_reader.clone() {
+                        diff_tag = Some(request.clone());
+                        diff_job = Some(tokio::task::spawn_blocking(move || {
+                            let mut result = request;
+                            if let Ok(diff) = reader.read(&result.receipt) { result.diff = diff; }
+                            result
+                        }));
+                    } else {
+                        view.accept_diff(request);
+                    }
+                }
                 let size = terminal
                     .size()
                     .map_err(|error| anyhow::anyhow!("terminal size: {error}"))?;
@@ -2691,6 +2755,9 @@ where
                 request = async { approval_rx.as_mut().expect("guarded approval receiver").recv().await }, if approval_rx.is_some() => LoopWake::Approval(request),
                 request = async { instruction_rx.as_mut().expect("guarded instruction receiver").recv().await }, if instruction_rx.is_some() => LoopWake::Instruction(request),
                 update = context.changed(), if context_open => LoopWake::Context(update),
+                update = tool_updates.recv(), if tool_cards_open => LoopWake::ToolCards(update),
+                (id, preview) = tool_cards::next_preview(&view.tool_cards) => LoopWake::ToolPreview(id, preview),
+                diff = async { diff_job.as_mut().expect("guarded diff read").await }, if diff_job.is_some() => LoopWake::ToolDiff(diff),
                 wake = next_wake_with_progress(
                     &scheduler,
                     &mut input,
@@ -2748,6 +2815,28 @@ where
                 }
                 LoopWake::Context(Err(_)) => {
                     context_open = false;
+                    continue;
+                }
+                LoopWake::ToolCards(Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) => {
+                    view.refresh_tool_cards(tool_feed.snapshot_for_session(&view.session));
+                    dirty = true;
+                    continue;
+                }
+                LoopWake::ToolCards(Err(broadcast::error::RecvError::Closed)) => {
+                    tool_cards_open = false;
+                    continue;
+                }
+                LoopWake::ToolPreview(id, preview) => {
+                    if view.tool_preview(&id, preview) {
+                        preview_paint.mark();
+                    }
+                    continue;
+                }
+                LoopWake::ToolDiff(result) => {
+                    diff_job = None;
+                    let unavailable = diff_tag.take();
+                    if let Some(result) = result.ok().or(unavailable) { view.accept_diff(result); }
+                    dirty = true;
                     continue;
                 }
                 LoopWake::Regular(wake) => wake,
@@ -3075,6 +3164,11 @@ where
         }
     }
     .await;
+    // Blocking checked reads retain private directory handles. Await the one
+    // owned read before final shutdown can release the fixture/project root.
+    if let Some(job) = diff_job.take() {
+        let _ = job.await;
+    }
     drop(pending_approval);
     drop(approval_rx);
     drop(pending_instruction);
@@ -3115,6 +3209,29 @@ struct DispatchReviews {
 }
 
 async fn dispatch_controlled(
+    harness: &mut Harness,
+    models: &[ModelInfo],
+    command: &str,
+    registry: &commands::Registry,
+    cancellation: &CancellationToken,
+    turn_id: Option<&str>,
+    reviews: DispatchReviews,
+) -> Result<DispatchOutcome> {
+    // Runtime command branches retain large async states. Keep that state on
+    // the heap instead of embedding it in every interactive caller's future.
+    Box::pin(dispatch_controlled_inner(
+        harness,
+        models,
+        command,
+        registry,
+        cancellation,
+        turn_id,
+        reviews,
+    ))
+    .await
+}
+
+async fn dispatch_controlled_inner(
     harness: &mut Harness,
     models: &[ModelInfo],
     command: &str,
@@ -4141,6 +4258,235 @@ mod tests {
                 metadata: Default::default(),
             }],
         )
+    }
+
+    fn card_fixture(id: &str, ordinal: u64) -> Arc<kuru_runtime::ToolCard> {
+        Arc::new(kuru_runtime::ToolCard {
+            id: id.into(),
+            session_id: "plain-session".into(),
+            source_view: "main".into(),
+            turn_id: "turn".into(),
+            turn_key: "turn-key".into(),
+            actor_id: "part-a".into(),
+            call_id: "reused-call-id".into(),
+            name: "file_write".into(),
+            ordinal,
+            state: kuru_runtime::ToolCardState::Pending,
+            arguments: Some("{\"path\":\"notes.txt\"}".into()),
+            output: None,
+            private_content: false,
+            checkpoint_id: None,
+            stdout: None,
+            stderr: None,
+            preview_truncated: false,
+            preview_omitted: 0,
+            progress: None,
+        })
+    }
+
+    #[test]
+    fn tool_cards_keep_exact_bindings_and_reject_late_preview_after_settlement_or_session_change() {
+        let mut view = fixture();
+        view.transcript.push(("user".into(), "first".into()));
+        let first = card_fixture("first-binding", 1);
+        view.refresh_tool_cards((vec![first.clone()], 0));
+        view.transcript.push(("part-a".into(), "answer".into()));
+        view.transcript.push(("user".into(), "second".into()));
+        let second = card_fixture("second-binding", 2);
+        view.refresh_tool_cards((vec![first.clone(), second.clone()], 0));
+        assert_eq!(view.tool_cards[0].anchor, 0);
+        assert_eq!(view.tool_cards[1].anchor, 2);
+        let mut settled = (*first).clone();
+        settled.state = kuru_runtime::ToolCardState::Settled(kuru_runtime::ToolOutcome::Cancelled);
+        settled.stdout = Some("safe prefix".into());
+        view.refresh_tool_cards((vec![Arc::new(settled), second], 0));
+        let late = kuru_connectors::ShellPreviewSnapshot {
+            sequence: 4,
+            stdout: None,
+            stderr: None,
+            omitted: 0,
+        };
+        assert!(!view.tool_preview("first-binding", late.clone()));
+        assert_eq!(view.tool_cards[0].stdout, "safe prefix");
+        assert_eq!(
+            view.tool_cards[1].card.state,
+            kuru_runtime::ToolCardState::Pending
+        );
+        let frame = rendered(&view);
+        assert!(
+            frame.find("#1").unwrap() < frame.find("#2").unwrap(),
+            "{frame}"
+        );
+        view.clear_visible_conversation();
+        view.refresh_tool_cards((vec![first], 0));
+        assert!(view.tool_cards.is_empty());
+        view.select_tool_card();
+        assert!(
+            view.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("observed in this session"))
+        );
+        view.select_session("another-session".into());
+        assert!(!view.tool_preview("second-binding", late));
+    }
+
+    #[test]
+    fn tool_cards_controls_preserve_composer_and_modal_priorities() {
+        let mut view = fixture();
+        view.input = "literal draft".into();
+        view.cursor = view.input.len();
+        view.refresh_tool_cards((vec![card_fixture("binding", 1)], 0));
+        view.key(key(KeyCode::F(6)));
+        view.key(key(KeyCode::F(7)));
+        assert!(view.tool_cards[0].expanded);
+        assert_eq!(view.input, "literal draft");
+        view.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(view.recall.is_some());
+        view.key(key(KeyCode::F(7)));
+        assert!(view.tool_cards[0].expanded);
+        view.key(key(KeyCode::Esc));
+        view.permission_prompt = Some(PermissionPrompt {
+            display: PermissionDisplay {
+                label: "native file write".into(),
+                scope: "notes.txt".into(),
+                preview: "bounded approval preview".into(),
+                rememberable: false,
+                remember_disabled_reason: Some("fixture".into()),
+            },
+            whole_tool: false,
+            scroll: 0,
+        });
+        view.key(key(KeyCode::F(7)));
+        assert!(view.tool_cards[0].expanded);
+        assert_eq!(
+            view.key(key(KeyCode::Char('4'))),
+            Some("/approval-deny".into())
+        );
+        view.permission_prompt = None;
+        view.open_picker(Picker::Sessions);
+        view.key(key(KeyCode::F(7)));
+        assert!(view.tool_cards[0].expanded);
+        assert_eq!(view.input, "literal draft");
+    }
+
+    #[test]
+    fn tool_cards_diff_reads_skip_ineligible_cards_and_ignore_cleared_or_foreign_results() {
+        let mut view = fixture();
+        let mut shell = (*card_fixture("shell", 1)).clone();
+        shell.state = kuru_runtime::ToolCardState::Settled(kuru_runtime::ToolOutcome::Ok);
+        let mut file = (*card_fixture("file", 2)).clone();
+        file.state = shell.state;
+        file.checkpoint_id = Some("receipt-one".into());
+        let mut second_file = file.clone();
+        second_file.id = "second-file".into();
+        second_file.ordinal = 3;
+        second_file.checkpoint_id = Some("receipt-two".into());
+        view.refresh_tool_cards((
+            vec![Arc::new(shell), Arc::new(file), Arc::new(second_file)],
+            0,
+        ));
+        for card in &mut view.tool_cards {
+            card.expanded = true;
+        }
+        assert_eq!(
+            view.next_diff(),
+            Some(("file".into(), "receipt-one".into()))
+        );
+        let result = tool_cards::DiffResult {
+            session: view.session.clone(),
+            card: "file".into(),
+            receipt: "receipt-one".into(),
+            diff: kuru_connectors::CheckpointDiff::Unavailable {
+                reason: "Checked file diff unavailable",
+            },
+        };
+        let mut foreign = result.clone();
+        foreign.session = "another-session".into();
+        assert!(!view.accept_diff(foreign));
+        assert!(view.accept_diff(result.clone()));
+        assert_eq!(
+            view.next_diff(),
+            Some(("second-file".into(), "receipt-two".into()))
+        );
+        view.clear_visible_conversation();
+        assert!(!view.accept_diff(result));
+    }
+
+    #[test]
+    fn tool_cards_transcript_cache_distinguishes_equal_epoch_views_and_clones() {
+        let mut first = fixture();
+        first.transcript.push(("user".into(), "same prompt".into()));
+        first.refresh_tool_cards((vec![card_fixture("first", 1)], 0));
+        let mut second = first.clone();
+        let mut different = (*card_fixture("second", 1)).clone();
+        different.name = "UNIQUE_SECOND_TOOL".into();
+        second.tool_cards[0].card = Arc::new(different);
+        assert_eq!(first.tool_card_epoch, second.tool_card_epoch);
+        let first_frame = rendered(&first);
+        let second_frame = rendered(&second);
+        assert!(first_frame.contains("file_write"), "{first_frame}");
+        assert!(
+            second_frame.contains("UNIQUE_SECOND_TOOL"),
+            "{second_frame}"
+        );
+        assert!(!second_frame.contains("file_write"));
+    }
+
+    #[test]
+    fn tool_cards_render_recorded_diff_and_honest_private_or_missing_details_at_80_and_120() {
+        for width in [80, 120] {
+            let mut view = fixture();
+            view.transcript
+                .push(("user".into(), "edit the note".into()));
+            let mut card = (*card_fixture("binding", 1)).clone();
+            card.state = kuru_runtime::ToolCardState::Settled(kuru_runtime::ToolOutcome::Ok);
+            card.output = Some("done\u{1b}[31m\u{7}".into());
+            view.refresh_tool_cards((vec![Arc::new(card)], 2));
+            view.select_tool_card();
+            view.toggle_tool_card();
+            view.tool_cards[0].diff = Some(kuru_connectors::CheckpointDiff::Available {
+                text: "-before\n+after\n\\ No newline at end of file\n".into(),
+                truncated: false,
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            terminal.draw(|frame| draw(frame, &view)).unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                screen.contains("file_write") && screen.contains("Complete"),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("checked recorded file diff") && screen.contains("+after"),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("No newline at end of file")
+                    && screen.contains("older details unavailable"),
+                "{screen}"
+            );
+            assert!(!screen.contains('\u{1b}') && !screen.contains('\u{7}'));
+            let mut private = (*view.tool_cards[0].card).clone();
+            private.private_content = true;
+            private.arguments = Some("PRIVATE_COGNITIVE_ARGUMENT".into());
+            private.output = Some("PRIVATE_COGNITIVE_RESULT".into());
+            view.refresh_tool_cards((vec![Arc::new(private)], 0));
+            terminal.draw(|frame| draw(frame, &view)).unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(screen.contains("Arguments and result withheld"), "{screen}");
+            assert!(!screen.contains("PRIVATE_COGNITIVE"));
+        }
     }
 
     fn session_summary(

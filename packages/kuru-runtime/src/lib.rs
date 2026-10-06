@@ -7,6 +7,7 @@ mod engine;
 mod event;
 mod progress;
 pub mod server;
+mod tool_cards;
 mod topology_state;
 
 pub use bus::PeerMessage;
@@ -22,6 +23,9 @@ pub use event::{
     TurnLimitReason,
 };
 pub use progress::{ContextSnapshot, FacingProgress, RequestContext};
+pub use tool_cards::{
+    MAX_TOOL_CARD_BYTES, MAX_TOOL_CARDS, ToolCard, ToolCardFeed, ToolCardState, ToolCardUpdate,
+};
 
 #[cfg(test)]
 fn test_receipt(message: &kuru_core::Message) -> anyhow::Result<serde_json::Value> {

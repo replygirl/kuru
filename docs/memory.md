@@ -339,6 +339,22 @@ undo adds a compensating membership revision without rewriting reports or sessio
 state. Retired identities and their reports remain
 available for inspection.
 
+Dream reconciliation selects an exact private head and live revision under the
+existing owner write guard. It refuses overlapping membership versions before a
+native merge, including equal-value changes, and preserves a clean candidate on
+conflict. Nonoverlapping session records, reports and histories merge into the
+candidate before fast-forward publication. A definite moved live revision is a
+no-effect retry, with the runtime retaining a three-attempt budget.
+
+Lost replies are resolved from the original branch/private-head/live tuple.
+Only an exact fast-forward target or a commit with the two ordered expected
+parents proves a committed merge. An unchanged private head proves only that the
+request was not committed; it does not reconstruct a lost conflict or no-op reply.
+Unknown requests and ambiguous or dirty refs remain fenced. Checked recovery
+returns a fresh handle with its effective promotion base while retaining the
+original creation and request identities. Read-only inspection does not replay,
+promote or abandon a candidate.
+
 The upgrade reads the latest legacy topology inside its staged migration and
 materializes membership and every report, including extra report identities. It
 keeps the original topology bytes unchanged. Malformed input or a conflicting

@@ -15,18 +15,19 @@ mod spawn_gate;
 mod store;
 
 pub use facade::{
-    ActiveExportSnapshot, Candidate, CandidateTransitionRecovery, CandidateTransitionResolution,
+    ActiveExportSnapshot, Candidate, CandidateReconciliation, CandidateReconciliationRecovery,
+    CandidateReconciliationResolution, CandidateTransitionRecovery, CandidateTransitionResolution,
     CandidateUnitRecovery, DreamLease, ExportCursor, ExportPage, MemoryStore, MemoryView,
     SelectedAbandonResolution, SelectedAbandonUncertain, StateReadCut, UsageLedger,
 };
 pub use progress::{MemoryOpenProgress, MemoryOpenStage};
 pub use store::purge::PurgeOutcome;
 pub use store::{
-    CandidateConflict, CandidateInventoryPage, CandidateRefRefusal, CandidateRefRejected,
-    CandidateRefState, CandidateRefStatus, ContextSummaryCheckpoint, ContextSummaryConfirmation,
-    ContextSummaryCursor, ContextSummaryItem, ContextSummaryRecord, ContextSummaryStale,
-    ContextSummaryWindow, ExportProvenance, FORK_PROVENANCE_RECORD_FORMAT, HistoryWindow,
-    LEGACY_PREFIX_RECORD_FORMAT, LegacySessionTurnResume, LegacyTranscriptPrefix,
+    CandidateConflict, CandidateInventoryPage, CandidateReconciliationResult, CandidateRefRefusal,
+    CandidateRefRejected, CandidateRefState, CandidateRefStatus, ContextSummaryCheckpoint,
+    ContextSummaryConfirmation, ContextSummaryCursor, ContextSummaryItem, ContextSummaryRecord,
+    ContextSummaryStale, ContextSummaryWindow, ExportProvenance, FORK_PROVENANCE_RECORD_FORMAT,
+    HistoryWindow, LEGACY_PREFIX_RECORD_FORMAT, LegacySessionTurnResume, LegacyTranscriptPrefix,
     MAX_SESSION_LABEL_BYTES, MemoryStatus, OpenOptions, PUBLIC_TURN_RECORD_FORMAT,
     PublicTranscriptCursor, PublicTranscriptEntry, PublicTranscriptPage, PublicTranscriptPosition,
     PublicTurnKind, PublicTurnRecord, PublicTurnSettlement, ReasoningSummaryConflict,

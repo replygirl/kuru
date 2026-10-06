@@ -205,7 +205,9 @@ pub(crate) fn windows_shell_environment(
 
 use crate::{
     MAX_BYTES,
-    file_edits::{CheckpointStore, CheckpointSummary, EditHunk, FileEffect, apply_hunks},
+    file_edits::{
+        CheckpointDiff, CheckpointStore, CheckpointSummary, EditHunk, FileEffect, apply_hunks,
+    },
     hooks::HookHost,
     instruction_review::{
         InstructionGate, InstructionGateOutcome, InstructionReviewSender, SkillGate,
@@ -277,6 +279,12 @@ pub struct ToolInvocationContext {
 }
 
 impl ToolInvocationContext {
+    /// The exact private receipt identity used by managed native file effects.
+    /// Presentation uses this identity without reimplementing its encoding.
+    pub fn file_checkpoint_id(&self) -> Result<String> {
+        self.receipt_id()
+    }
+
     fn receipt_id(&self) -> Result<String> {
         for field in [
             &self.session_id,
@@ -480,6 +488,19 @@ impl ToolHost {
             .as_ref()
             .context("private file checkpoint store is unavailable")?
             .inspect(id)
+    }
+
+    pub fn file_checkpoint_diff(&self, id: &str) -> Result<CheckpointDiff> {
+        self.checkpoints
+            .as_ref()
+            .context("private file checkpoint store is unavailable")?
+            .diff(id)
+    }
+
+    pub fn file_checkpoint_diff_reader(&self) -> Option<crate::CheckpointDiffReader> {
+        self.checkpoints
+            .as_ref()
+            .map(|store| crate::CheckpointDiffReader::new(store.clone()))
     }
 
     pub fn list_file_checkpoints(&self, limit: usize) -> Result<Vec<CheckpointSummary>> {
@@ -786,6 +807,7 @@ impl ToolHost {
             None,
             false,
             ToolInvocationOrigin::DirectUser,
+            None,
         )
         .await
         .result
@@ -806,6 +828,7 @@ impl ToolHost {
             instruction_approval,
             true,
             ToolInvocationOrigin::ActorUnattributed,
+            None,
         )
         .await
     }
@@ -820,6 +843,26 @@ impl ToolHost {
         instruction_approval: Option<&InstructionReviewSender>,
         context: &ToolInvocationContext,
     ) -> ActorToolOutcome {
+        self.execute_for_actor_with_context_and_progress(
+            name,
+            args,
+            permission_approval,
+            instruction_approval,
+            context,
+            None,
+        )
+        .await
+    }
+
+    pub async fn execute_for_actor_with_context_and_progress(
+        &self,
+        name: &str,
+        args: Value,
+        permission_approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
+        context: &ToolInvocationContext,
+        progress: Option<&crate::ShellProgress>,
+    ) -> ActorToolOutcome {
         self.execute_dispatch(
             name,
             args,
@@ -827,10 +870,15 @@ impl ToolHost {
             instruction_approval,
             true,
             ToolInvocationOrigin::Actor(context),
+            progress,
         )
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "exact tool authority and optional private presentation remain explicit"
+    )]
     async fn execute_dispatch(
         &self,
         name: &str,
@@ -839,6 +887,7 @@ impl ToolHost {
         instruction_approval: Option<&InstructionReviewSender>,
         actor: bool,
         origin: ToolInvocationOrigin<'_>,
+        progress: Option<&crate::ShellProgress>,
     ) -> ActorToolOutcome {
         let mut instructions = None;
         let mut replan_required = false;
@@ -930,6 +979,7 @@ impl ToolHost {
                     origin,
                     None,
                     &mut instructions,
+                    progress,
                 )
                 .await
             {
@@ -1042,7 +1092,7 @@ impl ToolHost {
                 _ => unreachable!("permission service returned an invalid outcome"),
             }
             let authorized_target = invocation.target().cloned();
-            self.execute_inner(name, args, approval, instruction_approval, actor, origin, authorized_target.as_ref(), &mut instructions).await
+            self.execute_inner(name, args, approval, instruction_approval, actor, origin, authorized_target.as_ref(), &mut instructions, progress).await
         }
         .await;
         let result = match result {
@@ -1207,6 +1257,7 @@ impl ToolHost {
         origin: ToolInvocationOrigin<'_>,
         authorized_target: Option<&ProjectRelativeTarget>,
         instructions: &mut Option<String>,
+        progress: Option<&crate::ShellProgress>,
     ) -> std::result::Result<ToolExecution, ToolFailure> {
         if !args.is_object() {
             return Err(ToolFailure::built_in(anyhow::anyhow!(
@@ -1347,20 +1398,22 @@ impl ToolHost {
                         "timeout_ms must be 1..120000"
                     );
                     #[cfg(unix)]
-                    let result = shell(
+                    let result = shell_with_progress(
                         self.shells(),
                         self.root_guard.clone(),
                         self.root.clone(),
                         string(&args, "command")?,
                         Duration::from_millis(duration),
+                        progress,
                     )
                     .await?;
                     #[cfg(windows)]
-                    let result = shell(
+                    let result = shell_with_progress(
                         &self.root_guard,
                         &self.root,
                         string(&args, "command")?,
                         Duration::from_millis(duration),
+                        progress,
                     )
                     .await?;
                     Ok(ToolExecution::ProjectedJson(
@@ -2183,17 +2236,23 @@ fn spec(name: &str, description: &str, fields: &[&str], required: &[&str]) -> To
 }
 
 #[cfg(unix)]
-async fn shell(
+async fn shell_with_progress(
     registry: &ShellRegistry,
     root_guard: Arc<Directory>,
     root: PathBuf,
     command: &str,
     duration: Duration,
+    progress: Option<&crate::ShellProgress>,
 ) -> Result<String> {
     let result = registry
-        .execute(root_guard, root, command.into(), duration, || {
-            unix_shell_environment(std::env::vars_os())
-        })
+        .execute_with_progress(
+            root_guard,
+            root,
+            command.into(),
+            duration,
+            || unix_shell_environment(std::env::vars_os()),
+            progress.cloned(),
+        )
         .await;
     match result {
         Err(error) if error.downcast_ref::<ProjectedShellDiagnostic>().is_some() => Err(error),
@@ -2206,13 +2265,14 @@ async fn shell(
 }
 
 #[cfg(windows)]
-async fn shell(
+async fn shell_with_progress(
     root_guard: &Directory,
     root: &Path,
     command: &str,
     duration: Duration,
+    progress: Option<&crate::ShellProgress>,
 ) -> Result<String> {
-    let result = shell_inner(root_guard, root, command, duration).await;
+    let result = shell_inner(root_guard, root, command, duration, progress).await;
     match result {
         Err(error) if error.downcast_ref::<ProjectedShellDiagnostic>().is_some() => Err(error),
         Err(_) => Err(shell_failure(
@@ -2248,6 +2308,7 @@ async fn shell_inner(
     root: &Path,
     command: &str,
     duration: Duration,
+    progress: Option<&crate::ShellProgress>,
 ) -> Result<String> {
     use base64::Engine;
     use kuru_platform::windows::process::{
@@ -2331,7 +2392,10 @@ async fn shell_inner(
     let mut out = ShellCapture::new();
     let mut err = ShellCapture::new();
     let operation = async {
-        tokio::try_join!(out.read(&mut stdout), err.read(&mut stderr))?;
+        tokio::try_join!(
+            out.read_with_progress(&mut stdout, progress, crate::ShellStream::Stdout),
+            err.read_with_progress(&mut stderr, progress, crate::ShellStream::Stderr),
+        )?;
         out.finish()?;
         err.finish()?;
         let status = child.wait(duration).await?;

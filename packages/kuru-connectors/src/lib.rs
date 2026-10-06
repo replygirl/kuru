@@ -32,7 +32,10 @@ mod test_support;
 
 pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
-pub use file_edits::{CheckpointState, CheckpointStore, CheckpointSummary, FileEffect};
+pub use file_edits::{
+    CheckpointDiff, CheckpointDiffReader, CheckpointState, CheckpointStore, CheckpointSummary,
+    FileEffect,
+};
 pub use hooks::{
     HookAnnotation, HookBudget, HookHost, HookObservation, HookOutcomeKind,
     MAX_PRE_TURN_INPUT_BYTES, PostHookRun, PreHookOutcome, PreHookRun, PreToolValue, PreTurnValue,
@@ -60,6 +63,9 @@ pub use providers::{
 };
 pub use redaction::{
     ProjectionError, json as project_json, text as project_text, truncate_tool_output,
+};
+pub use shell_diagnostic::{
+    MAX_SHELL_PREVIEW_BYTES, ShellPreview, ShellPreviewSnapshot, ShellProgress, ShellStream,
 };
 pub use tool_output::is_permission_denied;
 #[cfg(any(test, feature = "test-support"))]

@@ -297,6 +297,12 @@ impl StreamingProjection {
             .push(bytes, &mut self.output)
     }
 
+    /// Only bytes already released by the scanner. Its unresolved suffix is
+    /// never flushed to obtain a partial preview.
+    pub(crate) fn preview(&self) -> (String, bool) {
+        (self.output.preview_text(), self.output.overflowed)
+    }
+
     pub(crate) fn finish(mut self) -> Result<String, ProjectionError> {
         self.scanner
             .take()
@@ -430,6 +436,23 @@ impl HeadTail {
         let prefix = Self::prefix_without_incomplete_edge(&self.prefix);
         let tail = self.tail.into_iter().collect::<Vec<_>>();
         let tail = Self::tail_without_incomplete_edge(&tail);
+        let mut output = String::with_capacity(prefix.len() + TRUNCATED.len() + tail.len());
+        Self::append_lossy(&mut output, prefix);
+        output.push_str(TRUNCATED);
+        Self::append_lossy(&mut output, tail);
+        output
+    }
+    fn preview_text(&self) -> String {
+        if !self.overflowed {
+            let complete = Self::prefix_without_incomplete_edge(&self.prefix);
+            let mut output = String::with_capacity(complete.len());
+            Self::append_lossy(&mut output, complete);
+            return output;
+        }
+        let prefix = Self::prefix_without_incomplete_edge(&self.prefix);
+        let tail = self.tail.iter().copied().collect::<Vec<_>>();
+        let tail = Self::tail_without_incomplete_edge(&tail);
+        let tail = Self::prefix_without_incomplete_edge(tail);
         let mut output = String::with_capacity(prefix.len() + TRUNCATED.len() + tail.len());
         Self::append_lossy(&mut output, prefix);
         output.push_str(TRUNCATED);
@@ -2457,5 +2480,37 @@ mod tests {
         }
         assert_eq!(truncate_tool_output("abcdef", 2), "..");
         assert_eq!(truncate_tool_output("kept", 4), "kept");
+    }
+    #[test]
+    fn live_preview_withholds_split_secret_and_utf8_until_safe() {
+        let mut projection = super::StreamingProjection::new(2048);
+        projection.push(b"start sk-proj-abcdef").unwrap();
+        let (preview, truncated) = projection.preview();
+        assert!(!truncated);
+        assert!(!preview.contains("sk-proj-abcdef"));
+        projection.push(b"ghijklmnop0123456789 end ").unwrap();
+        projection.push(&[0xe2, 0x82]).unwrap();
+        let (preview, _) = projection.preview();
+        assert!(!preview.contains("sk-proj-"));
+        assert!(!preview.contains('?'));
+        projection.push(&[0xac, b'\n']).unwrap();
+        let (preview, _) = projection.preview();
+        assert!(preview.contains("[REDACTED:recognized-secret]"));
+        assert!(preview.contains('€'));
+        let final_text = projection.finish().unwrap();
+        assert!(!final_text.contains("sk-proj-"));
+    }
+
+    #[test]
+    fn live_preview_truncates_without_growth() {
+        let mut projection = super::StreamingProjection::new(2048);
+        for _ in 0..128 {
+            projection.push(&[b'x'; 8192]).unwrap();
+        }
+        let (preview, truncated) = projection.preview();
+        assert!(truncated);
+        assert!(preview.len() <= 2048);
+        assert!(preview.contains("[truncated]"));
+        assert!(preview.starts_with('x') && preview.ends_with('x'));
     }
 }
