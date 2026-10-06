@@ -2514,14 +2514,56 @@ async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
 
 #[tokio::test]
 async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_ends() -> Result<()> {
+    production_upgrade_lost_commit_fixture(false).await
+}
+
+#[tokio::test]
+async fn production_upgrade_commit_fixture_early_error_preserves_cause_and_quiescence() -> Result<()>
+{
+    let error = production_upgrade_lost_commit_fixture(true)
+        .await
+        .expect_err("the deliberate fixture error must remain a failure");
+    let text = format!("{error:#}");
+    ensure!(
+        error
+            .chain()
+            .any(|cause| cause.to_string() == "deliberate early migration fixture error"),
+        "original fixture error was replaced: {text}"
+    );
+    ensure!(
+        !text.contains("cleanup also failed") && !text.contains("fixture root"),
+        "the deliberate error must return only after owned cleanup: {text}"
+    );
+    Ok(())
+}
+
+// Only this real lost-commit fixture and its early-error acceptance share this
+// flow. Keep the root outside the observed body so neither `?` nor an assertion
+// can release it before its owned opening, proxy and engine have settled.
+async fn production_upgrade_lost_commit_fixture(inject_error: bool) -> Result<()> {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
     let root = crate::test_support::tempdir()?;
-    let mut options = crate::test_support::warmed_open_options(
+    let mut options = match crate::test_support::warmed_open_options(
         root.path().to_owned(),
         format!("project/{}", "f".repeat(64)),
     )
-    .await?;
+    .await
+    {
+        Ok(options) => options,
+        Err(error) => return root.release(Err(error)),
+    };
+    let mut initial_server = None;
+    let mut opening = None;
+    let mut active_store = None;
+    let mut proxy = None;
+    let mut pause_control = None;
+    let mut stage = "released schema preparation";
+    let outcome = AssertUnwindSafe(async {
     super::tests::released_v1(&options).await?;
-    let server = super::tests::released_server(&options).await?;
+    initial_server = Some(super::tests::released_server(&options).await?);
+    let server = initial_server.as_ref().unwrap();
     let main = server.pool("main").await?;
     let base = revision(&main).await?;
     main.close().await;
@@ -2533,36 +2575,51 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforeCommit, reserved.port);
     let completion_deadline = migration_observation_deadline(&options);
     options.migration_hooks = Some(Arc::new(hooks));
-    let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
+    pause_control = Some(control);
+    let control = pause_control.as_ref().unwrap();
+    opening = Some(tokio::spawn(crate::test_support::spawn_gated_open(options.clone())));
 
+    stage = "routed source observation";
     let source = tokio::time::timeout(completion_deadline, control.route_source())
         .await
         .context("production migration did not expose its routed fixture source")??;
-    let proxy = reserved.start(
+    proxy = Some(reserved.start(
         source,
         "CALL DOLT_COMMIT",
         DurableObservation::RevisionAdvanced { base: base.clone() },
-    );
+    ));
+    let observed_proxy = proxy.as_ref().unwrap();
     control.resume_route();
+    stage = "commit boundary observation";
     tokio::time::timeout(migration_observation_deadline(&options), control.reached())
         .await
         .context("production migration did not reach the commit boundary")??;
+    if inject_error {
+        bail!("deliberate early migration fixture error");
+    }
     control.resume();
 
-    let store = tokio::time::timeout(completion_deadline, opening)
+    stage = "lost commit reply reconciliation";
+    let joined = tokio::time::timeout(completion_deadline, opening.as_mut().unwrap())
         .await
         .with_context(|| {
             format!(
                 "production migration did not reconcile the lost commit reply (reply_discarded={}, routed_session_ended={})",
-                proxy.discarded.load(Ordering::Acquire),
-                proxy.session_ended.load(Ordering::Acquire)
+                observed_proxy.discarded.load(Ordering::Acquire),
+                observed_proxy.session_ended.load(Ordering::Acquire)
             )
-        })???;
+        })?;
+    // A completed JoinHandle cannot be polled again, including when its
+    // returned Result is an error. Pending handles stay owned for cleanup.
+    opening.take();
+    active_store = Some(joined??);
+    let store = active_store.as_ref().unwrap();
+    stage = "durable upgrade assertions";
     assert!(
-        proxy.discarded.load(Ordering::Acquire),
+        observed_proxy.discarded.load(Ordering::Acquire),
         "fixture must discard the durable production migration DOLT_COMMIT reply"
     );
-    await_flag(&proxy.session_ended, QUERY_TIMEOUT)
+    await_flag(&observed_proxy.session_ended, QUERY_TIMEOUT)
         .await
         .context(
             "the proxy must observe the original routed SQL session end before reconciliation",
@@ -2579,16 +2636,21 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
     .fetch_one(store.pool.as_ref())
     .await?;
     assert_eq!(commits, 1, "production migration must publish exactly once");
-    store.close().await?;
-    proxy.close().await;
+    stage = "upgraded store close";
+    active_store.take().unwrap().close().await?;
+    proxy.take().unwrap().close().await;
 
+    stage = "reopen of durable upgrade";
     let reopen_deadline = migration_observation_deadline(&options);
     let reopened = tokio::time::timeout(
         reopen_deadline,
-        crate::test_support::spawn_gated_open(options),
+        crate::test_support::spawn_gated_open(options.clone()),
     )
     .await
     .context("reopen replayed a migration hook instead of recognizing the durable upgrade")??;
+    active_store = Some(reopened);
+    let reopened = active_store.as_ref().unwrap();
+    stage = "reopened upgrade assertions";
     assert_eq!(reopened.revision().await?, upgraded);
     let commits: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
@@ -2596,8 +2658,105 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
     .fetch_one(reopened.pool.as_ref())
     .await?;
     assert_eq!(commits, 1, "reopen must not replay a reconciled migration");
-    reopened.close().await?;
-    Ok(())
+    active_store.take().unwrap().close().await?;
+    Ok::<(), anyhow::Error>(())
+    }).catch_unwind().await;
+
+    // This fixture injects an early observation error, not cancellation. Resume
+    // its owned opening and let its existing bounded migration finish before
+    // closing the returned store. Only an expired opening is cancelled.
+    if let Some(control) = pause_control.take() {
+        control.resume_route();
+        control.resume();
+    }
+    let mut cleanup_failures = Vec::new();
+    if let Some(mut opening) = opening.take() {
+        let joined = match tokio::time::timeout(
+            migration_observation_deadline(&options),
+            &mut opening,
+        )
+        .await
+        {
+            Ok(joined) => joined,
+            Err(_) => {
+                opening.abort();
+                cleanup_failures
+                    .push("unfinished opening exceeded its migration deadline".to_owned());
+                opening.await
+            }
+        };
+        match joined {
+            Ok(Ok(store)) => {
+                if let Err(error) = store.close().await {
+                    cleanup_failures.push(format!("returned opening store: {error:#}"));
+                }
+            }
+            Ok(Err(error)) => cleanup_failures.push(format!("unfinished opening: {error:#}")),
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => cleanup_failures.push(format!("opening task: {error:#}")),
+        }
+    }
+    if let Some(proxy) = proxy.take()
+        && AssertUnwindSafe(proxy.close())
+            .catch_unwind()
+            .await
+            .is_err()
+    {
+        cleanup_failures.push("packet proxy panicked during owned cleanup".to_owned());
+    }
+    if let Some(store) = active_store.take()
+        && let Err(error) = store.close().await
+    {
+        cleanup_failures.push(format!("active store: {error:#}"));
+    }
+    if let Some(server) = initial_server.take()
+        && let Err(error) = server.close().await
+    {
+        cleanup_failures.push(format!("initial server: {error:#}"));
+    }
+    let lifecycle_root = cfg!(windows).then(|| options.data_dir.join("memory/lifecycles"));
+    let directories = project_directory(&options.data_dir, &options.project_scope)
+        .and_then(|directory| crate::test_support::project_store_directories(&directory));
+    match directories {
+        Ok(directories) => {
+            for directory in directories {
+                if let Err(error) = crate::test_support::await_store_quiescence(
+                    &directory,
+                    lifecycle_root.as_deref(),
+                )
+                .await
+                {
+                    cleanup_failures.push(format!("store quiescence: {error:#}"));
+                }
+            }
+        }
+        Err(error) => cleanup_failures.push(format!("store directory observation: {error:#}")),
+    }
+    let cleanup = if cleanup_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "fixture cleanup also failed: {}",
+            cleanup_failures.join("; ")
+        ))
+    };
+    match outcome {
+        Ok(result) => {
+            let result = result.with_context(|| format!("lost-commit fixture stage: {stage}"));
+            let result = match (result, cleanup) {
+                (Ok(()), cleanup) => cleanup,
+                (Err(error), Ok(())) => Err(error),
+                (Err(error), Err(cleanup)) => Err(error.context(format!("{cleanup:#}"))),
+            };
+            root.release(result)
+        }
+        Err(panic) => {
+            if let Err(error) = root.release(cleanup) {
+                eprintln!("lost-commit fixture panic cleanup: {error:#}");
+            }
+            std::panic::resume_unwind(panic)
+        }
+    }
 }
 
 #[tokio::test]
