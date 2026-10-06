@@ -1433,8 +1433,10 @@ mod tests {
         );
         let retry = prepare(directory.path(), &scope).unwrap().unwrap();
         assert_eq!(retry.receipt, prepared.receipt);
-        let options =
-            test_support::open_options(directory.path().to_owned(), scope.clone()).unwrap();
+        // A prepared legacy import selects cold creation, even with warmed caches.
+        let options = test_support::warmed_open_options(directory.path().to_owned(), scope.clone())
+            .await
+            .unwrap();
         let store = MemoryStore::open(options.clone()).await.unwrap();
         assert_eq!(
             store
@@ -1533,7 +1535,10 @@ mod tests {
         let scope = format!("project/{}", "e".repeat(64));
         let source = legacy(&directory.path().join("memory.sqlite3"));
         source.execute("INSERT INTO messages (namespace,role,content) VALUES ('project/other/transcript','user','preserved')", []).unwrap();
-        let options = test_support::open_options(directory.path().to_owned(), scope).unwrap();
+        // A prepared legacy import selects cold creation, even with warmed caches.
+        let options = test_support::warmed_open_options(directory.path().to_owned(), scope)
+            .await
+            .unwrap();
         let store = MemoryStore::open(options).await.unwrap();
         assert!(
             store
