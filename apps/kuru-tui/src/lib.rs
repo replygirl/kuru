@@ -4,6 +4,7 @@ mod authentication;
 pub mod cli;
 mod commands;
 mod diagnostics;
+mod headless;
 mod instruction_gate;
 pub mod memory_activity;
 mod memory_export;

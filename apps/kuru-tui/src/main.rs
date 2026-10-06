@@ -1,7 +1,7 @@
 #[cfg(not(windows))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    Box::pin(dispatch()).await
+    finish_dispatch(Box::pin(dispatch()).await)
 }
 
 #[cfg(windows)]
@@ -13,15 +13,28 @@ fn main() -> anyhow::Result<()> {
         .stack_size(DISPATCH_STACK_BYTES)
         .spawn(windows_dispatch)
         .map_err(|error| anyhow::anyhow!("start Kuru Windows dispatch worker: {error}"))?;
-    worker
+    let result = worker
         .join()
-        .map_err(|_| anyhow::anyhow!("Kuru Windows dispatch worker panicked"))?
+        .map_err(|_| anyhow::anyhow!("Kuru Windows dispatch worker panicked"))?;
+    finish_dispatch(result)
 }
 
 #[cfg(windows)]
 #[tokio::main]
 async fn windows_dispatch() -> anyhow::Result<()> {
     Box::pin(dispatch()).await
+}
+
+fn finish_dispatch(result: anyhow::Result<()>) -> anyhow::Result<()> {
+    if let Err(error) = &result
+        && let Some(code) = kuru::cli::headless_exit_code(error)
+    {
+        // All authority cleanup completed before the CLI returned this typed
+        // status. Only a stdout/stdin-only OS thread may remain kernel-blocked.
+        eprintln!("Error: {error:#}");
+        std::process::exit(code);
+    }
+    result
 }
 
 async fn dispatch() -> anyhow::Result<()> {

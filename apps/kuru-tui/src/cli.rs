@@ -23,8 +23,7 @@ use kuru_memory::{
 };
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_runtime::{
-    CancellationToken, Event, HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER, Harness, forget_note,
-    read_notes,
+    Event, HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER, Harness, forget_note, read_notes,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -34,6 +33,8 @@ use crate::{
     permission_store::GrantStore,
     trust::{ApprovalState, ApprovalStore},
 };
+
+pub use crate::headless::OutputFormat;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -105,9 +106,11 @@ pub enum Command {
     Man,
     /// Execute a prompt without the terminal UI.
     Run {
-        prompt: String,
+        prompt: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long, value_enum, conflicts_with = "json")]
+        output_format: Option<OutputFormat>,
         /// Use an explicit durable ID for exact retry in this session.
         #[arg(long, value_name = "ID")]
         turn_id: Option<String>,
@@ -830,7 +833,25 @@ pub async fn execute(cli: Cli) -> Result<()> {
     execute_inner(cli, false).await
 }
 
-async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
+async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
+    let mut run_signal = None;
+    // Input completes before paths, configuration/trust or any configured
+    // provider, tool, memory or diagnostic authority can activate.
+    if let Some(Command::Run {
+        prompt, turn_id, ..
+    }) = &mut cli.command
+    {
+        if turn_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.len() > 256)
+        {
+            return Err(anyhow::Error::new(crate::headless::RunExit(2))
+                .context("turn ID must contain 1–256 bytes"));
+        }
+        let (input, signal) = crate::headless::read_input(prompt.take()).await?;
+        *prompt = Some(input);
+        run_signal = Some(signal);
+    }
     if let Some(command @ (Command::Completions { .. } | Command::Man)) = &cli.command {
         return write_stdout_ignoring_broken_pipe(&shell_support_output(command)?);
     }
@@ -1200,6 +1221,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     // Keep cleanup outside every command/error return and retain the project
     // lease until the owned supervisor has reaped Dolt.
     let mut memory_to_close = existing_memory.clone();
+    let mut run_delivery = None;
     let result = async {
         let preferences = if let Some(memory) = &existing_memory {
             Harness::load_preferences(memory, &cwd).await?
@@ -1490,40 +1512,24 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             Some(Command::Run {
                 prompt,
                 json,
+                output_format,
                 turn_id,
             }) => {
                 let mut events = harness.subscribe();
                 let turn_id = turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                let cancellation = CancellationToken::new();
-                let result = {
-                    let operation =
-                        harness.run_local_controlled(&prompt, None, &turn_id, &cancellation);
-                    tokio::pin!(operation);
-                    tokio::select! {
-                        biased;
-                        result = &mut operation => result,
-                        signal = ctrl_c_cancellation() => {
-                            cancellation.cancel();
-                            // Await the same admitted operation, including any
-                            // accepted checkpoint, before releasing its lease.
-                            let result = operation.await;
-                            match signal {
-                                Ok(()) => result,
-                                Err(error) => result.context(format!("Run cancellation listener failed: {error:#}")),
-                            }
-                        }
-                    }
-                }
-                .map(|result| result.output);
-                let succeeded = result.is_ok();
-                if let Ok(result) = &result {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(result)?);
-                    } else {
-                        println!("{}", result.text);
-                    }
-                }
-                let cleanup = harness.shutdown(succeeded).await;
+                let mut delivery = crate::headless::drive(
+                    &mut harness,
+                    prompt.as_deref().expect("Run input was validated before authority"),
+                    &turn_id,
+                    json,
+                    output_format,
+                    run_signal.take().expect("Run retains its input-registered signal"),
+                ).await;
+                let succeeded = delivery.as_ref().is_ok_and(|delivery| delivery.result.is_ok());
+                let cleanup = match &mut delivery {
+                    Ok(delivery) => delivery.shutdown(&mut harness, succeeded).await,
+                    Err(_) => harness.shutdown(false).await,
+                };
                 for event in harness.take_compaction_notices() {
                     if let Event::Compaction { actor, notice } = event {
                         // Context maintenance never changes stdout's answer/JSON.
@@ -1566,7 +1572,8 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                         let _ = writeln!(io::stderr().lock(), "{report}");
                     }
                 }
-                let result = result.map(drop).map_err(|error| {
+                let mut delivery = finish(delivery, cleanup, "harness setup")?;
+                delivery.result = delivery.result.map_err(|error| {
                     let mut failures = std::collections::BTreeSet::new();
                     while let Ok(event) = events.try_recv() {
                         if let Event::Error { detail, .. } = event
@@ -1581,7 +1588,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                         error.context(format!("provider errors: {}", failures.into_iter().collect::<Vec<_>>().join("; ")))
                     }
                 });
-                finish(result, cleanup, "harness")?;
+                run_delivery = Some(delivery);
             }
 
             Some(Command::Dream) => {
@@ -1646,7 +1653,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         Some(diagnostics) => diagnostics.finish(),
         None => Ok(()),
     };
-    match (
+    let settled = match (
         finish(result, cleanup, "project memory"),
         diagnostic_cleanup,
     ) {
@@ -1659,13 +1666,20 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             Err(error.context("diagnostic cleanup also failed; diagnostics may be incomplete"))
         }
         (Err(error), Ok(())) => Err(error),
+    };
+    // The stdout-only worker cannot extend the project writer lifetime.
+    drop(_lease);
+    if let Some(delivery) = run_delivery {
+        delivery.finish(settled).await
+    } else {
+        settled
     }
 }
 
 /// Combine an operation's result with the cleanup that ran after it. A
 /// single failure is returned unchanged; when both fail, neither cause is
 /// dropped, in the shape `Harness::shutdown` uses (primary first).
-fn finish<T>(primary: Result<T>, cleanup: Result<()>, what: &str) -> Result<T> {
+pub(crate) fn finish<T>(primary: Result<T>, cleanup: Result<()>, what: &str) -> Result<T> {
     match (primary, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(cleanup)) => Err(cleanup),
@@ -1729,10 +1743,17 @@ async fn run_mcp_command(host: &ToolHost, command: &McpCommand) -> Result<()> {
     Ok(())
 }
 
-async fn ctrl_c_cancellation() -> Result<()> {
+pub(crate) async fn ctrl_c_cancellation() -> Result<()> {
     tokio::signal::ctrl_c()
         .await
         .context("listen for Ctrl-C cancellation")
+}
+
+/// Binary-only exit classification, after execute has awaited its cleanup.
+pub fn headless_exit_code(error: &anyhow::Error) -> Option<i32> {
+    error
+        .downcast_ref::<crate::headless::RunExit>()
+        .map(|exit| exit.0)
 }
 
 fn report_mcp_statuses(statuses: &[McpStatus]) {
@@ -1902,10 +1923,15 @@ fn preflight(cli: &Cli, root: &Directory, data: &Path, snapshot: &ConfigSnapshot
             _ => bail!("workspace trust was not granted"),
         };
     }
-    bail!(
+    let refusal = format!(
         "workspace authority is not approved for this command\n{}\nRun `kuru trust approve` with the same `-C` directory, or repeat this command with `--trust-workspace-once` after review.",
         manifest_text(root, &applicable, Some(store.inspect(snapshot.manifest()))),
-    )
+    );
+    if matches!(cli.command, Some(Command::Run { .. })) {
+        Err(anyhow::Error::new(crate::headless::RunExit(3)).context(refusal))
+    } else {
+        Err(anyhow::anyhow!(refusal))
+    }
 }
 
 fn show_manifest(root: &Directory, manifest: &SafeManifest, state: Option<ApprovalState>) {

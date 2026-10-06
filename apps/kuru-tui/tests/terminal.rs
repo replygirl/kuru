@@ -73,6 +73,683 @@ const EXIT_TIMEOUT: Duration = OPERATION_TIMEOUT
     .saturating_add(IO_TIMEOUT)
     .saturating_add(FRAME_ALLOWANCE);
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_tty_argument_never_reads_stdin_at_120_and_80() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        for width in [120, 80] {
+            let mut command = sandbox.command("demo");
+            command.args(["run", "TTY_ARGUMENT_ONLY", "--json"]);
+            let mut terminal = Terminal::spawn(command, 30, width)?;
+            // The terminal stays open and receives no input or EOF.
+            terminal.wait_exit(sandbox.startup_timeout + EXIT_TIMEOUT)?;
+            ensure!(String::from_utf8_lossy(&terminal.output).contains("TTY_ARGUMENT_ONLY"));
+            terminal.assert_restored()?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Prove cancellation against actual OS pipes and the default exit-dream
+/// provider boundary, then recover only the exact completed journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_held_output_broken_pipe_and_exit_dream_preserve_completed_retry() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        use kuru_platform::unix::{OwnedProcessGroup, Reap, RootState, StdioPlan, StdioSlot};
+        use nix::{sys::signal::{Signal, kill}, unistd::Pid};
+        use sha2::{Digest, Sha256};
+
+        let sandbox = Sandbox::warmed().await?;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let dream_started = Arc::new(tokio::sync::Notify::new());
+        let models_started = Arc::new(tokio::sync::Notify::new());
+        let hold_models = Arc::new(AtomicBool::new(false));
+        let (release, released) = watch::channel(false);
+        let answer = format!("PUBLIC_COMPLETED_{}", "x".repeat(128 * 1024));
+        let app = Router::new()
+            .route("/v1/models", get({
+                let models_started = models_started.clone();
+                let hold_models = hold_models.clone();
+                let released = released.clone();
+                move || {
+                    let models_started = models_started.clone();
+                    let hold_models = hold_models.clone();
+                    let mut released = released.clone();
+                    async move {
+                        if hold_models.load(Ordering::SeqCst) {
+                            models_started.notify_one();
+                            let _ = released.wait_for(|ready| *ready).await;
+                        }
+                        Json(json!({"data":[{"id":"fixture"}]}))
+                    }
+                }
+            }))
+            .route("/v1/responses", post({
+                let requests = requests.clone();
+                let dream_started = dream_started.clone();
+                let answer = answer.clone();
+                move |Json(request): Json<Value>| {
+                    let requests = requests.clone();
+                    let dream_started = dream_started.clone();
+                    let answer = answer.clone();
+                    let mut released = released.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let instructions = request["instructions"].as_str().unwrap_or("");
+                        if instructions.contains("Phase: dream") {
+                            // Reaching this request requires an already completed
+                            // turn and candidate admission, not a timer guess.
+                            dream_started.notify_one();
+                            let _ = released.wait_for(|ready| *ready).await;
+                        }
+                        let text = if instructions.contains("Phase: speak and act") {
+                            &answer
+                        } else { "PRIVATE_HEADLESS_PEER_SENTINEL" };
+                        ([(CONTENT_TYPE, "text/event-stream")], format!("data: {}\n\n", json!({
+                            "type":"response.completed", "response":{
+                                "id":"headless-owned-output", "status":"completed",
+                                "output":[{"type":"message","content":[{"type":"output_text","text":text}]}],
+                                "usage":{"input_tokens":8,"output_tokens":8}
+                            }
+                        }))).into_response()
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = sandbox.root.path().join("headless-owned-output.toml");
+        std::fs::write(&config, format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\ndream_every=0\n",
+            listener.local_addr()?
+        ))?;
+        let _server = Server(tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }));
+        for case in ["held-output", "broken-output", "exit-dream", "setup-models"] {
+            release.send_replace(false);
+            hold_models.store(case == "setup-models", Ordering::SeqCst);
+            let requests_before_case = requests.load(Ordering::SeqCst);
+            let mut command = sandbox.command("responses");
+            if case == "exit-dream" {
+                // Restore the product default; Sandbox normally disables it.
+                let args = command.get_args().filter(|arg| *arg != "--no-dream").map(std::ffi::OsStr::to_os_string).collect::<Vec<_>>();
+                let mut with_dream = Command::new(command.get_program());
+                with_dream.args(args);
+                for (key, value) in command.get_envs() {
+                    if let Some(value) = value { with_dream.env(key,value); } else { with_dream.env_remove(key); }
+                }
+                command = with_dream;
+            }
+            if case == "held-output" {
+                command.arg("--debug");
+            }
+            command.args(["--model","fixture","--config"]).arg(&config).env("KURU_FIXTURE_KEY","fixture")
+                .args(["run",case,"--turn-id",case,"--json"]);
+            let pid_file = sandbox.root.path().join(format!("{case}.pid"));
+            let mut launch = Command::new("/bin/sh");
+            launch.args(["-c","printf '%s' \"$$\" > \"$1\"; shift; exec \"$@\"","headless-owned-output"])
+                .arg(&pid_file).arg(command.get_program()).args(command.get_args());
+            for (key,value) in command.get_envs() {
+                if let Some(value) = value { launch.env(key,value); } else { launch.env_remove(key); }
+            }
+            let mut child = OwnedProcessGroup::spawn(launch,StdioPlan::new(StdioSlot::Null,StdioSlot::Pipe,StdioSlot::Pipe))?;
+            let mut stdout: Option<Box<dyn Read + Send>> = Some(Box::new(child.take_stdout()?));
+            let mut stderr = child.take_stderr()?;
+            let (stderr_sender, stderr_receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let result = stderr.by_ref().take(1024 * 1024 + 1).read_to_end(&mut bytes).map(|_|bytes);
+                let _ = stderr_sender.send(result);
+            });
+            let mut prefix = Vec::new();
+            let mut session = None;
+            let outcome = async {
+                if case == "setup-models" {
+                    tokio::time::timeout(sandbox.startup_timeout + READY_TIMEOUT,models_started.notified()).await
+                        .context("setup did not enter the held model listing")?;
+                    let pid: i32 = std::fs::read_to_string(&pid_file)?.parse()?;
+                    ensure!(pid > 1 && matches!(child.root_state(),RootState::Running));
+                    kill(Pid::from_raw(pid),Signal::SIGINT)?;
+                    // Only then finish setup: the input-registered listener
+                    // must retain this queued signal before user admission.
+                    release.send_replace(true);
+                } else {
+                if case == "exit-dream" {
+                    tokio::time::timeout(sandbox.startup_timeout + READY_TIMEOUT,dream_started.notified()).await
+                        .context("default exit dream never reached the held provider")?;
+                } else {
+                    let mut pipe = stdout.take().expect("stdout");
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    std::thread::spawn(move || {
+                        let mut first = [0];
+                        let result = pipe.read_exact(&mut first).map(|_| (first,pipe));
+                        let _ = sender.send(result);
+                    });
+                    let (first,pipe) = tokio::time::timeout(sandbox.startup_timeout + EXIT_TIMEOUT,receiver).await
+                        .context("final stdout never began")???;
+                    prefix.extend(first);
+                    if case == "held-output" { stdout = Some(pipe); } else { drop(pipe); }
+                }
+                // Inspect the exact durable result before signalling. The
+                // large final write already began in output cases, so the
+                // held reader actually competes with final delivery.
+                let mut options = memory_options(&sandbox)?;
+                options.read_only = true;
+                let inspector = MemoryStore::open_managed_observed(options,sandbox.project.canonicalize()?,PathBuf::from(env!("CARGO_BIN_EXE_kuru"))).1.await?;
+                let inspect_result = async {
+                    let id = kuru_runtime::Harness::continuation_session(&inspector,&sandbox.project).await?;
+                    let mut digest = Sha256::new(); digest.update(b"kuru.turn-journal.v1\0"); digest.update(case.as_bytes());
+                    let suffix = digest.finalize().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+                    let key = format!("{}/session/{id}/turn/{suffix}",kuru_runtime::project_scope(&sandbox.project)?);
+                    let journal = inspector.get(&key).await?.context("completed journal missing")?;
+                    ensure!(journal["id"] == case && journal["prompt"] == case && journal["output"]["text"] == answer,
+                        "wrong completion proof for {case}");
+                    Ok::<_,anyhow::Error>(id)
+                }.await;
+                let close = inspector.close().await;
+                close?;
+                session = Some(inspect_result?);
+                if case != "broken-output" {
+                    let pid: i32 = std::fs::read_to_string(&pid_file)?.parse()?;
+                    ensure!(pid > 1 && matches!(child.root_state(),RootState::Running),"owned root not running before SIGINT");
+                    // No await or reap between owned observation and signal.
+                    kill(Pid::from_raw(pid),Signal::SIGINT)?;
+                }
+                }
+                let deadline = Instant::now() + EXIT_TIMEOUT;
+                loop {
+                    match child.root_state() {
+                        RootState::Exited => break,
+                        RootState::Running | RootState::Interrupted => {},
+                        state => anyhow::bail!("owned output root state: {state:?}"),
+                    }
+                    ensure!(Instant::now() < deadline,"{case} did not settle after output interruption");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if case == "setup-models" {
+                    let mut options = memory_options(&sandbox)?;
+                    options.read_only = true;
+                    let inspector = MemoryStore::open_managed_observed(options,sandbox.project.canonicalize()?,PathBuf::from(env!("CARGO_BIN_EXE_kuru"))).1.await?;
+                    let inspected = async {
+                        let id = kuru_runtime::Harness::continuation_session(&inspector,&sandbox.project).await?;
+                        let scope = kuru_runtime::project_scope(&sandbox.project)?;
+                        let mut digest = Sha256::new(); digest.update(b"kuru.turn-journal.v1\0"); digest.update(case.as_bytes());
+                        let suffix = digest.finalize().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+                        ensure!(inspector.get(&format!("{scope}/session/{id}/turn/{suffix}")).await?.is_none(),"setup SIGINT admitted a user turn");
+                        let saved = inspector.get(&format!("{scope}/session/{id}")).await?.context("setup session absent")?;
+                        ensure!(saved["turns"] == 0 && requests.load(Ordering::SeqCst) == requests_before_case,"setup SIGINT started inference");
+                        Ok::<(),anyhow::Error>(())
+                    }.await;
+                    let closed = inspector.close().await;
+                    closed?; inspected?;
+                }
+                Ok::<(),anyhow::Error>(())
+            }.await;
+            child.terminate_before_reap();
+            child.wait_pre_reap(Duration::from_millis(10),Instant::now()+EXIT_TIMEOUT).await;
+            let status = child.reap_if_exited();
+            release.send_replace(true);
+            let stderr = stderr_receiver.recv_timeout(IO_TIMEOUT).context("owned-output stderr did not drain")??;
+            if let Some(mut pipe) = stdout {
+                pipe.by_ref().take(1024 * 1024 + 1).read_to_end(&mut prefix)?;
+            }
+            outcome?;
+            let Reap::Reaped(status) = status else { anyhow::bail!("output root was not reaped: {status:?}") };
+            ensure!(status.code() == Some(if case == "broken-output" {141} else {130}),"{case}: {status:?}: {}",String::from_utf8_lossy(&stderr));
+            ensure!(!String::from_utf8_lossy(&prefix).contains("PRIVATE_HEADLESS_PEER_SENTINEL"));
+            ensure!(!String::from_utf8_lossy(&stderr).contains("PRIVATE_HEADLESS_PEER_SENTINEL"));
+            if case == "held-output" {
+                ensure!(prefix.first() == Some(&b'{'), "debug output displaced the final JSON");
+                ensure!(String::from_utf8_lossy(&stderr).contains("\"debug_ring\":"), "debug ring notice absent from stderr");
+                ensure!(sandbox.data.join("diagnostics").is_dir(), "debug ring absent");
+            }
+            if case == "setup-models" {
+                ensure!(prefix.is_empty(),"unadmitted setup cancellation printed an answer");
+                continue;
+            }
+            let before_retry = requests.load(Ordering::SeqCst);
+            let mut retry = sandbox.command("responses");
+            retry.args(["--model","fixture","--config"]).arg(&config).env("KURU_FIXTURE_KEY","fixture")
+                .args(["--resume",session.as_deref().context("session absent")?,"run",case,"--turn-id",case,"--json"]);
+            let output = headless_piped_output(retry,Vec::new(),sandbox.startup_timeout+EXIT_TIMEOUT).await?;
+            ensure!(output.status.success(),"retry {case}: {}",String::from_utf8_lossy(&output.stderr));
+            let result: Value = serde_json::from_slice(&output.stdout)?;
+            ensure!(result["text"] == answer && requests.load(Ordering::SeqCst) == before_retry,"retry replayed {case}");
+        }
+        Ok(())
+    }).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_http_stream_keeps_tool_effects_private_and_denial_nonfatal() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let mode = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route("/v1/models",get(||async{Json(json!({"data":[{"id":"fixture"}]}))}))
+            .route("/v1/responses",post({
+                let mode = mode.clone(); let requests = requests.clone();
+                move |Json(request):Json<Value>| {
+                    let mode = mode.clone(); let requests = requests.clone();
+                    async move {
+                        requests.lock().unwrap().push(request.clone());
+                        let speaking = request["instructions"].as_str().is_some_and(|value|value.contains("Phase: speak and act"));
+                        let followup = request["input"].as_array().is_some_and(|input|input.iter().any(|item|item["type"]=="function_call_output"));
+                        if speaking && followup && mode.load(Ordering::SeqCst)==2 {
+                            return (axum::http::StatusCode::SERVICE_UNAVAILABLE,"PRIVATE_PROVIDER_ERROR_SENTINEL").into_response();
+                        }
+                        let output = if speaking && !followup {
+                            json!([{"type":"function_call","call_id":"headless-effect","name":"file_write",
+                                "arguments":json!({"path":"effect.txt","content":"PRIVATE_TOOL_BODY_SENTINEL"}).to_string()}])
+                        } else if speaking && followup {
+                            json!([
+                                {"id":"reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"PRIVATE_REASONING_SENTINEL"}],"encrypted_content":"PRIVATE_COGNITIVE_SENTINEL"},
+                                {"id":"message","type":"message","content":[{"type":"output_text","text":"PUBLIC_HTTP_ANSWER"}]}
+                            ])
+                        } else {
+                            json!([{"type":"message","content":[{"type":"output_text","text":
+                                if speaking {"PUBLIC_HTTP_ANSWER"} else {"PRIVATE_COGNITIVE_SENTINEL"}}]}])
+                        };
+                        let completed = format!("data: {}\n\n",json!({"type":"response.completed","response":{
+                            "id":"headless-http","status":"completed","output":output,
+                            "usage":{"input_tokens":8,"output_tokens":8}}}));
+                        if speaking && followup {
+                            let initial = format!("data: {}\n\ndata: {}\n\n",
+                                json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning","output_index":0,"summary_index":0,"delta":"PRIVATE_REASONING_SENTINEL"}),
+                                json!({"type":"response.output_text.delta","item_id":"message","output_index":1,"content_index":0,"delta":"PUBLIC_HTTP_ANSWER"}));
+                            return ([(CONTENT_TYPE,"text/event-stream")],Body::from_stream(stream::iter([
+                                Ok::<_,io::Error>(initial),Ok(completed)
+                            ]))).into_response();
+                        }
+                        ([(CONTENT_TYPE,"text/event-stream")],completed).into_response()
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let _server = Server(tokio::spawn(async move{axum::serve(listener,app).await.unwrap()}));
+        for case in 0..3 {
+            mode.store(case,Ordering::SeqCst);
+            let sandbox = Sandbox::warmed().await?;
+            let config = sandbox.root.path().join("headless-http.toml");
+            std::fs::write(&config,format!("api_base='http://{address}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n"))?;
+            let mut command = sandbox.command("responses");
+            command.args(["--model","fixture","--config"]).arg(&config).env("KURU_FIXTURE_KEY","fixture");
+            if case!=1 {command.arg("--allow-write");}
+            command.args(["run","EXACT_ARGV_HTTP","--turn-id","headless-http","--output-format","stream-json"]);
+            let before = requests.lock().unwrap().len();
+            let output = headless_piped_output(command,b"PIPE_LITERAL_HTTP".to_vec(),sandbox.startup_timeout+EXIT_TIMEOUT).await?;
+            ensure!(output.status.code()==Some(if case==2 {1}else{0}),"HTTP case{case}: {}",String::from_utf8_lossy(&output.stderr));
+            let text = std::str::from_utf8(&output.stdout)?;
+            for private in ["PRIVATE_TOOL_BODY_SENTINEL","PRIVATE_COGNITIVE_SENTINEL","PRIVATE_REASONING_SENTINEL","PRIVATE_PROVIDER_ERROR_SENTINEL"] {
+                ensure!(!text.contains(private),"public stream disclosed {private}");
+            }
+            let records = text.lines().map(serde_json::from_str::<Value>).collect::<std::result::Result<Vec<_>,_>>()?;
+            ensure!(records.iter().all(|record|record["version"]==1 && ["started","status","snapshot","gap","terminal"].contains(&record["kind"].as_str().unwrap_or(""))));
+            ensure!(records.windows(2).all(|pair|pair[0]["seq"].as_u64()<pair[1]["seq"].as_u64()));
+            ensure!(records.iter().filter(|record|record["kind"]=="terminal").count()==1);
+            let terminal = records.last().context("HTTP terminal absent")?;
+            ensure!(terminal["detail"]["status"]==if case==2 {"failed"}else{"completed"});
+            if case!=2 {ensure!(terminal["detail"]["answer"]=="PUBLIC_HTTP_ANSWER");}
+            if case==1 {ensure!(!sandbox.project.join("effect.txt").exists(),"denied write took effect");}
+            else {ensure!(std::fs::read(sandbox.project.join("effect.txt"))?==b"PRIVATE_TOOL_BODY_SENTINEL");}
+            {
+                let captured = requests.lock().unwrap();
+                ensure!(captured[before..].iter().any(|request| request.to_string().contains("EXACT_ARGV_HTTP\\n\\nPiped input (literal data):\\nPIPE_LITERAL_HTTP")),"HTTP omitted exact composed prompt");
+            }
+            if case==0 {
+                let before_retry = requests.lock().unwrap().len();
+                let mut retry = sandbox.command("responses");
+                retry.args(["--model","fixture","--config"]).arg(&config).env("KURU_FIXTURE_KEY","fixture")
+                    .args(["--allow-write","--resume",terminal["detail"]["session"].as_str().context("HTTP session absent")?,
+                        "run","EXACT_ARGV_HTTP","--turn-id","headless-http","--json"]);
+                let retried = headless_piped_output(retry,b"PIPE_LITERAL_HTTP".to_vec(),sandbox.startup_timeout+EXIT_TIMEOUT).await?;
+                ensure!(retried.status.success(),"HTTP retry: {}",String::from_utf8_lossy(&retried.stderr));
+                let final_json:Value=serde_json::from_slice(&retried.stdout)?;
+                ensure!(final_json["text"]=="PUBLIC_HTTP_ANSWER" && final_json.get("version").is_none() && final_json["events"].is_array());
+                ensure!(requests.lock().unwrap().len()==before_retry && std::fs::read(sandbox.project.join("effect.txt"))?==b"PRIVATE_TOOL_BODY_SENTINEL");
+            }
+        }
+        let untrusted = Sandbox::warmed().await?;
+        std::fs::create_dir(untrusted.project.join(".kuru"))?;
+        std::fs::write(untrusted.project.join(".kuru/config.toml"),"allow_shell=true\n")?;
+        let mut command = untrusted.command("demo");
+        command.args(["run","workspace denied","--json"]);
+        let output = headless_piped_output(command,Vec::new(),untrusted.startup_timeout+EXIT_TIMEOUT).await?;
+        ensure!(output.status.code()==Some(3) && output.stdout.is_empty() && !untrusted.data.exists(),"trust refusal: {}",String::from_utf8_lossy(&output.stderr));
+        Ok(())
+    }).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_held_stdin_sigint_precedes_every_authority_boundary() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        use kuru_platform::unix::{OwnedProcessGroup, Reap, RootState, StdioPlan, StdioSlot};
+        use nix::{
+            sys::signal::{Signal, kill},
+            unistd::Pid,
+        };
+        let sandbox = Sandbox::warmed().await?;
+        let invalid = sandbox.root.path().join("must-not-load.toml");
+        std::fs::write(&invalid, "[")?;
+        let pid_file = sandbox.root.path().join("held-stdin.pid");
+        let mut command = sandbox.command("demo");
+        command
+            .arg("--config")
+            .arg(&invalid)
+            .args(["run", "--json"])
+            .env("KURU_HEADLESS_STDIN_READY_FIXTURE", "1");
+        let mut launch = Command::new("/bin/sh");
+        launch
+            .args([
+                "-c",
+                "printf '%s' \"$$\" > \"$1\"; shift; exec \"$@\"",
+                "headless-stdin-fixture",
+            ])
+            .arg(&pid_file)
+            .arg(command.get_program())
+            .args(command.get_args());
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                launch.env(key, value);
+            } else {
+                launch.env_remove(key);
+            }
+        }
+        let mut child = OwnedProcessGroup::spawn(
+            launch,
+            StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Pipe),
+        )?;
+        // This retained writer prevents EOF until after the signalled root
+        // settles. No authority can have activated while stdin is incomplete.
+        let stdin = child.take_stdin()?;
+        let mut stdout = child.take_stdout()?;
+        let mut stderr = child.take_stderr()?;
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (stderr_sender, stderr_receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ready_sender = Some(ready_sender);
+            let mut bytes = Vec::new();
+            let result = (|| -> io::Result<Vec<u8>> {
+                let mut byte = [0];
+                while stderr.read(&mut byte)? != 0 {
+                    bytes.push(byte[0]);
+                    if bytes.ends_with(b"headless stdin signal ready\n")
+                        && let Some(sender) = ready_sender.take()
+                    {
+                        let _ = sender.send(());
+                    }
+                    if bytes.len() > 1024 * 1024 {
+                        return Err(io::Error::other("stdin stderr capture bound"));
+                    }
+                }
+                Ok(bytes)
+            })();
+            let _ = stderr_sender.send(result);
+        });
+        let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout
+                .by_ref()
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = stdout_sender.send(result);
+        });
+        let outcome = async {
+            tokio::time::timeout(sandbox.startup_timeout + READY_TIMEOUT, ready_receiver)
+                .await
+                .context("held stdin never registered its signal listener")??;
+            let pid: i32 = std::fs::read_to_string(&pid_file)?.parse()?;
+            ensure!(pid > 1 && matches!(child.root_state(), RootState::Running));
+            // The root remains owned/unreaped; no await separates this check
+            // from its signal, and stdin is still held by this fixture.
+            kill(Pid::from_raw(pid), Signal::SIGINT)?;
+            let deadline = Instant::now() + EXIT_TIMEOUT;
+            loop {
+                match child.root_state() {
+                    RootState::Exited => break,
+                    RootState::Running | RootState::Interrupted => {}
+                    state => anyhow::bail!("held stdin root state: {state:?}"),
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "held stdin did not settle on SIGINT"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        child.terminate_before_reap();
+        child
+            .wait_pre_reap(Duration::from_millis(10), Instant::now() + EXIT_TIMEOUT)
+            .await;
+        let status = child.reap_if_exited();
+        drop(stdin);
+        let stdout = stdout_receiver
+            .recv_timeout(IO_TIMEOUT)
+            .context("held stdin stdout did not drain")??;
+        let stderr = stderr_receiver
+            .recv_timeout(IO_TIMEOUT)
+            .context("held stdin stderr did not drain")??;
+        outcome?;
+        let Reap::Reaped(status) = status else {
+            anyhow::bail!("held stdin root was not reaped: {status:?}")
+        };
+        ensure!(
+            status.code() == Some(130) && stdout.is_empty() && !sandbox.data.exists(),
+            "held stdin: {status:?}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        ensure!(
+            !String::from_utf8_lossy(&stderr).contains("must-not-load.toml"),
+            "configuration activated before stdin completed"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// Test-only one-shot pipe driver. Every launch is platform-owned; both output
+/// pipes drain concurrently and the retained root is reaped on every outcome.
+async fn headless_piped_output(
+    mut command: Command,
+    input: Vec<u8>,
+    allowance: Duration,
+) -> Result<std::process::Output> {
+    use kuru_platform::unix::{OwnedProcessGroup, Reap, RootState, StdioPlan, StdioSlot};
+    command.env_remove("KURU_REDUCED_MOTION");
+    let mut child = OwnedProcessGroup::spawn(
+        command,
+        StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Pipe),
+    )?;
+    let mut stdin = child.take_stdin()?;
+    let input_worker = std::thread::spawn(move || {
+        let result = stdin.write_all(&input);
+        drop(stdin);
+        result
+    });
+    let capture = |mut pipe: Box<dyn Read + Send>| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe
+                .by_ref()
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = sender.send(result);
+        });
+        receiver
+    };
+    let stdout = capture(Box::new(child.take_stdout()?));
+    let stderr = capture(Box::new(child.take_stderr()?));
+    let deadline = Instant::now() + allowance;
+    let outcome = async {
+        loop {
+            match child.root_state() {
+                RootState::Exited => return Ok::<(), anyhow::Error>(()),
+                RootState::Running | RootState::Interrupted => {}
+                state => anyhow::bail!("headless root state: {state:?}"),
+            }
+            ensure!(Instant::now() < deadline, "headless child did not settle");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    .await;
+    child.terminate_before_reap();
+    child
+        .wait_pre_reap(Duration::from_millis(10), Instant::now() + EXIT_TIMEOUT)
+        .await;
+    let status = child.reap_if_exited();
+    let input_result = input_worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdin fixture worker panicked"))?;
+    let stdout = stdout
+        .recv_timeout(IO_TIMEOUT)
+        .context("headless stdout did not drain")??;
+    let stderr = stderr
+        .recv_timeout(IO_TIMEOUT)
+        .context("headless stderr did not drain")??;
+    outcome?;
+    if let Err(error) = input_result {
+        ensure!(
+            error.kind() == io::ErrorKind::BrokenPipe,
+            "stdin fixture: {error}"
+        );
+    }
+    ensure!(stdout.len() <= 1024 * 1024 && stderr.len() <= 1024 * 1024);
+    let Reap::Reaped(status) = status else {
+        anyhow::bail!("headless root was not reaped: {status:?}")
+    };
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_piped_input_retry_and_pre_authority_rejection_are_exact() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        let allowance = sandbox.startup_timeout + EXIT_TIMEOUT;
+        let mut command = sandbox.command("demo");
+        command.args([
+            "run",
+            "summarize",
+            "--turn-id",
+            "headless-exact",
+            "--output-format",
+            "stream-json",
+        ]);
+        let output = headless_piped_output(command, b"PIPE_FACT_ALPHA".to_vec(), allowance).await?;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<Value> = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        ensure!(
+            records
+                .iter()
+                .filter(|record| record["kind"] == "terminal")
+                .count()
+                == 1
+        );
+        ensure!(
+            records
+                .windows(2)
+                .all(|pair| pair[0]["seq"].as_u64() < pair[1]["seq"].as_u64())
+        );
+        let terminal = records.last().context("terminal missing")?;
+        ensure!(terminal["kind"] == "terminal" && terminal["detail"]["status"] == "completed");
+        let session = terminal["detail"]["session"]
+            .as_str()
+            .context("session missing")?;
+        for (input, expected, reused) in [
+            (b"PIPE_FACT_ALPHA".as_slice(), 0, true),
+            (b"PIPE_FACT_BETA".as_slice(), 2, false),
+        ] {
+            let mut command = sandbox.command("demo");
+            command.args([
+                "--resume",
+                session,
+                "run",
+                "summarize",
+                "--turn-id",
+                "headless-exact",
+                "--output-format",
+                "stream-json",
+            ]);
+            let output = headless_piped_output(command, input.to_vec(), allowance).await?;
+            ensure!(
+                output.status.code() == Some(expected),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let records: Vec<Value> = std::str::from_utf8(&output.stdout)?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<_, _>>()?;
+            let terminal = records.last().context("retry terminal missing")?;
+            if reused {
+                ensure!(terminal["detail"]["reused"] == true);
+            } else {
+                ensure!(terminal["detail"]["status"] == "rejected");
+            }
+        }
+        for (argv, input, expected) in [
+            (Some("ARGUMENT_BYTES"), Vec::new(), "ARGUMENT_BYTES"),
+            (None, b"PIPE_ONLY_BYTES".to_vec(), "PIPE_ONLY_BYTES"),
+        ] {
+            let mut command = sandbox.command("demo");
+            command.arg("run");
+            if let Some(argv) = argv {
+                command.arg(argv);
+            }
+            command.arg("--json");
+            let output = headless_piped_output(command, input, allowance).await?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout)?;
+            ensure!(
+                result["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(expected))
+            );
+            ensure!(result.get("version").is_none() && result["events"].is_array());
+        }
+        let rejected = Sandbox::warmed().await?;
+        // Invalid configuration would fail if the input boundary were late.
+        let invalid = rejected.root.path().join("invalid.toml");
+        std::fs::write(&invalid, "[")?;
+        for input in [Vec::new(), vec![0xff], vec![b'x'; 131_073]] {
+            let mut command = rejected.command("demo");
+            command
+                .arg("--config")
+                .arg(&invalid)
+                .args(["run", "--output-format", "stream-json"]);
+            let output = headless_piped_output(command, input, allowance).await?;
+            ensure!(
+                output.status.code() == Some(2),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ensure!(output.stdout.is_empty() && !rejected.data.exists());
+        }
+        Ok(())
+    })
+    .await
+}
+
 #[test]
 fn real_pty_file_checkpoint_inspect_and_selected_undo() -> Result<()> {
     let sandbox = Sandbox::new()?;

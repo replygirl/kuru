@@ -168,6 +168,18 @@ pub struct ControlledTurnOutput {
     pub reused: bool,
 }
 
+/// An exact retry ID cannot be reused for a different request in its session.
+#[derive(Debug)]
+pub struct TurnInputMismatch;
+
+impl std::fmt::Display for TurnInputMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("turn ID is already associated with a different request in this session")
+    }
+}
+
+impl std::error::Error for TurnInputMismatch {}
+
 #[derive(Clone, Copy, Default)]
 struct TurnReviewChannels<'a> {
     permission: Option<&'a ApprovalSender>,
@@ -1144,12 +1156,25 @@ impl Harness {
     }
     pub async fn shutdown(&mut self, dream: bool) -> Result<()> {
         let cancellation = CancellationToken::new();
+        self.shutdown_controlled(dream, &cancellation).await
+    }
+
+    /// Cancel an exit dream while still awaiting the same complete cleanup.
+    pub async fn shutdown_controlled(
+        &mut self,
+        dream: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
         let result = async {
             self.reconcile().await?;
-            if dream && self.config.dream_on_exit && self.session.turns > 0 {
+            if dream
+                && self.config.dream_on_exit
+                && self.session.turns > 0
+                && !cancellation.is_cancelled()
+            {
                 match tokio::time::timeout(
                     SHUTDOWN_DREAM_TIMEOUT,
-                    self.dream_controlled(&cancellation),
+                    self.dream_controlled(cancellation),
                 )
                 .await
                 {
@@ -1174,6 +1199,7 @@ impl Harness {
         let tool_cleanup = self.tools.shutdown().await;
         match (result, memory_cleanup, tool_cleanup) {
             (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(()), Ok(())) => Err(error),
             (primary, memory, tools) => {
                 let mut failures = Vec::new();
                 if let Err(error) = primary {
@@ -1595,10 +1621,9 @@ impl Harness {
             let mut journal =
                 decode_turn_journal(value).context("stored turn journal is invalid")?;
             journal.validate(id)?;
-            ensure!(
-                journal.prompt == prompt && journal.target.as_deref() == target,
-                "turn ID is already associated with a different request in this session"
-            );
+            if journal.prompt != prompt || journal.target.as_deref() != target {
+                return Err(TurnInputMismatch.into());
+            }
             if let Some(output) = journal.output {
                 return Ok(TurnAdmission::Reuse(project_turn_output(output)));
             }
