@@ -151,6 +151,21 @@ pub struct OpenOptions {
     pub config: MemoryConfig,
     pub read_only: bool,
     pub supervisor: Option<PathBuf>,
+    /// Exact inventoried legacy scope selected for an explicit import. A
+    /// missing value keeps the established automatic exact-project import.
+    pub(crate) legacy_source_scope: Option<String>,
+    /// Test-only pause after explicit import's initial no-effect checks and
+    /// immediately before the native maintenance barrier is requested.
+    #[cfg(test)]
+    pub(crate) legacy_admission_pause: Option<Arc<LegacyAdmissionPause>>,
+    /// Test-only pause after the imported store has opened but before receipt
+    /// collection and local close begin.
+    #[cfg(test)]
+    pub(crate) legacy_open_pause: Option<Arc<LegacyAdmissionPause>>,
+    /// Test-only pause after imported memory has closed and reaped but before
+    /// the worker releases its maintenance permit.
+    #[cfg(test)]
+    pub(crate) legacy_close_pause: Option<Arc<LegacyAdmissionPause>>,
     /// Identifies the client that spawns a service owner. The owner retires
     /// on its own only after an attachment has presented this token; it is
     /// not a secret and grants nothing else.
@@ -223,6 +238,23 @@ pub(crate) enum Creation {
     Cold,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct LegacyAdmissionPause {
+    pub(crate) reached: tokio::sync::Semaphore,
+    pub(crate) resume: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for LegacyAdmissionPause {
+    fn default() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            resume: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
 impl OpenOptions {
     pub fn new(data_dir: PathBuf, project_scope: String) -> Self {
         Self {
@@ -231,6 +263,13 @@ impl OpenOptions {
             config: MemoryConfig::default(),
             read_only: false,
             supervisor: None,
+            legacy_source_scope: None,
+            #[cfg(test)]
+            legacy_admission_pause: None,
+            #[cfg(test)]
+            legacy_open_pause: None,
+            #[cfg(test)]
+            legacy_close_pause: None,
             starter_token: None,
             expected_instance: None,
             #[cfg(test)]
@@ -1762,6 +1801,10 @@ pub(crate) const SCHEMA_VERSIONS: [i32; 2] = [
 ];
 
 impl MemoryStore {
+    pub(crate) fn migration_receipt(&self) -> Result<Option<MigrationReceipt>> {
+        Ok(read_activation(&self.shared.directory, &self.shared.project_scope)?.migration)
+    }
+
     /// Inspect only the existing project directory and bounded activation
     /// record. This creates no lock, engine cache, service, migration, or
     /// staging path.
@@ -2120,11 +2163,21 @@ impl MemoryStore {
             let scope = options.project_scope.clone();
             let legacy =
                 if Self::legacy_import_suppressed(&options.data_dir, &options.project_scope)? {
+                    ensure!(
+                        options.legacy_source_scope.is_none(),
+                        migration::LegacyImportRejected(migration::LegacyImportRefusal::Suppressed)
+                    );
                     None
                 } else {
-                    tokio::task::spawn_blocking(move || migration::prepare(&data, &scope))
-                        .await??
-                        .map(Arc::new)
+                    let source_scope = options.legacy_source_scope.clone();
+                    tokio::task::spawn_blocking(move || match source_scope {
+                        Some(source_scope) => {
+                            migration::prepare_explicit(&data, &scope, &source_scope)
+                        }
+                        None => migration::prepare(&data, &scope),
+                    })
+                    .await??
+                    .map(Arc::new)
                 };
             let recovered = recover_staging(
                 &directory,

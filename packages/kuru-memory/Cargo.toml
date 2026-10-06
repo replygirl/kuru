@@ -23,7 +23,7 @@ futures.workspace = true
 kuru-core.workspace = true
 kuru-platform.workspace = true
 kuru-archive.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

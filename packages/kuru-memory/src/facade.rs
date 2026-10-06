@@ -30,6 +30,39 @@ use crate::{
 };
 pub use driver::{DriverPresence, SessionDriver};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyScopeStatus {
+    Unimported,
+    Imported,
+    Suppressed,
+    Unresolved,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LegacyInventoryScope {
+    pub scope: String,
+    pub messages: u64,
+    pub state: u64,
+    pub status: LegacyScopeStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LegacyProjectInventory {
+    pub scopes: Vec<LegacyInventoryScope>,
+    pub unresolved_rows: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LegacyImportOutcome {
+    pub source_scope: String,
+    pub target_scope: String,
+    pub revision: String,
+    pub snapshot_sha256: String,
+    pub messages: usize,
+    pub state: usize,
+}
+
 #[derive(Clone)]
 pub struct MemoryStore {
     backend: Backend,
@@ -1578,6 +1611,214 @@ fn session_lifecycle_outcome(value: ServiceValue) -> Result<store::SessionLifecy
 }
 
 impl MemoryStore {
+    /// Observe legacy scopes and checked activation controls without starting
+    /// Dolt, electing a service, or retaining an import snapshot.
+    pub fn legacy_inventory(data_dir: &Path) -> Result<Option<LegacyProjectInventory>> {
+        let Some(raw) = crate::migration::inventory(data_dir)? else {
+            return Ok(None);
+        };
+        let scopes = raw
+            .scopes
+            .into_iter()
+            .map(|item| {
+                let status =
+                    match store::MemoryStore::inspect_project_structure(data_dir, &item.scope) {
+                        store::ProjectStructure::Activated => LegacyScopeStatus::Imported,
+                        store::ProjectStructure::Absent => {
+                            match store::MemoryStore::legacy_import_suppressed(
+                                data_dir,
+                                &item.scope,
+                            ) {
+                                Ok(true) => LegacyScopeStatus::Suppressed,
+                                Ok(false) => LegacyScopeStatus::Unimported,
+                                Err(_) => LegacyScopeStatus::Unresolved,
+                            }
+                        }
+                        store::ProjectStructure::InvalidActivation
+                        | store::ProjectStructure::Unverified => LegacyScopeStatus::Unresolved,
+                    };
+                LegacyInventoryScope {
+                    scope: item.scope,
+                    messages: item.messages,
+                    state: item.state,
+                    status,
+                }
+            })
+            .collect();
+        Ok(Some(LegacyProjectInventory {
+            scopes,
+            unresolved_rows: raw.unresolved_rows,
+        }))
+    }
+
+    /// Import one selected legacy scope under checked native and service
+    /// maintenance ownership. The spawned worker owns the permit through
+    /// local store close even when its caller is cancelled.
+    pub async fn import_legacy(
+        mut options: OpenOptions,
+        source_scope: Option<String>,
+    ) -> Result<LegacyImportOutcome> {
+        use crate::migration::{LegacyImportRefusal, LegacyImportRejected};
+
+        ensure!(!options.read_only, "legacy import requires writable memory");
+        let selected = source_scope.unwrap_or_else(|| options.project_scope.clone());
+        store::project_directory(&options.data_dir, &selected)?;
+        options.legacy_source_scope = Some(selected.clone());
+        let worker = tokio::spawn(async move {
+            ensure!(
+                !store::MemoryStore::exists(&options.data_dir, &options.project_scope)?,
+                LegacyImportRejected(LegacyImportRefusal::AlreadyActive)
+            );
+            ensure!(
+                !store::MemoryStore::legacy_import_suppressed(
+                    &options.data_dir,
+                    &options.project_scope,
+                )?,
+                LegacyImportRejected(LegacyImportRefusal::Suppressed)
+            );
+            #[cfg(test)]
+            if let Some(pause) = options.legacy_admission_pause.clone() {
+                pause.reached.add_permits(1);
+                pause
+                    .resume
+                    .acquire()
+                    .await
+                    .context("legacy admission pause closed")?
+                    .forget();
+            }
+            let data = options.data_dir.clone();
+            let selected_for_proof = selected.clone();
+            let proved = tokio::task::spawn_blocking(move || {
+                crate::migration::source_scope_proved(&data, &selected_for_proof)
+            })
+            .await??;
+            ensure!(
+                proved,
+                LegacyImportRejected(LegacyImportRefusal::SourceScopeUnproved)
+            );
+            let permit = service::acquire_maintenance_permit(&options)
+                .await
+                .map_err(|error| {
+                    if error.is::<service::MaintenanceActiveClients>()
+                        || error.is::<crate::session_driver::NativeMaintenanceBusy>()
+                    {
+                        anyhow::Error::new(LegacyImportRejected(LegacyImportRefusal::ActiveClients))
+                    } else {
+                        error
+                    }
+                })?;
+            // Recheck after both native admission and checked owner retirement
+            // so neither a new starter nor a purge races this import.
+            ensure!(
+                !store::MemoryStore::exists(&options.data_dir, &options.project_scope)?,
+                LegacyImportRejected(LegacyImportRefusal::AlreadyActive)
+            );
+            ensure!(
+                !store::MemoryStore::legacy_import_suppressed(
+                    &options.data_dir,
+                    &options.project_scope,
+                )?,
+                LegacyImportRejected(LegacyImportRefusal::Suppressed)
+            );
+            let quiescence_store =
+                store::project_directory(&options.data_dir, &options.project_scope)?;
+            #[cfg(unix)]
+            let lifecycle_root: Option<PathBuf> = None;
+            #[cfg(windows)]
+            let lifecycle_root = Some(options.data_dir.join("memory/lifecycles"));
+            #[cfg(test)]
+            let open_pause = options.legacy_open_pause.clone();
+            #[cfg(test)]
+            let close_pause = options.legacy_close_pause.clone();
+            let local = store::MemoryStore::open(options).await?;
+            // Keep this checked directory identity alive while the service
+            // closes, so a later quiescence observation cannot bind to a
+            // replacement at the same path.
+            let checked_directory = crate::files::directory(&quiescence_store).ok();
+            #[cfg(test)]
+            if let Some(pause) = open_pause {
+                pause.reached.add_permits(1);
+                pause
+                    .resume
+                    .acquire()
+                    .await
+                    .context("legacy open pause closed")?
+                    .forget();
+            }
+            let result = async {
+                let receipt = local
+                    .migration_receipt()?
+                    .context("active project has no legacy import receipt")?;
+                ensure!(
+                    receipt
+                        .source_project_scope
+                        .as_deref()
+                        .unwrap_or(&receipt.project_scope)
+                        == selected,
+                    "legacy activation receipt source differs from selected scope"
+                );
+                Ok::<_, anyhow::Error>(LegacyImportOutcome {
+                    source_scope: selected,
+                    target_scope: receipt.project_scope,
+                    revision: local.revision().await?,
+                    snapshot_sha256: receipt.source_sha256,
+                    messages: receipt.messages,
+                    state: receipt.state,
+                })
+            }
+            .await;
+            let closed = local.close().await;
+            if closed.is_err() {
+                // On a bounded close error, Server transfers its exact child
+                // and lifecycle guard to its existing independent reaper.
+                // Keep maintenance admission until that same store's stable
+                // lifecycle lease can be acquired; a close error is not proof
+                // that the reaper completed.
+                let Some(checked_directory) = checked_directory else {
+                    // The opened store's path could not be retained, so no
+                    // same-store reap proof is available. Keep admission
+                    // instead of releasing it against an unverified path.
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                };
+                loop {
+                    if let Ok(lease) = crate::server::Server::quiescence_at(
+                        &quiescence_store,
+                        lifecycle_root.as_deref(),
+                        Duration::from_secs(300),
+                    )
+                    .await
+                        && lease.directory.identity() == checked_directory.identity()
+                    {
+                        drop(lease);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            #[cfg(test)]
+            if let Some(pause) = close_pause {
+                pause.reached.add_permits(1);
+                pause
+                    .resume
+                    .acquire()
+                    .await
+                    .context("legacy close pause closed")?
+                    .forget();
+            }
+            drop(permit);
+            match (result, closed) {
+                (Ok(outcome), Ok(())) => Ok(outcome),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(error)) => Err(error.context("close imported Dolt memory")),
+                (Err(error), Err(cleanup)) => Err(error.context(format!(
+                    "imported Dolt memory cleanup also failed: {cleanup:#}"
+                ))),
+            }
+        });
+        worker.await.context("legacy import worker stopped")?
+    }
+
     /// Inspect the exact project's existing activation without opening Dolt
     /// or creating any project state.
     pub fn inspect_project_structure(
@@ -3828,7 +4069,7 @@ impl ActiveExportSnapshot {
 mod tests {
     use super::*;
     use crate::test_support::fixture_deadline;
-    use anyhow::Context;
+    use anyhow::{Context, ensure};
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::time::Duration;
@@ -9494,3 +9735,213 @@ mod tests {
 #[path = "facade/state_read_cut.rs"]
 mod state_read_cut;
 pub use state_read_cut::StateReadCut;
+
+#[cfg(test)]
+mod legacy_import_tests {
+    use super::*;
+    use crate::test_support::{self, closing};
+    use anyhow::Context;
+    use std::{path::Path, sync::Arc};
+
+    struct AbortOnDrop(tokio::task::AbortHandle);
+
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    fn legacy_entries(data: &Path) -> anyhow::Result<Vec<std::ffi::OsString>> {
+        let path = data.join("memory/legacy");
+        let mut entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<std::io::Result<Vec<_>>>()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        entries.sort();
+        Ok(entries)
+    }
+
+    #[tokio::test]
+    async fn explicit_import_refuses_real_n4_driver_before_staging() -> anyhow::Result<()> {
+        closing(async {
+            test_support::warm_runtime_cache().await?;
+            let root = test_support::tempdir()?;
+            let data = root.path().to_path_buf();
+            let uncanonical_project = root.path().join("workspace");
+            std::fs::create_dir(&uncanonical_project)?;
+            let project = uncanonical_project.canonicalize()?;
+            let scope = service::canonical_project_scope(&project)?;
+            let source_path = data.join("memory.sqlite3");
+            let source = rusqlite::Connection::open(&source_path)?;
+            source.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA user_version=1;
+                 CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+                 CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+            )?;
+            source.pragma_update(None, "application_id", 0x4b55_5255_i64)?;
+            source.execute(
+                "INSERT INTO messages (namespace,role,content) VALUES (?1,'user','retained source')",
+                [format!("{scope}/transcript/one")],
+            )?;
+            drop(source);
+            let before_source = std::fs::read(&source_path)?;
+
+            let options = test_support::warmed_open_options(data.clone(), scope.clone()).await?;
+            let admission_deadline = service::maintenance_deadline(&options) + Duration::from_secs(2);
+            let pause = Arc::new(store::LegacyAdmissionPause::default());
+            let mut paused = options.clone();
+            paused.legacy_admission_pause = Some(pause.clone());
+            let mut importing = tokio::spawn(MemoryStore::import_legacy(paused, None));
+            let _import_cleanup = AbortOnDrop(importing.abort_handle());
+            tokio::select! {
+                reached = pause.reached.acquire() => {
+                    reached.context("legacy import admission pause closed")?.forget();
+                }
+                settled = &mut importing => {
+                    anyhow::bail!("import settled before admission pause: {settled:?}");
+                }
+            }
+            ensure!(!store::MemoryStore::exists(&data, &scope)?);
+
+            // The sibling activates normally and admits a real N4 session
+            // while explicit import is held after its initial preflight.
+            let fixture_options = options.clone();
+            let sibling = MemoryStore::open(options).await?;
+            sibling.create_session("import", Mode::Ifs, "import").await?;
+            let (session_memory, driver) = sibling.bind_session_driver(&data, &project).await?;
+            let target = crate::SessionDriverTarget::Catalog(Box::new(
+                sibling
+                    .session_catalog_record("import")
+                    .await?
+                    .context("missing admitted import fixture session")?,
+            ));
+            driver.select(target).await?;
+            ensure!(sibling.live_session_drivers().await?.len() == 1);
+            let snapshots = legacy_entries(&data)?;
+            ensure!(!snapshots.is_empty(), "the sibling's automatic import did not retain its snapshot");
+
+            pause.resume.add_permits(1);
+            let refused = tokio::time::timeout(
+                admission_deadline,
+                importing,
+            )
+            .await
+            .context("explicit import did not settle at the N4 native barrier")?
+            .context("explicit import worker stopped")?
+            .expect_err("explicit import passed an admitted session driver");
+            ensure!(
+                refused.downcast_ref::<crate::migration::LegacyImportRejected>()
+                    == Some(&crate::migration::LegacyImportRejected(
+                        crate::migration::LegacyImportRefusal::ActiveClients,
+                    )),
+                "wrong import refusal: {refused:#}"
+            );
+            ensure!(legacy_entries(&data)? == snapshots, "refused import retained a new snapshot");
+            driver.close().await?;
+            session_memory.close().await?;
+            sibling.close().await?;
+            test_support::await_managed_quiescence(&fixture_options).await?;
+            ensure!(std::fs::read(source_path)? == before_source, "refused import changed legacy source bytes");
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn cancelled_import_retains_maintenance_through_close_and_reap() -> anyhow::Result<()> {
+        closing(async {
+            test_support::warm_runtime_cache().await?;
+            let root = test_support::tempdir()?;
+            let data = root.path().to_path_buf();
+            let uncanonical_project = root.path().join("workspace");
+            std::fs::create_dir(&uncanonical_project)?;
+            let project = uncanonical_project.canonicalize()?;
+            let scope = service::canonical_project_scope(&project)?;
+            let source_path = data.join("memory.sqlite3");
+            let source = rusqlite::Connection::open(&source_path)?;
+            source.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA user_version=1;
+                 CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+                 CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+            )?;
+            source.pragma_update(None, "application_id", 0x4b55_5255_i64)?;
+            source.execute(
+                "INSERT INTO messages (namespace,role,content) VALUES (?1,'user','preserved')",
+                [format!("{scope}/transcript/one")],
+            )?;
+            drop(source);
+            let before_source = std::fs::read(&source_path)?;
+
+            let mut options = test_support::warmed_open_options(data.clone(), scope.clone()).await?;
+            let open_pause = Arc::new(store::LegacyAdmissionPause::default());
+            let close_pause = Arc::new(store::LegacyAdmissionPause::default());
+            options.legacy_open_pause = Some(open_pause.clone());
+            options.legacy_close_pause = Some(close_pause.clone());
+            let mut caller = tokio::spawn(MemoryStore::import_legacy(options, None));
+            let _caller_cleanup = AbortOnDrop(caller.abort_handle());
+            tokio::select! {
+                reached = open_pause.reached.acquire() => {
+                    reached.context("import open pause closed")?.forget();
+                }
+                settled = &mut caller => {
+                    anyhow::bail!("import settled before owned store opened: {settled:?}");
+                }
+            }
+
+            // The worker now owns an open imported store. Dropping its caller
+            // must not cancel the actual close/reap or release maintenance.
+            caller.abort();
+            let cancelled = caller.await.expect_err("import caller remained attached");
+            ensure!(cancelled.is_cancelled());
+            let busy = match crate::session_driver::NativeMaintenanceLease::acquire(&data, &scope) {
+                Ok(_) => anyhow::bail!("cancelled caller released maintenance before worker cleanup"),
+                Err(error) => error,
+            };
+            ensure!(busy.is::<crate::session_driver::NativeMaintenanceBusy>());
+
+            open_pause.resume.add_permits(1);
+            tokio::select! {
+                reached = close_pause.reached.acquire() => {
+                    reached.context("import close pause closed")?.forget();
+                }
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                    anyhow::bail!("detached import did not finish actual local close and reap");
+                }
+            }
+            let busy_after_close = match crate::session_driver::NativeMaintenanceLease::acquire(&data, &scope) {
+                Ok(_) => anyhow::bail!("detached import released maintenance before worker cleanup completed"),
+                Err(error) => error,
+            };
+            ensure!(busy_after_close.is::<crate::session_driver::NativeMaintenanceBusy>());
+            close_pause.resume.add_permits(1);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match crate::session_driver::NativeMaintenanceLease::acquire(&data, &scope) {
+                    Ok(permit) => {
+                        drop(permit);
+                        break;
+                    }
+                    Err(error) if error.is::<crate::session_driver::NativeMaintenanceBusy>() => {
+                        ensure!(tokio::time::Instant::now() < deadline, "detached import did not release maintenance after close");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            ensure!(
+                store::MemoryStore::inspect_project_structure(&data, &scope)
+                    == store::ProjectStructure::Activated,
+                "completed import lost its activated receipt"
+            );
+            ensure!(std::fs::read(source_path)? == before_source);
+            ensure!(!legacy_entries(&data)?.is_empty());
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+    }
+}
