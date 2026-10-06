@@ -1672,6 +1672,7 @@ fn usage_branch_store(store: &MemoryStore) -> Result<MemoryStore> {
         pool,
         branch: usage_ledger::BRANCH.into(),
         logical_receipt: None,
+        public_transcript_proof: Default::default(),
     })
 }
 
@@ -2013,6 +2014,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
         pool,
         branch: "main".into(),
         logical_receipt: None,
+        public_transcript_proof: Default::default(),
     }
 }
 
@@ -2108,6 +2110,7 @@ async fn exact_base_schema_branch(store: &MemoryStore) -> SchemaBranch {
             pool,
             branch,
             logical_receipt: None,
+            public_transcript_proof: Default::default(),
         },
         base,
     }
@@ -3422,6 +3425,7 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
         shared,
         branch: "main".into(),
         logical_receipt: None,
+        public_transcript_proof: Default::default(),
     };
     assert_schema_commit(&current, &base, &source_history, &receipt).await;
     assert_eq!(
@@ -3584,6 +3588,7 @@ impl AckDropProxy {
             pool: Arc::new(MemoryPool::fixture(pool, &store.branch)),
             branch: store.branch.clone(),
             logical_receipt: None,
+            public_transcript_proof: Default::default(),
         }
     }
 

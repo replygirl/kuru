@@ -872,6 +872,7 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
                 Some(notice),
                 crate::commands::Registry::default(),
                 None,
+                Default::default(),
             )
             .await;
             let buffer = terminal.backend().buffer();
@@ -985,6 +986,7 @@ async fn failed_initial_tui_draw_never_marks_the_notice_shown() {
             Some(notice),
             crate::commands::Registry::default(),
             None,
+            Default::default(),
         )
         .await
         .unwrap_err();
@@ -1029,6 +1031,7 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
                 Some(notice),
                 crate::commands::Registry::default(),
                 None,
+                Default::default(),
             )
             .await
         });
@@ -1143,6 +1146,7 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
             project_initial_view(&harness).await.unwrap()
         };
         let mut view = View::from_initial(initial, vec![]);
+        view.focused = false;
         let mut job = None;
 
         seed_stale_runtime(&mut view);
@@ -1185,10 +1189,11 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
             "authoritative completion"
         );
         assert_eq!(view.status, "Complete");
+        assert!(view.completion_signal_pending);
         assert!(!view.busy);
         assert!(view.operation_start.is_none());
         assert_eq!(
-            view.completion_metadata[&0],
+            view.completion_metadata[view.transcript.item_id(0).unwrap()],
             "11 input tokens · 7 output tokens"
         );
         assert_runtime_projection(&view, &harness).await;
@@ -1228,6 +1233,7 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         ));
         assert_eq!(view.transcript, transcript);
         assert_eq!(view.status, "Complete · stored result reused");
+        assert!(!view.completion_signal_pending);
         assert!(
             view.notice
                 .as_deref()
@@ -1257,6 +1263,7 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         ));
         assert_eq!(view.status, "Complete");
         assert_eq!(view.mode, "freudian");
+        assert!(!view.completion_signal_pending);
         assert!(
             view.notice
                 .as_deref()
@@ -1288,6 +1295,7 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         ));
         assert_eq!(view.status, "Failed · details in conversation");
         assert_eq!(view.mode, "freudian");
+        assert!(!view.completion_signal_pending);
         assert!(
             view.transcript
                 .last()
@@ -1296,8 +1304,40 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         assert!(view.operation_start.is_none());
         assert_runtime_projection(&view, &harness).await;
 
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = harness
+            .lock()
+            .await
+            .run_controlled(
+                "cancelled notification",
+                None,
+                "cancelled-notification",
+                &cancelled,
+            )
+            .await
+            .unwrap_err();
+        let outcome = apply_completion(
+            (7, Err(error)),
+            7,
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            CompletionState::Settled { quit: false, .. }
+        ));
+        assert_eq!(view.status, "Cancelled · turn interrupted");
+        assert!(!view.completion_signal_pending);
+
         seed_stale_runtime(&mut view);
         view.begin_operation();
+        view.completion_signal_pending = true;
         view.completion_locked = true;
         job = Some(tokio::spawn(std::future::pending()));
         let before = (
@@ -1326,6 +1366,7 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         .await
         .unwrap();
         assert_eq!(outcome, CompletionState::Stale);
+        assert!(view.completion_signal_pending);
         assert_eq!(
             (
                 view.transcript,

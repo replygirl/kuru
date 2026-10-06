@@ -1129,7 +1129,7 @@ fn terminal_fixture_process() -> Result<()> {
                 ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
             let mut view = kuru::ui::View::from_initial(
                 kuru::ui::InitialViewData {
-                    transcript: Vec::new(),
+                    transcript: Vec::new().into(),
                     session: "fixture-session".into(),
                     project: "fixture-project".into(),
                     motion: false,
@@ -1574,6 +1574,160 @@ fn json_contains_exact_text(value: &Value, expected: &str) -> bool {
             .any(|item| json_contains_exact_text(item, expected)),
         _ => false,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_public_pages_literal_search_and_deep_item_anchor_at_120_and_80() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        use kuru_core::Message;
+        use kuru_memory::{PublicTurnSettlement, SessionTurnCheckpoint};
+        let sandbox = Sandbox::warmed().await?;
+        let created = sandbox
+            .command("demo")
+            .args(["run", "public navigation origin", "--json"])
+            .output()?;
+        ensure!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let created: Value = serde_json::from_slice(&created.stdout)?;
+        let session = created["session"]
+            .as_str()
+            .context("navigation session missing")?
+            .to_owned();
+        let options = memory_options(&sandbox)?;
+        let (_, opening) = MemoryStore::open_managed_observed(
+            options.clone(),
+            sandbox.project.canonicalize()?,
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        );
+        let memory = opening.await?;
+        let seeded: Result<()> = async {
+            let generation = memory
+                .session_catalog_record(&session)
+                .await?
+                .context("navigation catalog missing")?
+                .lifecycle_generation;
+            let namespace = format!(
+                "{}/transcript/{session}",
+                kuru_runtime::project_scope(&sandbox.project)?
+            );
+            for index in 0..96 {
+                let turn = format!("navigation-{index:03}");
+                let marker = format!("SEARCH_OLD_{index:03}");
+                memory
+                    .checkpoint_session_turn(
+                        &namespace,
+                        &session,
+                        &[Message::text("user", format!("old question {marker}"))],
+                        &[],
+                        &SessionTurnCheckpoint::Admit {
+                            expected_generation: generation,
+                            turn_id: turn.clone(),
+                            label: None,
+                            expected_transcript_rows: None,
+                        },
+                    )
+                    .await?;
+                let answer = if index == 95 {
+                    format!(
+                        "{}END_SINGLE_ITEM\nATTACK\u{1b}]2;FOREIGN_TITLE\u{7}",
+                        "LONG_PUBLIC_ROW 👨‍👩‍👧‍👦 👍🏽 e\u{301}\n".repeat(70_000)
+                    )
+                } else {
+                    format!("older answer {marker}")
+                };
+                memory
+                    .checkpoint_session_turn(
+                        &namespace,
+                        &session,
+                        &[Message::text("assistant", answer)],
+                        &[],
+                        &SessionTurnCheckpoint::Settle {
+                            expected_generation: generation,
+                            turn_id: turn,
+                            settlement: PublicTurnSettlement::Completed,
+                            speaker_id: "fixture-speaker".into(),
+                        },
+                    )
+                    .await?;
+            }
+            ensure!(
+                memory
+                    .public_transcript_page(&session, None, 32)
+                    .await?
+                    .total_rows
+                    >= 97
+            );
+            Ok(())
+        }
+        .await;
+        let closed = memory.close().await;
+        let quiesced = kuru_memory::test_support::await_managed_quiescence(&options).await;
+        seeded?;
+        closed?;
+        quiesced?;
+        let mut command = sandbox.command("demo");
+        command
+            .args(["--resume", &session])
+            .env("KURU_REDUCED_MOTION", "1")
+            .env("TERM", "xterm-256color");
+        let mut terminal = Terminal::spawn(command, 35, 120)?;
+        terminal
+            .wait_composer_frame(&["END_SINGLE_ITEM", "enter send"], sandbox.startup_timeout)?;
+        terminal.send(b"\x1b[5~")?;
+        terminal
+            .wait_composer_frame(&["LONG_PUBLIC_ROW", "history", "enter send"], READY_TIMEOUT)?;
+        terminal.send("literal draft 猫".as_bytes())?;
+        terminal.wait_composer_frame(
+            &["LONG_PUBLIC_ROW", "literal draft 猫", "enter send"],
+            READY_TIMEOUT,
+        )?;
+        terminal.resize(24, 80)?;
+        terminal.wait_composer_frame(
+            &["LONG_PUBLIC_ROW", "literal draft 猫", "enter send"],
+            READY_TIMEOUT,
+        )?;
+        terminal.send(b"\x06SEARCH_OLD_003")?;
+        terminal.wait_composer_frame(
+            &["older answer SEARCH_OLD_003", "Match", "literal draft 猫"],
+            READY_TIMEOUT,
+        )?;
+        ensure!(
+            !terminal.screen().contains("old question SEARCH_OLD_003"),
+            "search skipped the exact answer anchor: {}",
+            terminal.screen()
+        );
+        terminal.send(b"\r")?;
+        terminal.wait_composer_frame(
+            &["old question SEARCH_OLD_003", "Match", "literal draft 猫"],
+            READY_TIMEOUT,
+        )?;
+        terminal.send(b"\x1b")?;
+        terminal.wait_composer_frame(
+            &["LONG_PUBLIC_ROW", "literal draft 猫", "enter send"],
+            READY_TIMEOUT,
+        )?;
+        ensure!(!String::from_utf8_lossy(&terminal.output).contains("\u{1b}]2;FOREIGN_TITLE"));
+        terminal.send(b"\x03")?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        terminal.assert_restored()?;
+        ensure!(
+            terminal
+                .output
+                .windows(b"\x1b[22;2t".len())
+                .any(|bytes| bytes == b"\x1b[22;2t")
+        );
+        ensure!(
+            terminal
+                .output
+                .windows(b"\x1b[23;2t".len())
+                .any(|bytes| bytes == b"\x1b[23;2t")
+        );
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6227,10 +6381,33 @@ async fn real_pty_previews_delayed_native_selected_stream_at_three_sizes() -> Re
             .env("KURU_REDUCED_MOTION", "1");
         let mut terminal = Terminal::spawn(command, 24, 80)?;
         terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
-        terminal.send(b"Stream to the user\r")?;
+        let prompt = format!(
+            "Stream to the user\n{}",
+            (0..40)
+                .map(|row| format!("PUBLIC_READING_{row:03}\n"))
+                .collect::<String>()
+        );
+        terminal.send(format!("\x1b[200~{prompt}\x1b[201~\r").as_bytes())?;
         terminal.wait("selected provider request started", READY_TIMEOUT, |_| {
             Ok(selected_started.load(Ordering::SeqCst))
         })?;
+        terminal.wait_composer_frame(&["VISIBLE_LIVE_TAIL", "thinking"], READY_TIMEOUT)?;
+        let before_scroll = terminal.output.len();
+        terminal.send(b"\x1b[5~")?;
+        terminal.wait(
+            "completed held-stream reading frame",
+            READY_TIMEOUT,
+            |terminal| {
+                Ok(terminal.completed_frame_after(before_scroll)
+                    && terminal.screen().contains("PUBLIC_READING_"))
+            },
+        )?;
+        let reading = terminal
+            .screen()
+            .split_whitespace()
+            .find(|token| token.starts_with("PUBLIC_READING_"))
+            .context("held-stream public anchor missing")?
+            .to_owned();
         for (rows, cols) in [(24, 80), (40, 120), (18, 40)] {
             if (rows, cols) != (24, 80) {
                 terminal.resize(rows, cols)?;
@@ -6245,6 +6422,15 @@ async fn real_pty_previews_delayed_native_selected_stream_at_three_sizes() -> Re
                 READY_TIMEOUT,
             )?;
             let screen = terminal.screen();
+            // The inherited 40-column preview case has no transcript rows
+            // left after its panel and chrome. At practical widths, resizing
+            // must keep the saved public reading item visible.
+            if cols >= 80 {
+                ensure!(
+                    screen.contains(&reading),
+                    "reading item moved at {cols}x{rows}: {screen}"
+                );
+            }
             ensure!(
                 !screen.contains("PRIVATE_PEER_SENTINEL")
                     && !screen.contains("PRIVATE_NATIVE_SENTINEL"),
@@ -6255,11 +6441,60 @@ async fn real_pty_previews_delayed_native_selected_stream_at_three_sizes() -> Re
                 "terminal answer appeared before completion"
             );
         }
+        let before_resize = terminal.output.len();
+        terminal.resize(24, 80)?;
+        terminal.wait(
+            "completed restored reading viewport",
+            READY_TIMEOUT,
+            |terminal| {
+                Ok(terminal.completed_frame_after(before_resize)
+                    && terminal.screen().contains(&reading)
+                    && terminal.screen().contains("VISIBLE_LIVE_TAIL"))
+            },
+        )?;
         terminal.send(b"\x1b[200~NEXT_DRAFT\x1b[201~")?;
         terminal.wait_composer_frame(&["NEXT_DRAFT", "VISIBLE_LIVE_TAIL"], READY_TIMEOUT)?;
+        let navigation_deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            ensure!(
+                Instant::now() < navigation_deadline,
+                "forward navigation did not reach the newest public item: {}",
+                terminal.screen()
+            );
+            let before_scroll = terminal.output.len();
+            terminal.send(b"\x1b[6~")?;
+            terminal.wait(
+                "completed forward-navigation frame",
+                navigation_deadline.saturating_duration_since(Instant::now()),
+                |terminal| Ok(terminal.completed_frame_after(before_scroll)),
+            )?;
+            if !terminal.screen().contains("↑ history") {
+                break;
+            }
+        }
+        ensure!(
+            !terminal.output.contains(&b'\x07'),
+            "completion signal preceded settlement"
+        );
+        let before_focus = terminal.output.len();
+        terminal.send(b"\x1b[O")?;
+        terminal.wait(
+            "completed unfocused held-provider frame",
+            READY_TIMEOUT,
+            |terminal| Ok(terminal.completed_frame_after(before_focus)),
+        )?;
         release.send(true)?;
         terminal
             .wait_composer_frame(&["FINAL_PUBLIC", "NEXT_DRAFT", "enter send"], READY_TIMEOUT)?;
+        ensure!(
+            terminal
+                .output
+                .iter()
+                .filter(|byte| **byte == b'\x07')
+                .count()
+                == 1,
+            "successful unfocused completion did not emit exactly one content-free bell"
+        );
         let screen = terminal.screen();
         ensure!(
             !screen.contains("draft · provisional") && !screen.contains("VISIBLE_SUMMARY"),

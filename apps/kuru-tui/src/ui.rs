@@ -26,7 +26,9 @@ use kuru_core::{
     ConfigDisplayProjection, Mode, ModelInfo, NativeTool, PermissionSelector, Relationship,
     SessionUsage, UsagePhase,
 };
-use kuru_memory::{PublicTranscriptEntry, PublicTranscriptPage, SessionLifecycleState};
+use kuru_memory::{
+    PublicTranscriptCursor, PublicTranscriptEntry, PublicTranscriptPage, SessionLifecycleState,
+};
 use kuru_runtime::{
     CancellationToken, ContextSnapshot, ControlledTurnOutput, Event, FacingProgress, Harness,
     INTERRUPTION_ROLE, INTERRUPTION_TEXT, RequestContext, ResponseOutcome, SessionSummary,
@@ -56,8 +58,11 @@ mod render;
 #[cfg(test)]
 mod runtime_tests;
 mod scene;
+mod terminal_integration;
 mod tool_cards;
+mod transcript;
 pub use render::draw;
+pub use transcript::Transcript;
 
 const ACTIVITY_DRAIN_CAP: usize = 256;
 const PREVIEW_PAINT_INTERVAL: Duration = Duration::from_millis(80);
@@ -213,7 +218,7 @@ pub struct RuntimeSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct InitialViewData {
-    pub transcript: Vec<(String, String)>,
+    pub transcript: Transcript,
     pub session: String,
     pub project: String,
     pub motion: bool,
@@ -224,8 +229,8 @@ pub struct InitialViewData {
 #[derive(Debug, Clone)]
 pub struct View {
     tool_card_cache_identity: tool_cards::CacheIdentity,
-    pub transcript: Vec<(String, String)>,
-    completion_metadata: BTreeMap<usize, String>,
+    pub transcript: Transcript,
+    completion_metadata: BTreeMap<transcript::ItemId, String>,
     compaction_notices_seen: BTreeSet<(String, String)>,
     tool_cards: Vec<tool_cards::CardView>,
     selected_tool_card: Option<String>,
@@ -295,6 +300,10 @@ pub struct View {
     operation_start: Option<u64>,
     notice_until: u64,
     completion_locked: bool,
+    completion_signal_pending: bool,
+    transcript_navigation: transcript::Navigation,
+    transcript_search: Option<transcript::Search>,
+    active_source_view: Option<String>,
 }
 
 impl View {
@@ -315,6 +324,9 @@ impl View {
             self.tool_cards_omitted = 0;
             self.tool_cards_hidden_through = 0;
             self.tool_card_epoch = self.tool_card_epoch.wrapping_add(1);
+            self.transcript_navigation.reset();
+            self.transcript_search = None;
+            self.active_source_view = None;
         }
     }
 
@@ -597,6 +609,10 @@ impl View {
             operation_start: None,
             notice_until: 0,
             completion_locked: false,
+            completion_signal_pending: false,
+            transcript_navigation: transcript::Navigation::default(),
+            transcript_search: None,
+            active_source_view: None,
         }
     }
 
@@ -670,6 +686,8 @@ impl View {
     fn clear_visible_conversation(&mut self) {
         self.transcript.clear();
         self.completion_metadata.clear();
+        self.transcript_navigation.reset();
+        self.transcript_search = None;
         self.tool_cards_hidden_through = self
             .tool_cards
             .iter()
@@ -1076,21 +1094,31 @@ impl View {
             .unwrap_or_else(|| self.actor_name(&output.speaker));
         self.speaker_id = output.speaker;
         self.speaker = speaker.clone();
-        let index = self.transcript.len();
         self.transcript.push((speaker, output.text));
-        self.completion_metadata.insert(
-            index,
-            match &outcome {
-                Some(outcome) => format!(
-                    "{} input tokens · {} output tokens · {outcome}",
-                    output.input_tokens, output.output_tokens
-                ),
-                None => format!(
-                    "{} input tokens · {} output tokens",
-                    output.input_tokens, output.output_tokens
-                ),
-            },
-        );
+        if let (Some(turn), Some(source)) = (&self.active_operation_id, &self.active_source_view) {
+            self.transcript.bind_answer(&self.session, turn, source);
+        }
+        let id = self
+            .transcript
+            .item_id(self.transcript.len().saturating_sub(1))
+            .cloned();
+        self.completion_metadata
+            .retain(|id, _| self.transcript.items.iter().any(|item| &item.id == id));
+        if let Some(id) = id {
+            self.completion_metadata.insert(
+                id,
+                match &outcome {
+                    Some(outcome) => format!(
+                        "{} input tokens · {} output tokens · {outcome}",
+                        output.input_tokens, output.output_tokens
+                    ),
+                    None => format!(
+                        "{} input tokens · {} output tokens",
+                        output.input_tokens, output.output_tokens
+                    ),
+                },
+            );
+        }
         self.show_scene = false;
         self.status =
             outcome.map_or_else(|| "Complete".into(), |value| format!("Complete · {value}"));
@@ -1102,7 +1130,25 @@ impl View {
             TerminalEvent::Key(key) if key.kind == KeyEventKind::Release => return (false, None),
             TerminalEvent::Key(key) => self.key(key),
             TerminalEvent::Paste(text) => {
-                self.paste(&text);
+                let search_owns_input = self.picker.is_none()
+                    && self.permission_prompt.is_none()
+                    && self.instruction_prompt.is_none()
+                    && self.permission_rows.is_none()
+                    && self.recall.is_none();
+                if let Some(search) = self
+                    .transcript_search
+                    .as_mut()
+                    .filter(|_| search_owns_input)
+                {
+                    if search.query.len() + text.len() <= composer::DRAFT_BYTE_LIMIT {
+                        search.query.push_str(&text);
+                        search.changed();
+                        self.transcript_navigation.epoch =
+                            self.transcript_navigation.epoch.wrapping_add(1);
+                    }
+                } else {
+                    self.paste(&text);
+                }
                 None
             }
             TerminalEvent::FocusGained => {
@@ -1111,6 +1157,24 @@ impl View {
             }
             TerminalEvent::FocusLost => {
                 self.focused = false;
+                None
+            }
+            TerminalEvent::Mouse(event)
+                if self.picker.is_none()
+                    && self.permission_prompt.is_none()
+                    && self.instruction_prompt.is_none()
+                    && self.permission_rows.is_none()
+                    && self.recall.is_none() =>
+            {
+                match event.kind {
+                    crossterm::event::MouseEventKind::ScrollUp => {
+                        self.transcript_navigation.scroll(-3)
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => {
+                        self.transcript_navigation.scroll(3)
+                    }
+                    _ => return (false, None),
+                }
                 None
             }
             TerminalEvent::Resize(_, _) => None,
@@ -1356,6 +1420,79 @@ impl View {
         if self.permission_prompt.is_none() && self.handle_recall_key(key) {
             return None;
         }
+        if self.recall.is_none()
+            && key.code == KeyCode::Char('f')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.transcript_navigation.epoch = self.transcript_navigation.epoch.wrapping_add(1);
+            let cursor = match &self.transcript_navigation.position {
+                transcript::Position::Reading(anchor) => self.transcript.cursor_for(&anchor.item),
+                transcript::Position::FollowTail => Some(None),
+            };
+            self.transcript_search = Some(transcript::Search::new(
+                self.transcript_navigation.position.clone(),
+                cursor,
+            ));
+            self.show_scene = false;
+            return None;
+        }
+        if let Some(search) = &mut self.transcript_search {
+            match key.code {
+                KeyCode::Esc => {
+                    self.transcript_navigation.position = search.saved_position.clone();
+                    let retained = match &search.saved_position {
+                        transcript::Position::Reading(anchor) => self
+                            .transcript
+                            .items
+                            .iter()
+                            .any(|item| item.id == anchor.item),
+                        transcript::Position::FollowTail => false,
+                    };
+                    if !retained {
+                        self.transcript_navigation.restore = search.saved_cursor.clone();
+                    }
+                    self.transcript_search = None;
+                    self.transcript_navigation.epoch =
+                        self.transcript_navigation.epoch.wrapping_add(1);
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if search.query.len() + character.len_utf8() <= composer::DRAFT_BYTE_LIMIT {
+                        search.query.push(character);
+                        search.changed();
+                        self.transcript_navigation.epoch =
+                            self.transcript_navigation.epoch.wrapping_add(1);
+                    }
+                }
+                KeyCode::Backspace => {
+                    search.query.pop();
+                    search.changed();
+                    self.transcript_navigation.epoch =
+                        self.transcript_navigation.epoch.wrapping_add(1);
+                }
+                KeyCode::Enter => {
+                    if let Some((item, byte)) = self
+                        .transcript
+                        .next_match(&search.query, search.last_match.as_ref())
+                    {
+                        search.last_match = Some((item.clone(), byte + search.query.len()));
+                        let row = 0;
+                        self.transcript_navigation.match_byte = Some((item.clone(), byte));
+                        self.transcript_navigation.position =
+                            transcript::Position::Reading(transcript::Anchor { item, row });
+                    } else if !search.finished {
+                        search.last_match = None;
+                        search.requested = true;
+                    } else {
+                        search.status = format!(
+                            "Complete · {} public records scanned · no further match",
+                            search.scanned
+                        );
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
         if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             self.command_completion = None;
         }
@@ -1380,8 +1517,8 @@ impl View {
                 self.open_picker(Picker::Modes);
             }
             KeyCode::Esc if self.busy => return Some("/cancel".into()),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::PageUp => self.transcript_navigation.scroll(-10),
+            KeyCode::PageDown => self.transcript_navigation.scroll(10),
             KeyCode::Enter
                 if key
                     .modifiers
@@ -1655,7 +1792,7 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
     let transcript = transcript_from_public_page(
         harness
             .memory()
-            .public_transcript_page(&harness.session.id, None, 500)
+            .public_transcript_page(&harness.session.id, None, transcript::PAGE_RECORDS)
             .await?,
     );
     Ok(InitialViewData {
@@ -1673,58 +1810,8 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
     })
 }
 
-fn transcript_from_public_page(mut page: PublicTranscriptPage) -> Vec<(String, String)> {
-    let omitted = page.total_rows.saturating_sub(page.records.len() as u64);
-    page.records.reverse();
-    let mut transcript = Vec::new();
-    for entry in page.records {
-        match entry {
-            PublicTranscriptEntry::Legacy { message, .. } => transcript.push(
-                project_transcript_message(&message.role, message.text_projection()),
-            ),
-            PublicTranscriptEntry::Turn { record } => {
-                if let Some(message) = record.user_entry {
-                    transcript.push(project_transcript_message(
-                        &message.role,
-                        message.text_projection(),
-                    ));
-                }
-                for message in record.terminal_entries {
-                    let role = if message.role == "assistant" {
-                        record.speaker_id.as_deref().unwrap_or("unknown")
-                    } else {
-                        &message.role
-                    };
-                    transcript.push(project_transcript_message(role, message.text_projection()));
-                }
-            }
-        }
-    }
-    if let Some(record) = page.pending {
-        if let Some(message) = record.user_entry {
-            transcript.push(project_transcript_message(
-                &message.role,
-                message.text_projection(),
-            ));
-        }
-        for message in record.terminal_entries {
-            let role = if message.role == "assistant" {
-                record.speaker_id.as_deref().unwrap_or("unknown")
-            } else {
-                &message.role
-            };
-            transcript.push(project_transcript_message(role, message.text_projection()));
-        }
-    }
-    if omitted > 0 {
-        transcript.push((
-            "kuru".into(),
-            format!(
-                "{omitted} earlier public turn(s) are not shown in this session view; stored history is unchanged."
-            ),
-        ));
-    }
-    transcript
+fn transcript_from_public_page(page: PublicTranscriptPage) -> Transcript {
+    Transcript::from_page(page)
 }
 
 fn project_transcript_message(role: &str, content: String) -> (String, String) {
@@ -1991,6 +2078,7 @@ fn editor_layout(input: &str, cursor: usize, width: usize) -> (Vec<Line<'static>
 /// Own terminal initialization and exact console restoration across errors.
 pub struct TerminalSession {
     restored: bool,
+    title: terminal_integration::SavedTitle,
     #[cfg(windows)]
     console: kuru_platform::windows::console::ConsoleModeGuard,
 }
@@ -1999,8 +2087,9 @@ impl TerminalSession {
     pub fn enter(output: &mut impl io::Write) -> Result<Self> {
         // The guard precedes raw mode and every escape write: even partial
         // initialization must restore the caller's original native state.
-        let guard = Self {
+        let mut guard = Self {
             restored: false,
+            title: terminal_integration::SavedTitle::default(),
             #[cfg(windows)]
             console: kuru_platform::windows::console::ConsoleModeGuard::capture()?,
         };
@@ -2011,7 +2100,12 @@ impl TerminalSession {
             output,
             EnterAlternateScreen,
             event::EnableBracketedPaste,
-            event::EnableFocusChange
+            event::EnableFocusChange,
+            event::EnableMouseCapture
+        )?;
+        guard.title.save(
+            output,
+            terminal_integration::title_stack_supported(std::env::var("TERM").ok().as_deref()),
         )?;
         Ok(guard)
     }
@@ -2021,15 +2115,18 @@ impl TerminalSession {
             return Ok(());
         }
         let raw = disable_raw_mode();
+        let title = self.title.restore(&mut io::stdout());
         let screen = execute!(
             io::stdout(),
             LeaveAlternateScreen,
             event::DisableBracketedPaste,
-            event::DisableFocusChange
+            event::DisableFocusChange,
+            event::DisableMouseCapture
         );
         #[cfg(windows)]
         let modes = self.console.restore();
         raw?;
+        title?;
         screen?;
         #[cfg(windows)]
         modes?;
@@ -2088,6 +2185,7 @@ pub(crate) async fn run_with_notice_commands_and_config(
         notice,
         registry,
         config_projection,
+        terminal_integration::Signals::new(guard.title.supported(), true),
     )
     .await;
     // Ratatui's Drop may show its cursor. Finish that while terminal output
@@ -2130,6 +2228,119 @@ enum Wake {
     Animation,
 }
 
+struct PublicRead {
+    session: String,
+    view: String,
+    epoch: u64,
+    kind: PublicReadKind,
+    page: Result<PublicTranscriptPage>,
+}
+
+async fn cancel_stale_public_read(
+    read: &mut Option<JoinHandle<PublicRead>>,
+    tag: &mut Option<(String, String, u64)>,
+    session: &str,
+    source_view: &str,
+    epoch: u64,
+) {
+    if tag.as_ref().is_some_and(|(owner, view, generation)| {
+        owner != session || view != source_view || *generation != epoch
+    }) {
+        if let Some(read) = read.take() {
+            read.abort();
+            let _ = read.await;
+        }
+        *tag = None;
+    }
+}
+fn apply_public_read(view: &mut View, source_view: &str, read: PublicRead) {
+    if read.session != view.session
+        || read.view != source_view
+        || read.epoch != view.transcript_navigation.epoch
+    {
+        return;
+    }
+    match read.page {
+        Ok(page) => match read.kind {
+            PublicReadKind::Older => {
+                if view.transcript.install_older(page) {
+                    view.transcript_navigation.scroll(-10);
+                } else {
+                    view.notify("Transcript changed; return to the latest page");
+                }
+            }
+            PublicReadKind::Newest => view.transcript.install_newest(page),
+            PublicReadKind::Restore => view.transcript.install_newest(page),
+            PublicReadKind::Newer { target, entry } => {
+                if page.next.as_ref() == Some(&target) {
+                    if view.transcript.install_newer(page, entry) {
+                        view.transcript_navigation.scroll(10);
+                    }
+                } else if let Some(cursor) = page.next {
+                    view.transcript_navigation.newer_needed = true;
+                    view.transcript_navigation.newer_scan = Some(Some(cursor));
+                } else {
+                    view.notify("Newer public page unavailable; return to the latest page");
+                }
+            }
+            PublicReadKind::Search(query) => {
+                if let Some(search) = &mut view.transcript_search
+                    && search.query == query
+                {
+                    search.scanned += page.records.len() as u64;
+                    search.cursor = page.next.clone();
+                    let projected = Transcript::from_page(page);
+                    let hit = projected.next_match(&query, None);
+                    search.finished = search.cursor.is_none();
+                    search.status = if hit.is_some() {
+                        format!("Match · {} public records scanned", search.scanned)
+                    } else if search.finished {
+                        format!(
+                            "Complete · {} public records scanned · no further match",
+                            search.scanned
+                        )
+                    } else {
+                        format!("Scanning · {} public records scanned", search.scanned)
+                    };
+                    search.requested = hit.is_none() && !search.finished;
+                    if let Some((item, byte)) = hit {
+                        search.last_match = Some((item.clone(), byte + query.len()));
+                        view.transcript.install_projection(projected);
+                        view.transcript_navigation.match_byte = Some((item.clone(), byte));
+                        view.transcript_navigation.position =
+                            transcript::Position::Reading(transcript::Anchor { item, row: 0 });
+                    }
+                }
+            }
+        },
+        Err(_) => {
+            if let Some(search) = &mut view.transcript_search {
+                search.status = "Stale or unavailable public scan · restart search".into();
+                search.requested = false;
+                search.finished = true;
+            } else {
+                view.notify(
+                    "Public transcript page stale or unavailable; return to the latest page",
+                );
+            }
+        }
+    }
+    view.completion_metadata
+        .retain(|id, _| view.transcript.items.iter().any(|item| &item.id == id));
+}
+
+#[derive(Clone)]
+enum PublicReadKind {
+    Older,
+    Newest,
+    Restore,
+    Newer {
+        target: PublicTranscriptCursor,
+        entry: Option<PublicTranscriptCursor>,
+    },
+    Search(String),
+}
+
 enum LoopWake {
     Approval(Option<ApprovalRequest>),
     Instruction(Option<InstructionReviewRequest>),
@@ -2137,6 +2348,7 @@ enum LoopWake {
     ToolCards(Result<kuru_runtime::ToolCardUpdate, broadcast::error::RecvError>),
     ToolPreview(String, kuru_connectors::ShellPreviewSnapshot),
     ToolDiff(std::result::Result<tool_cards::DiffResult, tokio::task::JoinError>),
+    PublicRead(Box<std::result::Result<PublicRead, tokio::task::JoinError>>),
     Regular(Wake),
 }
 
@@ -2445,6 +2657,8 @@ async fn apply_completion(
     if completed_generation != generation {
         return Ok(CompletionState::Stale);
     }
+    view.completion_signal_pending =
+        !view.focused && matches!(&message, Ok(DispatchOutcome::Turn(result)) if !result.reused);
 
     let activity = drain_activity(events, view, ACTIVITY_DRAIN_CAP);
     let notices = {
@@ -2652,10 +2866,15 @@ where
         None,
         commands::Registry::default(),
         None,
+        terminal_integration::Signals::default(),
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one terminal loop owns its existing runtime inputs and paired terminal signals"
+)]
 async fn run_loop_with_stream_and_notice<B, S>(
     terminal: &mut Terminal<B>,
     harness: Harness,
@@ -2664,6 +2883,7 @@ async fn run_loop_with_stream_and_notice<B, S>(
     mut notice: Option<MemoryNotice>,
     registry: commands::Registry,
     config_projection: Option<ConfigDisplayProjection>,
+    mut terminal_signals: terminal_integration::Signals,
 ) -> Result<()>
 where
     B: Backend,
@@ -2671,6 +2891,7 @@ where
     S: Stream<Item = io::Result<TerminalEvent>> + Unpin,
 {
     let initial = project_initial_view(&harness).await?;
+    let mut public_source = crate::public_transcript::Source::capture(&harness);
     let mut view = View::from_initial(initial, models).with_command_registry(registry);
     view.config_projection = config_projection;
     let permission_service = harness.permission_service();
@@ -2687,6 +2908,8 @@ where
     let diff_reader = harness.file_checkpoint_diff_reader();
     let mut diff_job: Option<JoinHandle<tool_cards::DiffResult>> = None;
     let mut diff_tag: Option<tool_cards::DiffResult> = None;
+    let mut public_read: Option<JoinHandle<PublicRead>> = None;
+    let mut public_read_tag: Option<(String, String, u64)> = None;
     let mut tool_updates = tool_feed.subscribe();
     let mut tool_cards_open = true;
     let harness = Arc::new(Mutex::new(harness));
@@ -2713,8 +2936,11 @@ where
 
     let result: Result<()> = async {
         loop {
+            cancel_stale_public_read(&mut public_read, &mut public_read_tag,
+                &view.session, &public_source.view, view.transcript_navigation.epoch).await;
             if dirty {
                 view.refresh_tool_cards(tool_feed.snapshot_for_session(&view.session));
+                view.completion_metadata.retain(|id, _| view.transcript.items.iter().any(|item| &item.id == id));
                 while !view.busy && diff_job.is_none()
                     && let Some((card, receipt)) = view.next_diff()
                 {
@@ -2737,6 +2963,40 @@ where
                     .size()
                     .map_err(|error| anyhow::anyhow!("terminal size: {error}"))?;
                 render::clamp_scroll(&mut view, size.into());
+                if public_read.is_none() {
+                    let request = if let Some(cursor) = view.transcript_navigation.restore.take() {
+                        Some((PublicReadKind::Restore, cursor))
+                    } else if let Some(search) = &mut view.transcript_search {
+                        if search.requested { search.requested = false;
+                            Some((PublicReadKind::Search(search.query.clone()), search.cursor.clone()))
+                        } else { None }
+                    } else if view.transcript_navigation.newer_needed {
+                        if let Some(target) = view.transcript.newer_target() {
+                            let entry = view.transcript_navigation.newer_scan.take().flatten();
+                            view.transcript_navigation.newer_needed = false;
+                            Some((PublicReadKind::Newer { target, entry: entry.clone() }, entry))
+                        } else { None }
+                    } else if std::mem::take(&mut view.transcript_navigation.older_needed) {
+                        view.transcript.older_cursor().map(|cursor| (PublicReadKind::Older, Some(cursor)))
+                    } else if std::mem::take(&mut view.transcript_navigation.newest_needed) {
+                        Some((PublicReadKind::Newest, None))
+                    } else { None };
+                    if let Some((kind, cursor)) = request {
+                        let source = public_source.clone();
+                        let epoch = view.transcript_navigation.epoch;
+                        public_read_tag = Some((source.session.clone(), source.view.clone(), epoch));
+                        public_read = Some(tokio::spawn(async move {
+                            let page = source.page(cursor.as_ref()).await;
+                            PublicRead { session: source.session, view: source.view, epoch, kind, page }
+                        }));
+                    }
+                }
+
+                terminal_signals.present(
+                    &mut io::stdout(),
+                    &view.session,
+                    std::mem::take(&mut view.completion_signal_pending),
+                )?;
                 terminal
                     .draw(|frame| draw(frame, &view))
                     .map_err(|error| anyhow::anyhow!("terminal draw: {error}"))?;
@@ -2757,6 +3017,7 @@ where
                 update = context.changed(), if context_open => LoopWake::Context(update),
                 update = tool_updates.recv(), if tool_cards_open => LoopWake::ToolCards(update),
                 (id, preview) = tool_cards::next_preview(&view.tool_cards) => LoopWake::ToolPreview(id, preview),
+                page = async { public_read.as_mut().expect("guarded public read").await }, if public_read.is_some() => LoopWake::PublicRead(Box::new(page)),
                 diff = async { diff_job.as_mut().expect("guarded diff read").await }, if diff_job.is_some() => LoopWake::ToolDiff(diff),
                 wake = next_wake_with_progress(
                     &scheduler,
@@ -2836,6 +3097,13 @@ where
                     diff_job = None;
                     let unavailable = diff_tag.take();
                     if let Some(result) = result.ok().or(unavailable) { view.accept_diff(result); }
+                    dirty = true;
+                    continue;
+                }
+                LoopWake::PublicRead(result) => {
+                    public_read = None;
+                    public_read_tag = None;
+                    if let Ok(read) = *result { apply_public_read(&mut view, &public_source.view, read); }
                     dirty = true;
                     continue;
                 }
@@ -2932,6 +3200,8 @@ where
                             view.begin_operation();
                             view.part_activity.clear();
                             view.routes.clear();
+                            if let Some(read) = public_read.take() { read.abort(); let _ = read.await; }
+                            public_read_tag = None;
                             view.status = "Closing session".into();
                             quit_pending = true;
                             generation = generation.wrapping_add(1);
@@ -3006,6 +3276,7 @@ where
                                 view.transcript.push(("user".into(), command.clone()));
                                 view.show_scene = false;
                                 view.scroll = 0;
+                                view.transcript_navigation.follow();
                             }
                             view.begin_operation();
                             view.status = if command.starts_with('/') && custom_prompt.is_none() {
@@ -3020,6 +3291,10 @@ where
                             let turn_id = (!command.starts_with('/') || custom_prompt.is_some())
                                 .then(|| uuid::Uuid::new_v4().to_string());
                             view.active_operation_id = turn_id.clone();
+                            view.active_source_view = turn_id.as_ref().map(|_| public_source.view.clone());
+                            if let Some(turn) = &turn_id {
+                                view.transcript.bind_user(&view.session, turn, &public_source.view);
+                            }
                             if turn_id.is_some() {
                                 view.request_context = None;
                                 view.facing_context = None;
@@ -3067,6 +3342,7 @@ where
                 Wake::Completion(Some(completion)) => {
                     scheduler.served(WakeSource::Completion);
                     if completion.0 == generation {
+                        public_source = crate::public_transcript::Source::capture(&*harness.lock().await);
                         view.accept_context(context.borrow_and_update().clone());
                         pending_approval = None;
                         approval_rx = None;
@@ -3097,6 +3373,11 @@ where
                             activity_open = activity_still_open(activity_open, activity_closed);
                             let size = terminal.size()?;
                             render::clamp_scroll(&mut view, size.into());
+                            terminal_signals.present(
+                                &mut io::stdout(),
+                                &view.session,
+                                std::mem::take(&mut view.completion_signal_pending),
+                            )?;
                             terminal.draw(|frame| draw(frame, &view))?;
                             return Ok(());
                         }
@@ -3166,6 +3447,13 @@ where
     .await;
     // Blocking checked reads retain private directory handles. Await the one
     // owned read before final shutdown can release the fixture/project root.
+    if let Some(read) = public_read.take() {
+        if let Some(token) = &cancellation {
+            token.cancel();
+        }
+        read.abort();
+        let _ = read.await;
+    }
     if let Some(job) = diff_job.take() {
         let _ = job.await;
     }
@@ -3806,17 +4094,14 @@ mod tests {
             total_rows: 4,
             next: None,
         });
-        assert_eq!(transcript.len(), 3);
+        assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0], ("user".into(), "question".into()));
         assert_eq!(transcript[1], ("stable-speaker".into(), "answer".into()));
-        assert!(
-            transcript
-                .last()
-                .unwrap()
-                .1
-                .starts_with("3 earlier public turn(s)")
-        );
-        assert!(transcript.last().unwrap().1.contains("session view"));
+        assert_eq!(transcript.omitted_records(), 3);
+        let mut view = fixture();
+        view.transcript = transcript;
+        view.show_scene = false;
+        assert!(rendered(&view).contains("3 public records outside this window"));
     }
 
     #[test]
@@ -4094,7 +4379,10 @@ mod tests {
             view.event(event.clone());
             sender.send(event.clone()).unwrap();
             present_settled_compactions(&mut receiver, &mut view, vec![event]);
-            assert_eq!(view.transcript.len(), operation as usize + 1);
+            assert_eq!(
+                view.transcript.len() as u64 + view.transcript.local_omitted,
+                u64::try_from(operation + 1).unwrap()
+            );
             assert!(view.compaction_notices_seen.is_empty());
             assert!(receiver.is_empty());
         }
@@ -4111,10 +4399,16 @@ mod tests {
         // event drain first. Keep its dedup entry until its own later settlement.
         sender.send(late.clone()).unwrap();
         present_settled_compactions(&mut receiver, &mut view, vec![]);
-        assert_eq!(view.transcript.len(), 2_049);
+        assert_eq!(
+            view.transcript.len() as u64 + view.transcript.local_omitted,
+            2_049
+        );
         assert_eq!(view.compaction_notices_seen.len(), 1);
         present_settled_compactions(&mut receiver, &mut view, vec![late]);
-        assert_eq!(view.transcript.len(), 2_049);
+        assert_eq!(
+            view.transcript.len() as u64 + view.transcript.local_omitted,
+            2_049
+        );
         assert!(view.compaction_notices_seen.is_empty());
         let lagged = Event::Compaction {
             actor: "part-c".into(),
@@ -4137,7 +4431,10 @@ mod tests {
         // Receiver lag can evict the live notice, but its accepted collector
         // entry still produces exactly one transcript message at settlement.
         present_settled_compactions(&mut receiver, &mut view, vec![lagged]);
-        assert_eq!(view.transcript.len(), 2_050);
+        assert_eq!(
+            view.transcript.len() as u64 + view.transcript.local_omitted,
+            2_050
+        );
         assert!(view.compaction_notices_seen.is_empty());
         assert!(
             view.activity
@@ -4151,6 +4448,11 @@ mod tests {
                 .1
                 .contains("original records remain stored")
         );
+        assert!(
+            view.transcript.len() < 2_048,
+            "local notices accumulated without a bounded window"
+        );
+        assert!(view.transcript.local_omitted > 0);
         let frame = rendered(&view);
         assert!(
             frame.contains("Compacted") && frame.contains("remain stored"),
@@ -4198,7 +4500,7 @@ mod tests {
         live.effort = "high".into();
         view.apply_runtime(live);
         let successful_frame = rendered(&View {
-            transcript: vec![("config".into(), format_config_inspection(&view))],
+            transcript: vec![("config".into(), format_config_inspection(&view))].into(),
             show_scene: false,
             ..view.clone()
         });
@@ -4243,7 +4545,7 @@ mod tests {
     fn fixture() -> View {
         View::from_initial(
             InitialViewData {
-                transcript: vec![],
+                transcript: vec![].into(),
                 session: "plain-session".into(),
                 project: "plain-project".into(),
                 motion: true,
@@ -4265,8 +4567,8 @@ mod tests {
             id: id.into(),
             session_id: "plain-session".into(),
             source_view: "main".into(),
-            turn_id: "turn".into(),
-            turn_key: "turn-key".into(),
+            turn_id: id.into(),
+            turn_key: transcript::turn_key("plain-session", id, "main"),
             actor_id: "part-a".into(),
             call_id: "reused-call-id".into(),
             name: "file_write".into(),
@@ -4288,14 +4590,24 @@ mod tests {
     fn tool_cards_keep_exact_bindings_and_reject_late_preview_after_settlement_or_session_change() {
         let mut view = fixture();
         view.transcript.push(("user".into(), "first".into()));
+        view.transcript
+            .bind_user("plain-session", "first-binding", "main");
         let first = card_fixture("first-binding", 1);
         view.refresh_tool_cards((vec![first.clone()], 0));
         view.transcript.push(("part-a".into(), "answer".into()));
         view.transcript.push(("user".into(), "second".into()));
+        view.transcript
+            .bind_user("plain-session", "second-binding", "main");
         let second = card_fixture("second-binding", 2);
         view.refresh_tool_cards((vec![first.clone(), second.clone()], 0));
-        assert_eq!(view.tool_cards[0].anchor, 0);
-        assert_eq!(view.tool_cards[1].anchor, 2);
+        assert_eq!(
+            view.tool_cards[0].anchor.as_ref(),
+            view.transcript.item_id(0)
+        );
+        assert_eq!(
+            view.tool_cards[1].anchor.as_ref(),
+            view.transcript.item_id(2)
+        );
         let mut settled = (*first).clone();
         settled.state = kuru_runtime::ToolCardState::Settled(kuru_runtime::ToolOutcome::Cancelled);
         settled.stdout = Some("safe prefix".into());
@@ -4416,6 +4728,7 @@ mod tests {
     fn tool_cards_transcript_cache_distinguishes_equal_epoch_views_and_clones() {
         let mut first = fixture();
         first.transcript.push(("user".into(), "same prompt".into()));
+        first.transcript.bind_user("plain-session", "first", "main");
         first.refresh_tool_cards((vec![card_fixture("first", 1)], 0));
         let mut second = first.clone();
         let mut different = (*card_fixture("second", 1)).clone();
@@ -4438,6 +4751,8 @@ mod tests {
             let mut view = fixture();
             view.transcript
                 .push(("user".into(), "edit the note".into()));
+            view.transcript
+                .bind_user("plain-session", "binding", "main");
             let mut card = (*card_fixture("binding", 1)).clone();
             card.state = kuru_runtime::ToolCardState::Settled(kuru_runtime::ToolOutcome::Ok);
             card.output = Some("done\u{1b}[31m\u{7}".into());
@@ -4694,7 +5009,10 @@ mod tests {
     fn local_clear_and_status_preserve_current_session_facts() {
         let mut view = fixture();
         view.transcript.push(("user".into(), "older turn".into()));
-        view.completion_metadata.insert(0, "known usage".into());
+        view.completion_metadata.insert(
+            view.transcript.item_id(0).unwrap().clone(),
+            "known usage".into(),
+        );
         view.scroll = 3;
         view.turns = 7;
         view.focus = Some("actor-1".into());
@@ -5612,7 +5930,7 @@ mod tests {
         assert_eq!(
             view.completion_metadata,
             BTreeMap::from([(
-                0,
+                view.transcript.item_id(0).unwrap().clone(),
                 "13 input tokens · 29 output tokens · peer-round budget reached".into()
             )])
         );
@@ -5741,9 +6059,21 @@ mod tests {
         assert!(view.input.is_empty());
         assert_eq!(view.cursor, 0);
         assert!(view.key(key(KeyCode::Enter)).is_none());
+        view.transcript
+            .push(("user".into(), "public scrollback\n".repeat(100)));
         view.key(key(KeyCode::PageUp));
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 120, 35));
+        assert!(matches!(
+            view.transcript_navigation.position,
+            transcript::Position::Reading(_)
+        ));
         assert_eq!(view.scroll, 10);
         view.key(key(KeyCode::PageDown));
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 120, 35));
+        assert!(matches!(
+            view.transcript_navigation.position,
+            transcript::Position::FollowTail
+        ));
         assert_eq!(view.scroll, 0);
         view.busy = true;
         assert_eq!(view.key(key(KeyCode::Esc)).unwrap(), "/cancel");
@@ -5881,6 +6211,205 @@ mod tests {
     }
 
     #[test]
+    fn transcript_anchor_survives_new_activity_resize_and_grapheme_wrapping() {
+        let mut view = fixture();
+        view.show_scene = false;
+        view.transcript
+            .push(("user".into(), "👨‍👩‍👧‍👦 👍🏽 e\u{301} ".repeat(100)));
+        view.transcript
+            .bind_user("plain-session", "anchor-binding", "main");
+        view.refresh_tool_cards((vec![card_fixture("anchor-binding", 1)], 0));
+        view.transcript
+            .push(("speaker".into(), "streaming tail".into()));
+        let reading = view.transcript.item_id(0).unwrap().clone();
+        view.transcript_navigation.position = transcript::Position::Reading(transcript::Anchor {
+            item: reading.clone(),
+            row: 4,
+        });
+        for width in [120, 80] {
+            view.selected_tool_card = Some("anchor-binding".into());
+            view.toggle_tool_card();
+            render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, width, 24));
+            assert!(
+                matches!(&view.transcript_navigation.position, transcript::Position::Reading(anchor) if anchor.item == reading && anchor.row == 4)
+            );
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &view)).unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                screen.contains("👨‍👩‍👧‍👦") && screen.contains("👍🏽") && screen.contains("e\u{301}"),
+                "{screen}"
+            );
+            view.transcript
+                .push(("kuru".into(), "new current notice".into()));
+        }
+        // A restored reading ID may be absent while its owned page loads.
+        // Layout of the temporary search window must not replace that ID.
+        let saved = view.transcript.clone();
+        view.transcript = vec![("user".into(), "temporary search page".into())].into();
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 80, 24));
+        assert!(matches!(&view.transcript_navigation.position,
+            transcript::Position::Reading(anchor) if anchor.item == reading && anchor.row == 4));
+        view.transcript.install_projection(saved);
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 80, 24));
+        assert!(matches!(&view.transcript_navigation.position,
+            transcript::Position::Reading(anchor) if anchor.item == reading && anchor.row == 4));
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 40, 7));
+        assert!(matches!(&view.transcript_navigation.position,
+            transcript::Position::Reading(anchor) if anchor.item == reading && anchor.row == 4));
+        view.transcript_navigation.scroll(i64::MAX);
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 40, 7));
+        assert_eq!(
+            view.transcript_navigation.position,
+            transcript::Position::FollowTail
+        );
+        view.transcript_navigation.follow();
+        view.scroll = 0;
+        render::clamp_scroll(&mut view, ratatui::layout::Rect::new(0, 0, 80, 24));
+        assert_eq!(
+            view.transcript_navigation.position,
+            transcript::Position::FollowTail
+        );
+    }
+
+    #[test]
+    fn transcript_search_keeps_literal_draft_and_recall_priority() {
+        let mut view = fixture();
+        view.input = "literal draft 猫".into();
+        view.cursor = view.input.len();
+        view.paste(&"large literal paste ".repeat(60));
+        let draft = (
+            view.input.clone(),
+            view.cursor,
+            view.paste_chips.project(&view.input, view.cursor),
+        );
+        view.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        view.key(key(KeyCode::Char('猫')));
+        view.terminal_event(TerminalEvent::Paste(" needle".into()));
+        assert_eq!(view.transcript_search.as_ref().unwrap().query, "猫 needle");
+        assert_eq!(
+            (
+                view.input.clone(),
+                view.cursor,
+                view.paste_chips.project(&view.input, view.cursor)
+            ),
+            draft
+        );
+        view.key(key(KeyCode::Esc));
+        assert!(view.transcript_search.is_none());
+        assert_eq!(
+            (
+                view.input.clone(),
+                view.cursor,
+                view.paste_chips.project(&view.input, view.cursor)
+            ),
+            draft
+        );
+        view.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        view.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(view.recall.is_some());
+        assert!(view.transcript_search.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_public_read_is_cancelled_and_awaited_on_query_session_and_clear() {
+        kuru_memory::test_support::closing(async {
+            struct Released(Option<tokio::sync::oneshot::Sender<()>>);
+            impl Drop for Released {
+                fn drop(&mut self) {
+                    if let Some(reply) = self.0.take() {
+                        let _ = reply.send(());
+                    }
+                }
+            }
+            for transition in 0..4 {
+                let mut view = fixture();
+                view.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+                let mut tag = Some((
+                    view.session.clone(),
+                    "main".into(),
+                    view.transcript_navigation.epoch,
+                ));
+                let old_tag = tag.clone().unwrap();
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let (released, mut finished) = tokio::sync::oneshot::channel();
+                let mut read = Some(tokio::spawn(async move {
+                    let _owned = Released(Some(released));
+                    let _ = started.send(());
+                    std::future::pending::<PublicRead>().await
+                }));
+                ready.await.unwrap();
+                match transition {
+                    0 => {
+                        view.key(key(KeyCode::Char('x')));
+                    }
+                    1 => view.select_session("different-session".into()),
+                    2 => view.clear_visible_conversation(),
+                    _ => {}
+                }
+                cancel_stale_public_read(
+                    &mut read,
+                    &mut tag,
+                    &view.session,
+                    "main",
+                    view.transcript_navigation.epoch,
+                )
+                .await;
+                if transition == 3 {
+                    assert!(read.is_some() && tag.is_some());
+                    cancel_stale_public_read(
+                        &mut read,
+                        &mut tag,
+                        &view.session,
+                        "candidate",
+                        view.transcript_navigation.epoch,
+                    )
+                    .await;
+                }
+                // This is ready without a later scheduler poll only because
+                // the production cancellation awaited the owned read's drop.
+                finished.try_recv().unwrap();
+                assert!(read.is_none() && tag.is_none());
+                let before = (
+                    view.transcript.epoch,
+                    view.notice.clone(),
+                    view.transcript_search
+                        .as_ref()
+                        .map(|search| search.status.clone()),
+                );
+                apply_public_read(
+                    &mut view,
+                    if transition == 3 { "candidate" } else { "main" },
+                    PublicRead {
+                        session: old_tag.0,
+                        view: old_tag.1,
+                        epoch: old_tag.2,
+                        kind: PublicReadKind::Newest,
+                        page: Err(anyhow::anyhow!("obsolete read")),
+                    },
+                );
+                assert_eq!(
+                    before,
+                    (
+                        view.transcript.epoch,
+                        view.notice.clone(),
+                        view.transcript_search
+                            .as_ref()
+                            .map(|search| search.status.clone()),
+                    )
+                );
+            }
+        })
+        .await;
+    }
+
+    #[test]
     fn stored_scroll_clamps_after_transcript_and_viewport_shrink() {
         let mut view = fixture();
         view.show_scene = false;
@@ -5919,7 +6448,7 @@ mod tests {
         let original_parts = initial_runtime.parts.clone();
         let mut view = View::from_initial(
             InitialViewData {
-                transcript: vec![("user".into(), "initial transcript".into())],
+                transcript: vec![("user".into(), "initial transcript".into())].into(),
                 session: "initial-session".into(),
                 project: "initial-project".into(),
                 motion: true,
@@ -5967,7 +6496,7 @@ mod tests {
         assert_eq!(view.input, "editor draft");
         assert_eq!(view.cursor, "editor draft".len());
         assert_eq!(
-            view.completion_metadata[&1],
+            view.completion_metadata[view.transcript.item_id(1).unwrap()],
             "3 input tokens · 5 output tokens"
         );
         assert_eq!(view.mode, "freudian");
@@ -6082,6 +6611,8 @@ mod tests {
         let mut view = fixture();
         view.input = "draft".into();
         view.cursor = view.input.len();
+        view.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        view.terminal_event(TerminalEvent::Paste("literal query".into()));
         view.permission_prompt = Some(PermissionPrompt {
             display: PermissionDisplay {
                 label: "native file write".into(),
@@ -6093,14 +6624,35 @@ mod tests {
             whole_tool: false,
             scroll: 0,
         });
-        view.paste("ignored approval paste");
+        view.terminal_event(TerminalEvent::Paste("ignored approval paste".into()));
         assert_eq!(view.input, "draft");
+        assert_eq!(
+            view.transcript_search.as_ref().unwrap().query,
+            "literal query"
+        );
         view.permission_prompt = None;
+
+        view.instruction_prompt = Some(InstructionPrompt {
+            display: "reviewed source".into(),
+            persistent_allowed: true,
+            scroll: 0,
+        });
+        view.terminal_event(TerminalEvent::Paste("ignored instruction paste".into()));
+        assert_eq!(view.input, "draft");
+        assert_eq!(
+            view.transcript_search.as_ref().unwrap().query,
+            "literal query"
+        );
+        view.instruction_prompt = None;
 
         view.open_picker(Picker::Models);
         view.query.clear();
-        view.paste("demo");
+        view.terminal_event(TerminalEvent::Paste("demo".into()));
         assert_eq!(view.input, "draft");
         assert_eq!(view.query, "demo");
+        assert_eq!(
+            view.transcript_search.as_ref().unwrap().query,
+            "literal query"
+        );
     }
 }

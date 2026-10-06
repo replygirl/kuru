@@ -83,6 +83,15 @@ portraits from that state. Rendering never accesses providers or private memory.
 Transcript layout is cached until text or width changes. No dependencies were
 added for this presentation system.
 
+Public paging validates the selected session's complete predecessor metadata
+chain once for an unchanged committed cut. A small view-local proof remembers
+only exact totals and continuation coordinates from two pages, so following
+older pages or searching sequentially reads bounded page metadata and bodies.
+Every request still checks the actual selected revision; stale or unknown
+continuations retain the full validation path. The initial proof remains linear
+in turn count. Returning toward newer evicted pages can still repeat prefix
+pages; this is not a constant-time random-access transcript.
+
 ## References and review
 
 OMP's [semantic theme colors](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/theme/schema.ts),

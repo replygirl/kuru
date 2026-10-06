@@ -21,6 +21,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
 use uuid::Uuid;
 
 mod candidate_reconciliation;
+mod public_transcript_proof;
+use public_transcript_proof::PublicTranscriptProof;
 mod state_read_cut;
 pub use candidate_reconciliation::{
     CandidateReconciliationObservation, CandidateReconciliationResult,
@@ -409,6 +411,7 @@ pub struct MemoryStore {
     pool: Arc<MemoryPool>,
     branch: String,
     logical_receipt: Option<LogicalReceipt>,
+    public_transcript_proof: Arc<StdMutex<Option<PublicTranscriptProof>>>,
 }
 
 /// Compact request identity for one server-dispatched mutation. The branch is
@@ -2239,6 +2242,7 @@ impl MemoryStore {
             pool,
             branch: "main".into(),
             logical_receipt: None,
+            public_transcript_proof: Default::default(),
         };
         if !options.read_only {
             // The recovery worker closes its server before reporting failure.
@@ -2411,6 +2415,7 @@ impl MemoryStore {
             pool,
             branch: usage_ledger::BRANCH.into(),
             logical_receipt: self.logical_receipt.clone(),
+            public_transcript_proof: Default::default(),
         }))
     }
 
@@ -3087,20 +3092,32 @@ impl MemoryStore {
             "public transcript requires an upgraded memory view"
         );
 
-        let _guard = self.shared.write.lock().await;
-        let mut transaction = self.pool.begin().await?;
-        let captured_revision: String = crate::pool::within(
-            QUERY_TIMEOUT,
-            sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')").fetch_one(&mut *transaction),
-        )
-        .await
-        .context("public transcript revision deadline exceeded")??;
-        if let Some(cursor) = cursor {
-            ensure!(
-                cursor.revision == captured_revision,
-                "public transcript continuation revision changed"
-            );
-        }
+        // Only an observed selected-view HEAD authorizes the immutable pool.
+        // The cursor never selects a commit, and cold pool/schema work must
+        // not hold the mutable writer guard.
+        let captured_revision = {
+            let _guard = self.shared.write.lock().await;
+            let captured = revision(&self.pool).await?;
+            if let Some(cursor) = cursor {
+                ensure!(
+                    cursor.revision == captured,
+                    "public transcript continuation revision changed"
+                );
+            }
+            captured
+        };
+        let pool = self.shared.server.pool(&captured_revision).await?;
+        ensure!(
+            revision(&pool).await? == captured_revision,
+            "public transcript pool did not resolve to its captured revision"
+        );
+        ensure!(
+            migrations::validate_historical(&pool).await? >= 7,
+            "public transcript requires an upgraded immutable memory view"
+        );
+        #[cfg(test)]
+        public_page_fixture::reach().await;
+        let mut transaction = pool.begin().await?;
 
         let catalog_row = crate::pool::within(
             QUERY_TIMEOUT,
@@ -3166,26 +3183,46 @@ impl MemoryStore {
             );
         }
 
+        let previous_proof = self
+            .public_transcript_proof
+            .lock()
+            .expect("public proof lock")
+            .clone()
+            .filter(|proof| {
+                proof.matches(&self.branch, session_id, &captured_revision, &page_head)
+            });
+        let reused_proof = previous_proof
+            .as_ref()
+            .filter(|proof| cursor.is_none() || proof.admits(&requested));
         let mut records = Vec::new();
         let mut budget = SessionSourceBudget::new(limit);
         let mut next = None;
-        let mut turn_count = 0_u64;
+        let mut turn_count = reused_proof.map_or(0, |proof| proof.turn_count);
         let mut found_requested_turn =
             !matches!(requested, Some(PublicTranscriptPosition::Turn { .. }));
-        let mut current = page_head.clone();
+        let mut current = if reused_proof.is_some() {
+            match &requested {
+                Some(PublicTranscriptPosition::Turn { node_id }) => Some(node_id.clone()),
+                _ => None,
+            }
+        } else {
+            page_head.clone()
+        };
         crate::pool::within(QUERY_TIMEOUT, async {
             while let Some(node_id) = current {
-                let record = load_public_turn(&mut transaction, &node_id)
+                let metadata = load_public_turn_metadata(&mut transaction, &node_id)
                     .await?
                     .context("public transcript predecessor turn does not exist")?;
                 ensure!(
-                    record.node_id == node_id
-                        && record.settlement != PublicTurnSettlement::Pending,
+                    metadata.node_id == node_id
+                        && metadata.settlement != PublicTurnSettlement::Pending,
                     "public transcript chain contains an invalid settled turn"
                 );
-                turn_count = turn_count
+                if reused_proof.is_none() {
+                    turn_count = turn_count
                     .checked_add(1)
                     .context("public transcript turn count overflowed")?;
+                }
                 let is_requested = matches!(
                     &requested,
                     Some(PublicTranscriptPosition::Turn { node_id: requested }) if requested == &node_id
@@ -3197,6 +3234,9 @@ impl MemoryStore {
                     && found_requested_turn
                     && next.is_none()
                 {
+                    let record = load_public_turn(&mut transaction, &node_id)
+                        .await?
+                        .context("public transcript returned turn does not exist")?;
                     let entry = PublicTranscriptEntry::Turn {
                         record: record.clone(),
                     };
@@ -3213,7 +3253,10 @@ impl MemoryStore {
                         });
                     }
                 }
-                current = record.predecessor_node_id;
+                current = metadata.predecessor_node_id;
+                if reused_proof.is_some() && next.is_some() {
+                    break;
+                }
             }
             Ok::<_, anyhow::Error>(())
         })
@@ -3315,6 +3358,13 @@ impl MemoryStore {
             });
         }
         validate_public_transcript_page(&page)?;
+        #[cfg(test)]
+        public_page_fixture::before_publish().await;
+        *self
+            .public_transcript_proof
+            .lock()
+            .expect("public proof lock") =
+            PublicTranscriptProof::completed(previous_proof, &page, requested, turn_count);
         Ok(page)
     }
 
@@ -4483,6 +4533,7 @@ impl MemoryStore {
             pool,
             branch,
             logical_receipt: None,
+            public_transcript_proof: Default::default(),
         };
         Ok(Candidate {
             live: self.clone(),
@@ -4924,6 +4975,53 @@ pub(crate) fn refuse_active_validation(options: &mut OpenOptions) {
         refuse_active: true,
         ..stage_worker::ValidationProbe::default()
     });
+}
+
+/// One private task-scoped reader pause after its immutable pool is proven.
+/// This is only the causal writer-progress fixture, not a runtime read API.
+#[cfg(test)]
+mod public_page_fixture {
+    use std::{
+        cell::RefCell,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    #[derive(Default)]
+    pub(super) struct Pause {
+        pub(super) reached: tokio::sync::Notify,
+        pub(super) release: tokio::sync::Notify,
+    }
+    tokio::task_local! { static PAUSE: RefCell<Option<Arc<Pause>>>; }
+    tokio::task_local! { static READS: Arc<AtomicUsize>; }
+    tokio::task_local! { static PUBLICATION: RefCell<Option<Arc<Pause>>>; }
+    pub(super) async fn publishing<F: Future>(pause: Arc<Pause>, future: F) -> F::Output {
+        PUBLICATION.scope(RefCell::new(Some(pause)), future).await
+    }
+    pub(super) async fn before_publish() {
+        let Ok(Some(pause)) = PUBLICATION.try_with(|pause| pause.borrow_mut().take()) else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+    }
+    pub(super) async fn observe<F: Future>(reads: Arc<AtomicUsize>, future: F) -> F::Output {
+        READS.scope(reads, future).await
+    }
+    pub(super) fn metadata_read() {
+        let _ = READS.try_with(|reads| reads.fetch_add(1, Ordering::Relaxed));
+    }
+    pub(super) async fn scope<F: Future>(pause: Arc<Pause>, future: F) -> F::Output {
+        PAUSE.scope(RefCell::new(Some(pause)), future).await
+    }
+    pub(super) async fn reach() {
+        let Ok(Some(pause)) = PAUSE.try_with(|pause| pause.borrow_mut().take()) else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+    }
 }
 
 /// Test-only pause between a failed open's failing mark and its engine's
@@ -6507,7 +6605,7 @@ pub(crate) fn validate_session_catalog_page(page: &SessionCatalogPage) -> Result
     Ok(())
 }
 
-pub(crate) fn validate_public_turn(record: &PublicTurnRecord) -> Result<()> {
+fn validate_public_turn_coordinates(record: &PublicTurnMetadata) -> Result<()> {
     ensure!(
         record.record_format == PUBLIC_TURN_RECORD_FORMAT,
         "public turn format is unsupported"
@@ -6518,7 +6616,7 @@ pub(crate) fn validate_public_turn(record: &PublicTurnRecord) -> Result<()> {
     let expected_node_id = match record.kind {
         PublicTurnKind::Primary => {
             ensure!(
-                record.continuation_of_node_id.is_none() && record.user_entry.is_some(),
+                record.continuation_of_node_id.is_none() && record.has_user_entry,
                 "primary public turn requires one user entry and no continuation reference"
             );
             public_turn_node_id(&record.origin_session_id, &record.turn_id)?
@@ -6534,14 +6632,14 @@ pub(crate) fn validate_public_turn(record: &PublicTurnRecord) -> Result<()> {
                 "public continuation does not reference its exact same-session primary turn"
             );
             ensure!(
-                record.user_entry.is_none(),
+                !record.has_user_entry,
                 "public continuation cannot contain another user entry"
             );
             public_turn_continuation_node_id(&record.origin_session_id, &record.turn_id)?
         }
         PublicTurnKind::LegacyContinuation => {
             ensure!(
-                record.continuation_of_node_id.is_none() && record.user_entry.is_none(),
+                record.continuation_of_node_id.is_none() && !record.has_user_entry,
                 "legacy public continuation cannot fabricate a primary reference or user entry"
             );
             public_turn_legacy_continuation_node_id(&record.origin_session_id, &record.turn_id)?
@@ -6558,6 +6656,11 @@ pub(crate) fn validate_public_turn(record: &PublicTurnRecord) -> Result<()> {
             "public turn cannot name itself as predecessor"
         );
     }
+    Ok(())
+}
+
+pub(crate) fn validate_public_turn(record: &PublicTurnRecord) -> Result<()> {
+    validate_public_turn_coordinates(&PublicTurnMetadata::from(record))?;
     if let Some(user_entry) = &record.user_entry {
         validate_public_message(user_entry)?;
         ensure!(
@@ -6757,6 +6860,90 @@ fn decode_session_catalog_row(row: &sqlx::mysql::MySqlRow) -> Result<SessionCata
     Ok(record)
 }
 
+/// Structural predecessor facts only. No public or private message body is
+/// fetched while proving unreturned nodes or exact total counts.
+struct PublicTurnMetadata {
+    node_id: String,
+    origin_session_id: String,
+    turn_id: String,
+    kind: PublicTurnKind,
+    continuation_of_node_id: Option<String>,
+    predecessor_node_id: Option<String>,
+    settlement: PublicTurnSettlement,
+    has_user_entry: bool,
+    record_format: String,
+}
+
+impl From<&PublicTurnRecord> for PublicTurnMetadata {
+    fn from(record: &PublicTurnRecord) -> Self {
+        Self {
+            node_id: record.node_id.clone(),
+            origin_session_id: record.origin_session_id.clone(),
+            turn_id: record.turn_id.clone(),
+            kind: record.kind,
+            continuation_of_node_id: record.continuation_of_node_id.clone(),
+            predecessor_node_id: record.predecessor_node_id.clone(),
+            settlement: record.settlement,
+            has_user_entry: record.user_entry.is_some(),
+            record_format: record.record_format.clone(),
+        }
+    }
+}
+
+async fn load_public_turn_metadata(
+    transaction: &mut MySqlConnection,
+    node_id: &str,
+) -> Result<Option<PublicTurnMetadata>> {
+    #[cfg(test)]
+    public_page_fixture::metadata_read();
+    validate_public_node_id("public transcript node", node_id)?;
+    let row = sqlx::query("SELECT node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry IS NOT NULL AS has_user_entry, record_format FROM session_public_turns WHERE node_id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    row.as_ref()
+        .map(|row| {
+            let kind: String = row.try_get("record_kind")?;
+            let settlement: String = row.try_get("settlement")?;
+            let record = PublicTurnMetadata {
+                node_id: row.try_get("node_id")?,
+                origin_session_id: String::from_utf8(
+                    row.try_get::<Vec<u8>, _>("origin_session_id")?,
+                )
+                .context("stored public turn origin session is not UTF-8")?,
+                turn_id: String::from_utf8(row.try_get::<Vec<u8>, _>("turn_id")?)
+                    .context("stored public turn identity is not UTF-8")?,
+                kind: decode_public_turn_kind(&kind)?,
+                continuation_of_node_id: row.try_get("continuation_of_node_id")?,
+                predecessor_node_id: row.try_get("predecessor_node_id")?,
+                settlement: decode_public_turn_settlement(&settlement)?,
+                has_user_entry: row.try_get::<i64, _>("has_user_entry")? != 0,
+                record_format: row.try_get("record_format")?,
+            };
+            validate_public_turn_coordinates(&record)?;
+            Ok(record)
+        })
+        .transpose()
+}
+
+fn decode_public_turn_kind(kind: &str) -> Result<PublicTurnKind> {
+    Ok(match kind {
+        "primary" => PublicTurnKind::Primary,
+        "continuation" => PublicTurnKind::Continuation,
+        "legacy" => PublicTurnKind::LegacyContinuation,
+        _ => bail!("stored public turn kind is unsupported"),
+    })
+}
+
+fn decode_public_turn_settlement(settlement: &str) -> Result<PublicTurnSettlement> {
+    Ok(match settlement {
+        "pending" => PublicTurnSettlement::Pending,
+        "completed" => PublicTurnSettlement::Completed,
+        "interrupted" => PublicTurnSettlement::Interrupted,
+        _ => bail!("stored public turn settlement is unsupported"),
+    })
+}
+
 async fn load_public_turn(
     transaction: &mut MySqlConnection,
     node_id: &str,
@@ -6780,20 +6967,10 @@ fn decode_public_turn_row(row: &sqlx::mysql::MySqlRow) -> Result<PublicTurnRecor
             .context("stored public turn origin session is not UTF-8")?,
         turn_id: String::from_utf8(row.try_get::<Vec<u8>, _>("turn_id")?)
             .context("stored public turn identity is not UTF-8")?,
-        kind: match record_kind.as_str() {
-            "primary" => PublicTurnKind::Primary,
-            "continuation" => PublicTurnKind::Continuation,
-            "legacy" => PublicTurnKind::LegacyContinuation,
-            _ => bail!("stored public turn kind is unsupported"),
-        },
+        kind: decode_public_turn_kind(&record_kind)?,
         continuation_of_node_id: row.try_get("continuation_of_node_id")?,
         predecessor_node_id: row.try_get("predecessor_node_id")?,
-        settlement: match settlement.as_str() {
-            "pending" => PublicTurnSettlement::Pending,
-            "completed" => PublicTurnSettlement::Completed,
-            "interrupted" => PublicTurnSettlement::Interrupted,
-            _ => bail!("stored public turn settlement is unsupported"),
-        },
+        settlement: decode_public_turn_settlement(&settlement)?,
         user_entry: user_entry
             .map(|entry| serde_json::from_str(&entry))
             .transpose()
@@ -8918,35 +9095,209 @@ mod tests {
         let mut first_cursor = None;
         let mut revision = None;
         let mut actual = Vec::new();
-        loop {
-            let page = store
-                .public_transcript_page(session_id, cursor.as_ref(), 128)
-                .await?;
-            assert_eq!(page.total_rows, 1025);
-            assert!(page.records.len() <= 128);
-            assert_eq!(
-                revision.get_or_insert_with(|| page.revision.clone()),
-                &page.revision
-            );
-            for entry in &page.records {
-                let PublicTranscriptEntry::Turn { record } = entry else {
-                    panic!("long v7 transcript returned a legacy row")
-                };
-                actual.push(record.turn_id.clone());
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        public_page_fixture::observe(reads.clone(), async {
+            loop {
+                let page = store
+                    .clone()
+                    .public_transcript_page(session_id, cursor.as_ref(), 32)
+                    .await?;
+                assert_eq!(page.total_rows, 1025);
+                assert!(page.records.len() <= 32);
+                assert_eq!(
+                    revision.get_or_insert_with(|| page.revision.clone()),
+                    &page.revision
+                );
+                for entry in &page.records {
+                    let PublicTranscriptEntry::Turn { record } = entry else {
+                        panic!("long v7 transcript returned a legacy row")
+                    };
+                    actual.push(record.turn_id.clone());
+                }
+                if first_cursor.is_none() {
+                    first_cursor = page.next.clone();
+                    assert_eq!(reads.load(Ordering::Relaxed), 1025);
+                }
+                cursor = page.next;
+                if cursor.is_none() {
+                    break;
+                }
             }
-            if first_cursor.is_none() {
-                first_cursor = page.next.clone();
-            }
-            cursor = page.next;
-            if cursor.is_none() {
-                break;
-            }
-        }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+        let metadata_reads = reads.load(Ordering::Relaxed);
         let expected = (0..1025)
             .rev()
             .map(|index| format!("turn-{index:04}"))
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+
+        // A separate attachment/view begins cold. Abort after its actual
+        // transaction/response validation, before any proof can be installed.
+        let independent = store.independent_public_reader();
+        let publication = Arc::new(public_page_fixture::Pause::default());
+        let paused_store = independent.clone();
+        let paused = publication.clone();
+        let held = tokio::spawn(async move {
+            public_page_fixture::publishing(
+                paused,
+                paused_store.public_transcript_page(session_id, None, 32),
+            )
+            .await
+        });
+        let reached = tokio::time::timeout(QUERY_TIMEOUT, publication.reached.notified()).await;
+        held.abort();
+        let ended = held.await;
+        let cancellation_proof = async {
+            reached.context("public proof publication pause not reached")?;
+            ensure!(
+                ended.is_err_and(|error| error.is_cancelled()),
+                "held public read did not cancel"
+            );
+            ensure!(
+                independent
+                    .public_transcript_proof
+                    .lock()
+                    .expect("public proof lock")
+                    .is_none(),
+                "cancelled read published proof"
+            );
+            let cold_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            public_page_fixture::observe(
+                cold_reads.clone(),
+                independent.public_transcript_page(session_id, None, 32),
+            )
+            .await?;
+            ensure!(
+                cold_reads.load(Ordering::Relaxed) == 1025,
+                "cancelled read left reusable chain proof"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = cancellation_proof {
+            store.close().await?;
+            return Err(error);
+        }
+
+        // An evicted but valid continuation retains full API semantics.
+        let forgotten_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let forgotten = public_page_fixture::observe(
+            forgotten_reads.clone(),
+            store.public_transcript_page(session_id, first_cursor.as_ref(), 32),
+        )
+        .await?;
+        assert_eq!(forgotten.total_rows, 1025);
+        assert_eq!(forgotten_reads.load(Ordering::Relaxed), 1025);
+
+        let candidate = store.begin_candidate("public proof isolation").await?;
+        assert!(
+            candidate
+                .view()
+                .public_transcript_proof
+                .lock()
+                .expect("public proof lock")
+                .is_none()
+        );
+        candidate.abandon().await?;
+
+        // The reader owns a proven immutable pool before this pause. A
+        // competing session must publish its actual checkpoint while that
+        // reader is held, not merely finish after the page has returned.
+        let other_session = "long-page-other-session";
+        store
+            .create_session_catalog(other_session, Mode::Ifs, "other reader peer")
+            .await?;
+        let captured = store.revision().await?;
+        let pause = Arc::new(public_page_fixture::Pause::default());
+        let read_store = store.clone();
+        let read_pause = pause.clone();
+        let mut reader = tokio::spawn(async move {
+            public_page_fixture::scope(
+                read_pause,
+                read_store.public_transcript_page(session_id, None, 32),
+            )
+            .await
+        });
+        let tested = async {
+            tokio::time::timeout(QUERY_TIMEOUT, pause.reached.notified())
+                .await
+                .context("public reader did not establish its immutable pool")?;
+            tokio::time::timeout(
+                QUERY_TIMEOUT,
+                store.checkpoint_session_turn(
+                    "project/transcript/long-page-other-session",
+                    other_session,
+                    &[Message::text(
+                        "user",
+                        "OTHER_SESSION_PRIVATE_TO_PUBLIC_CHAIN",
+                    )],
+                    &[],
+                    &SessionTurnCheckpoint::Admit {
+                        expected_generation: 0,
+                        turn_id: "other-turn".into(),
+                        label: None,
+                        expected_transcript_rows: None,
+                    },
+                ),
+            )
+            .await
+            .context("another session's checkpoint blocked on the held public reader")??;
+            ensure!(!reader.is_finished(), "reader returned before its release");
+            ensure!(
+                store
+                    .session_catalog_record(other_session)
+                    .await?
+                    .context("other session catalog missing")?
+                    .pending_node_id
+                    .is_some()
+            );
+            ensure!(
+                store.revision().await? != captured,
+                "other checkpoint did not commit"
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        pause.release.notify_one();
+        let read = tokio::time::timeout(QUERY_TIMEOUT, &mut reader).await;
+        if !reader.is_finished() {
+            reader.abort();
+            let _ = reader.await;
+        }
+        let proof: Result<()> = async {
+            tested?;
+            let page = read.context("held public reader did not finish after release")???;
+            assert_eq!(page.revision, captured);
+            assert_eq!(page.total_rows, 1025);
+            assert_eq!(page.records.len(), 32);
+            assert_eq!(
+                page.records
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        PublicTranscriptEntry::Turn { record } => Some(record.turn_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                expected[..32]
+            );
+            assert!(
+                !serde_json::to_string(&page)?.contains("OTHER_SESSION_PRIVATE_TO_PUBLIC_CHAIN")
+            );
+            let stale = store
+                .public_transcript_page(session_id, page.next.as_ref(), 32)
+                .await
+                .expect_err("other session write failed to invalidate the captured cursor");
+            ensure!(stale.to_string().contains("revision changed"), "{stale:#}");
+            Ok(())
+        }
+        .await;
+        if let Err(error) = proof {
+            let closed = store.close().await;
+            closed.context("close after public reader proof failure")?;
+            return Err(error);
+        }
 
         let namespace = "project/transcript/long-public-session";
         store
@@ -8977,7 +9328,7 @@ mod tests {
                 },
             )
             .await?;
-        let current = store.public_transcript_page(session_id, None, 128).await?;
+        let current = store.public_transcript_page(session_id, None, 32).await?;
         assert_eq!(current.total_rows, 1026);
         assert!(matches!(current.records.first(),
             Some(PublicTranscriptEntry::Turn { record })
@@ -8986,12 +9337,17 @@ mod tests {
             .public_transcript_page(
                 session_id,
                 Some(first_cursor.as_ref().context("long transcript cursor")?),
-                128,
+                32,
             )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("revision changed"), "{error:#}");
         store.close().await?;
+        ensure!(
+            metadata_reads <= 2 * 1025 + 33,
+            "complete 1025-turn scan made {metadata_reads} metadata reads; expected one chain proof plus page work"
+        );
+        eprintln!("1025-turn public scan: {metadata_reads} metadata reads across 33 pages");
         Ok(())
     }
 
@@ -11410,6 +11766,7 @@ mod tests {
             pool: old_pool.clone(),
             branch: branch.clone(),
             logical_receipt: None,
+            public_transcript_proof: Default::default(),
         };
         sqlx::query("CREATE TABLE historical_dirty_probe (id INT PRIMARY KEY)")
             .execute(old_pool.as_ref())
@@ -11479,6 +11836,7 @@ mod tests {
             pool: preserved.clone(),
             branch,
             logical_receipt: None,
+            public_transcript_proof: Default::default(),
         };
         assert_eq!(revision(&preserved).await?, candidate_head);
         assert_eq!(migrations::version(&preserved).await?, 1);
@@ -11822,6 +12180,7 @@ mod tests {
             pool: pool.clone(),
             branch,
             logical_receipt: None,
+            public_transcript_proof: Default::default(),
         };
         let error = history
             .history("missing", 1)

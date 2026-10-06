@@ -474,7 +474,7 @@ mod tests {
         let framework = Framework::builtin(mode);
         let mut view = View::from_initial(
             InitialViewData {
-                transcript: vec![],
+                transcript: vec![].into(),
                 session: "plain-session".into(),
                 project: "plain-project".into(),
                 motion: true,

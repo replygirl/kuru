@@ -4631,6 +4631,7 @@ mod tests {
             pool,
             branch: BRANCH.into(),
             logical_receipt: None,
+            public_transcript_proof: Default::default(),
         };
         let revisions = usage.revisions(1).await?;
         let live = state_hash(usage.pool.as_ref()).await?;

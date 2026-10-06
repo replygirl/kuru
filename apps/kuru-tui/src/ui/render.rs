@@ -10,6 +10,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{Picker, View, editor_layout, scene};
@@ -28,19 +29,41 @@ const ROSE: Color = Color::Rgb(242, 149, 173);
 const PALETTE: [Color; 6] = [MINT, BLUE, LILAC, ROSE, AMBER, LILAC];
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
+struct CardLayout {
+    card: std::sync::Arc<kuru_runtime::ToolCard>,
+    epoch: u64,
+    expanded: bool,
+}
+struct ItemLayout {
+    projection: uuid::Uuid,
+    metadata: Option<String>,
+    cards: Vec<CardLayout>,
+    footer: Option<u64>,
+    height: usize,
+}
+#[derive(Clone, Copy)]
+struct BodyResume {
+    byte: usize,
+    row: usize,
+    code: bool,
+}
+struct ActiveViewport {
+    item: super::transcript::ItemId,
+    projection: uuid::Uuid,
+    resume: BodyResume,
+}
 #[derive(Default)]
 struct TranscriptCache {
     view_identity: Option<uuid::Uuid>,
-    source: Vec<(String, String)>,
-    completion_metadata: BTreeMap<usize, String>,
     width: u16,
-    lines: Vec<Line<'static>>,
-    tool_card_epoch: u64,
+    items: BTreeMap<super::transcript::ItemId, ItemLayout>,
+    heights: Vec<usize>,
+    active: Option<ActiveViewport>,
 }
 
 thread_local! {
-    // One transcript per terminal thread, bounded by the public transcript itself.
-    // Comparing strings is cheap; only changed content or widths rebuild layout.
+    // Retain bounded per-item layout facts, never copied message bodies or
+    // the whole wrapped history. Stable IDs survive page insertion/eviction.
     static TRANSCRIPT: RefCell<TranscriptCache> = RefCell::default();
 }
 
@@ -49,20 +72,62 @@ fn style(color: Color) -> Style {
 }
 
 fn update_transcript_cache(cache: &mut TranscriptCache, view: &View, width: u16) {
-    if cache.view_identity != Some(view.tool_card_cache_identity.0)
-        || cache.width != width
-        || cache.source != view.transcript
-        || cache.completion_metadata != view.completion_metadata
-        || cache.tool_card_epoch != view.tool_card_epoch
-    {
-        cache.lines = wrap_lines(conversation_lines(view), usize::from(width.max(1)));
-        cache.source.clone_from(&view.transcript);
-        cache
-            .completion_metadata
-            .clone_from(&view.completion_metadata);
+    if cache.view_identity != Some(view.tool_card_cache_identity.0) || cache.width != width {
+        cache.items.clear();
+        cache.active = None;
         cache.width = width;
-        cache.tool_card_epoch = view.tool_card_epoch;
         cache.view_identity = Some(view.tool_card_cache_identity.0);
+    }
+    cache
+        .items
+        .retain(|id, _| view.transcript.items.iter().any(|item| &item.id == id));
+    cache.heights.clear();
+    for (index, item) in view.transcript.items.iter().enumerate() {
+        let metadata = view.completion_metadata.get(&item.id);
+        let cards = view
+            .tool_cards
+            .iter()
+            .filter(|card| card.anchor.as_ref() == Some(&item.id))
+            .collect::<Vec<_>>();
+        let footer = (index + 1 == view.transcript.len()
+            && (!view.tool_cards.is_empty() || view.tool_cards_omitted > 0))
+            .then_some(view.tool_cards_omitted);
+        let current = cache.items.get(&item.id);
+        let same = current.is_some_and(|old| {
+            old.projection == item.projection
+                && old.metadata.as_ref() == metadata
+                && old.footer == footer
+                && old.cards.len() == cards.len()
+                && old.cards.iter().zip(&cards).all(|(old, new)| {
+                    std::sync::Arc::ptr_eq(&old.card, &new.card)
+                        && old.epoch == new.layout_epoch
+                        && old.expanded == new.expanded
+                })
+        });
+        if !same {
+            let mut height = 0;
+            visit_item_rows_with_source(view, index, usize::from(width.max(1)), None, |_, _| {
+                height += 1
+            });
+            cache.items.insert(
+                item.id.clone(),
+                ItemLayout {
+                    projection: item.projection,
+                    metadata: metadata.cloned(),
+                    footer,
+                    height,
+                    cards: cards
+                        .into_iter()
+                        .map(|card| CardLayout {
+                            card: card.card.clone(),
+                            epoch: card.layout_epoch,
+                            expanded: card.expanded,
+                        })
+                        .collect(),
+                },
+            );
+        }
+        cache.heights.push(cache.items[&item.id].height);
     }
 }
 
@@ -268,12 +333,83 @@ pub(super) fn clamp_scroll(view: &mut View, size: Rect) {
         rows[1]
     };
     let content = inset(conversation, u16::from(conversation.width >= 12) * 2, 1);
-    let total_lines = TRANSCRIPT.with_borrow_mut(|cache| {
+    if let Some((item, byte)) = view.transcript_navigation.match_byte.take() {
+        let row = source_row(view, &item, byte, content.width);
+        view.transcript_navigation.position =
+            super::transcript::Position::Reading(super::transcript::Anchor { item, row });
+    }
+    TRANSCRIPT.with_borrow_mut(|cache| {
         update_transcript_cache(cache, view, content.width);
-        cache.lines.len()
+        let total = cache.heights.iter().sum::<usize>();
+        // A tiny layout may show no transcript rows. Explicit forward
+        // navigation must still be able to reach the final logical row;
+        // resizing alone continues to preserve a valid Reading anchor.
+        let maximum = total.saturating_sub(usize::from(content.height).max(1));
+        let navigation = &mut view.transcript_navigation;
+        if let super::transcript::Position::Reading(anchor) = &navigation.position
+            && !view
+                .transcript
+                .items
+                .iter()
+                .any(|item| item.id == anchor.item)
+        {
+            // An evicted saved anchor is restored by its owned page read.
+            // Drawing the current window must not replace that identity.
+            view.transcript.protected = None;
+            return;
+        }
+        let was_following = matches!(navigation.position, super::transcript::Position::FollowTail);
+        let mut offset = match &navigation.position {
+            super::transcript::Position::FollowTail => {
+                maximum.saturating_sub(usize::from(view.scroll))
+            }
+            super::transcript::Position::Reading(anchor) => {
+                let index = view
+                    .transcript
+                    .items
+                    .iter()
+                    .position(|item| item.id == anchor.item);
+                index.map_or(0, |index| {
+                    cache.heights[..index].iter().sum::<usize>()
+                        + anchor.row.min(cache.heights[index].saturating_sub(1))
+                })
+            }
+        };
+        let pending = std::mem::take(&mut navigation.pending_rows);
+        navigation.older_needed |= pending < 0
+            && pending.unsigned_abs() > offset as u64
+            && view.transcript.older_cursor().is_some();
+        offset = offset
+            .saturating_add_signed(pending.clamp(isize::MIN as i64, isize::MAX as i64) as isize)
+            .min(total.saturating_sub(1));
+        view.scroll = maximum.saturating_sub(offset).min(u16::MAX as usize) as u16;
+        if pending > 0 && offset >= maximum && view.transcript.newer_target().is_some() {
+            navigation.newer_needed = true;
+            navigation.newer_scan.get_or_insert(None);
+        }
+        if ((was_following && pending >= 0 && view.scroll == 0)
+            || (pending > 0 && offset >= maximum))
+            && view.transcript.newer_target().is_none()
+        {
+            navigation.position = super::transcript::Position::FollowTail;
+            view.transcript.protected = None;
+        } else {
+            let mut row = offset;
+            for (index, &height) in cache.heights.iter().enumerate() {
+                if row < height {
+                    let item = view.transcript.items[index].id.clone();
+                    navigation.position =
+                        super::transcript::Position::Reading(super::transcript::Anchor {
+                            item: item.clone(),
+                            row,
+                        });
+                    view.transcript.protected = Some(item);
+                    break;
+                }
+                row = row.saturating_sub(height);
+            }
+        }
     });
-    let maximum = total_lines.saturating_sub(usize::from(content.height));
-    view.scroll = view.scroll.min(maximum.min(u16::MAX as usize) as u16);
 }
 
 fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
@@ -447,20 +583,86 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let content = inset(area, u16::from(area.width >= 12) * 2, 1);
     TRANSCRIPT.with_borrow_mut(|cache| {
         update_transcript_cache(cache, view, content.width);
-        let offset = transcript_offset(
-            cache.lines.len(),
-            usize::from(content.height),
-            usize::from(view.scroll),
-        );
-        let visible = cache
-            .lines
-            .iter()
-            .skip(offset)
-            .take(usize::from(content.height))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut offset = match &view.transcript_navigation.position {
+            super::transcript::Position::FollowTail => cache
+                .heights
+                .iter()
+                .sum::<usize>()
+                .saturating_sub(usize::from(content.height))
+                .saturating_sub(usize::from(view.scroll)),
+            super::transcript::Position::Reading(anchor) => view
+                .transcript
+                .items
+                .iter()
+                .position(|item| item.id == anchor.item)
+                .map_or(0, |index| {
+                    cache.heights[..index].iter().sum::<usize>() + anchor.row
+                }),
+        };
+        let mut visible = Vec::with_capacity(usize::from(content.height));
+        let mut retained_start = false;
+        for (index, &height) in cache.heights.iter().enumerate() {
+            if offset >= height {
+                offset -= height;
+                continue;
+            }
+            let item = &view.transcript.items[index];
+            let resume = cache
+                .active
+                .as_ref()
+                .filter(|active| {
+                    active.item == item.id
+                        && active.projection == item.projection
+                        && active.resume.row <= offset
+                })
+                .map(|active| active.resume);
+            let remembered = visit_item_rows(
+                view,
+                index,
+                usize::from(content.width.max(1)),
+                offset,
+                usize::from(content.height).saturating_sub(visible.len()),
+                resume,
+                |line| visible.push(line),
+            );
+            if !retained_start {
+                cache.active = remembered.map(|resume| ActiveViewport {
+                    item: item.id.clone(),
+                    projection: item.projection,
+                    resume,
+                });
+                retained_start = true;
+            }
+            offset = 0;
+            if visible.len() >= usize::from(content.height) {
+                break;
+            }
+        }
         frame.render_widget(Paragraph::new(visible), content);
     });
+    if let Some(search) = &view.transcript_search {
+        let label = format!(
+            " Find: {} · {} · Enter next · Esc return ",
+            super::tool_cards::safe(&search.query),
+            search.status
+        );
+        frame.render_widget(
+            Paragraph::new(clipped(&label, usize::from(area.width)))
+                .style(style(AMBER).bg(SURFACE)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    } else if view.transcript.omitted_records() > 0 || view.transcript.local_omitted > 0 {
+        let label = format!(
+            " {} public records outside this window · {} local notices omitted · PgUp/PgDn · Ctrl-F find ",
+            view.transcript.omitted_records(),
+            view.transcript.local_omitted
+        );
+        frame.render_widget(
+            Paragraph::new(clipped(&label, usize::from(area.width)))
+                .style(style(MUTED).bg(SURFACE)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    }
     if view.scroll > 0 && area.width > 28 {
         frame.render_widget(
             Paragraph::new(" ↑ history · PgDn to return ").style(style(AMBER).bg(SURFACE)),
@@ -469,6 +671,7 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
     }
 }
 
+#[cfg(test)]
 fn transcript_offset(
     total_lines: usize,
     viewport_lines: usize,
@@ -478,89 +681,422 @@ fn transcript_offset(
     maximum_from_bottom - requested_from_bottom.min(maximum_from_bottom)
 }
 
-fn conversation_lines(view: &View) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::default()];
-    for (index, (speaker, body)) in view.transcript.iter().enumerate() {
-        let color = match speaker.as_str() {
-            "user" => BLUE,
-            "system" | "help" => AMBER,
-            "error" => ROSE,
-            _ => identity_color(speaker),
-        };
-        let label = if speaker == "user" { "you" } else { speaker };
-        lines.push(Line::from(vec![
-            Span::styled("● ", style(color)),
-            Span::styled(label.to_owned(), bold(color)),
-        ]));
-        let mut code = false;
-        for line in body.lines() {
-            if let Some(language) = line.trim_start().strip_prefix("```") {
-                code = !code;
-                lines.push(Line::from(Span::styled(
-                    if code {
-                        format!(
-                            "  ┌─ {}",
-                            if language.is_empty() {
-                                "code"
-                            } else {
-                                language
-                            }
-                        )
-                    } else {
-                        "  └─".into()
-                    },
-                    style(MUTED),
-                )));
-            } else if code {
-                lines.push(Line::from(vec![
-                    Span::styled("  │ ", style(EDGE)),
-                    Span::styled(line.to_owned(), style(AMBER).bg(RAISED)),
-                ]));
-            } else if let Some(quote) = line.strip_prefix("> ") {
-                let mut spans = vec![Span::styled("  ▎ ", style(LILAC))];
-                spans.extend(inline_spans(quote, MUTED));
-                lines.push(Line::from(spans));
-            } else if line.starts_with('#') && line.trim_start_matches('#').starts_with(' ') {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", line.trim_start_matches('#').trim_start()),
-                    bold(LILAC),
-                )));
-            } else {
-                let mut spans = vec![Span::raw("  ")];
-                if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-                    spans.push(Span::styled("• ", style(MINT)));
-                    spans.extend(inline_spans(item, TEXT));
-                } else {
-                    spans.extend(inline_spans(line, TEXT));
-                }
-                lines.push(Line::from(spans));
+fn visit_item_rows(
+    view: &View,
+    index: usize,
+    width: usize,
+    start: usize,
+    take: usize,
+    resume: Option<BodyResume>,
+    mut visit: impl FnMut(Line<'static>),
+) -> Option<BodyResume> {
+    let mut remembered = None;
+    let mut row = resume.map_or(0, |resume| resume.row);
+    visit_item_rows_with_source_at(
+        view,
+        index,
+        width,
+        Some((start, take)),
+        resume,
+        &mut remembered,
+        |line, _| {
+            if row >= start && row - start < take {
+                visit(line);
             }
+            row += 1;
+        },
+    );
+    remembered
+}
+
+pub(super) fn source_row(
+    view: &View,
+    id: &super::transcript::ItemId,
+    byte: usize,
+    width: u16,
+) -> usize {
+    let Some(index) = view.transcript.items.iter().position(|item| &item.id == id) else {
+        return 0;
+    };
+    let mut row = 0;
+    let mut found = None;
+    visit_item_rows_with_source(view, index, usize::from(width.max(1)), None, |_, source| {
+        if found.is_none() && source.is_some_and(|(_, end)| byte < end) {
+            found = Some(row);
         }
-        if let Some(metadata) = view.completion_metadata.get(&index) {
-            lines.push(Line::from(Span::styled(
-                format!("  {metadata}"),
-                style(MUTED),
-            )));
-        }
-        for card in view.tool_cards.iter().filter(|card| card.anchor == index) {
-            draw_card_lines(view, card, &mut lines);
-        }
-        lines.push(Line::default());
+        row += 1;
+    });
+    found.unwrap_or(0)
+}
+
+fn visit_item_rows_with_source(
+    view: &View,
+    index: usize,
+    width: usize,
+    render: Option<(usize, usize)>,
+    visit: impl FnMut(Line<'static>, Option<(usize, usize)>),
+) {
+    visit_item_rows_with_source_at(view, index, width, render, None, &mut None, visit);
+}
+
+fn visit_item_rows_with_source_at(
+    view: &View,
+    index: usize,
+    width: usize,
+    render: Option<(usize, usize)>,
+    resume: Option<BodyResume>,
+    remembered: &mut Option<BodyResume>,
+    mut visit: impl FnMut(Line<'static>, Option<(usize, usize)>),
+) {
+    let (speaker, body) = &view.transcript[index];
+    let source_line = std::cell::Cell::new(None);
+    let window = RowWindow {
+        range: render,
+        row: std::cell::Cell::new(resume.map_or(0, |resume| resume.row)),
+    };
+    let mut row_visit = |line, source| {
+        window.row.set(window.row.get() + 1);
+        visit(line, source);
+    };
+    let visit = std::cell::RefCell::new(&mut row_visit);
+    let emit = |line: Line<'_>| {
+        emit_wrapped(
+            line,
+            width,
+            body,
+            source_line.get(),
+            &window,
+            &mut **visit.borrow_mut(),
+        )
+    };
+    let color = match speaker.as_str() {
+        "user" => BLUE,
+        "system" | "help" => AMBER,
+        "error" => ROSE,
+        _ => identity_color(speaker),
+    };
+    let label = if speaker == "user" { "you" } else { speaker };
+    if resume.is_none() {
+        emit(Line::from(vec![
+            Span::styled("● ", style(color)),
+            Span::styled(label, bold(color)),
+        ]));
     }
-    if !view.tool_cards.is_empty() || view.tool_cards_omitted > 0 {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Tool cards · F6 select · F7 expand/collapse{}",
-                if view.tool_cards_omitted > 0 {
-                    format!(" · {} older details unavailable", view.tool_cards_omitted)
+    if window.done() {
+        return;
+    }
+    let mut code = resume.is_some_and(|resume| resume.code);
+    let remaining = resume
+        .and_then(|resume| body.get(resume.byte..))
+        .unwrap_or(body);
+    for line in remaining.lines() {
+        if window.done() {
+            return;
+        }
+        let start = line.as_ptr() as usize - body.as_ptr() as usize;
+        if render.is_some_and(|(start, _)| window.row.get() <= start) {
+            *remembered = Some(BodyResume {
+                byte: start,
+                row: window.row.get(),
+                code,
+            });
+        }
+        source_line.set(Some((start, start + line.len())));
+        if let Some(language) = line.trim_start().strip_prefix("```") {
+            code = !code;
+            emit(if code {
+                Line::from(vec![
+                    Span::styled("  ┌─ ", style(MUTED)),
+                    Span::styled(
+                        if language.is_empty() {
+                            "code"
+                        } else {
+                            language
+                        },
+                        style(MUTED),
+                    ),
+                ])
+            } else {
+                Line::from(Span::styled("  └─", style(MUTED)))
+            });
+        } else if code {
+            emit(Line::from(vec![
+                Span::styled("  │ ", style(EDGE)),
+                Span::styled(line, style(AMBER).bg(RAISED)),
+            ]));
+        } else if let Some(quote) = line.strip_prefix("> ") {
+            emit_inline(
+                Line::from(Span::styled("  ▎ ", style(LILAC))),
+                quote,
+                MUTED,
+                width,
+                body,
+                source_line.get(),
+                &window,
+                &mut **visit.borrow_mut(),
+            );
+        } else if line.starts_with('#') && line.trim_start_matches('#').starts_with(' ') {
+            emit(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line.trim_start_matches('#').trim_start(), bold(LILAC)),
+            ]));
+        } else {
+            let mut prefix = vec![Span::raw("  ")];
+            let text =
+                if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                    prefix.push(Span::styled("• ", style(MINT)));
+                    item
                 } else {
-                    String::new()
-                }
-            ),
+                    line
+                };
+            emit_inline(
+                Line::from(prefix),
+                text,
+                TEXT,
+                width,
+                body,
+                source_line.get(),
+                &window,
+                &mut **visit.borrow_mut(),
+            );
+        }
+    }
+    if window.done() {
+        return;
+    }
+    source_line.set(None);
+    let mut detail = Vec::new();
+    if let Some(metadata) = view
+        .transcript
+        .item_id(index)
+        .and_then(|id| view.completion_metadata.get(id))
+    {
+        detail.push(Line::from(Span::styled(
+            format!("  {metadata}"),
             style(MUTED),
         )));
     }
-    lines
+    for card in view
+        .tool_cards
+        .iter()
+        .filter(|card| card.anchor.as_ref() == view.transcript.item_id(index))
+    {
+        draw_card_lines(view, card, &mut detail);
+    }
+    for line in detail {
+        emit(line);
+    }
+    emit(Line::default());
+    if index + 1 == view.transcript.len()
+        && (!view.tool_cards.is_empty() || view.tool_cards_omitted > 0)
+    {
+        let omitted = if view.tool_cards_omitted > 0 {
+            format!(" · {} older details unavailable", view.tool_cards_omitted)
+        } else {
+            String::new()
+        };
+        emit(Line::from(Span::styled(
+            format!("Tool cards · F6 select · F7 expand/collapse{omitted}"),
+            style(MUTED),
+        )));
+    }
+}
+
+struct RowWindow {
+    range: Option<(usize, usize)>,
+    row: std::cell::Cell<usize>,
+}
+impl RowWindow {
+    fn wanted(&self) -> bool {
+        self.range
+            .is_some_and(|(start, take)| self.row.get() >= start && self.row.get() - start < take)
+    }
+    fn done(&self) -> bool {
+        self.range
+            .is_some_and(|(start, take)| self.row.get() >= start.saturating_add(take))
+    }
+}
+
+/// Borrow source spans and emit one wrapped row at a time. Only the visible
+/// rows escape this visitor; layout counting retains no message characters.
+fn emit_wrapped(
+    line: Line<'_>,
+    width: usize,
+    body: &str,
+    fallback: Option<(usize, usize)>,
+    window: &RowWindow,
+    visit: &mut impl FnMut(Line<'static>, Option<(usize, usize)>),
+) {
+    let body_start = body.as_ptr() as usize;
+    let body_end = body_start + body.len();
+    let mut characters = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let address = span.content.as_ptr() as usize;
+            let borrowed = matches!(&span.content, std::borrow::Cow::Borrowed(_))
+                && address >= body_start
+                && address + span.content.len() <= body_end;
+            span.content
+                .grapheme_indices(true)
+                .filter(|(_, grapheme)| {
+                    !grapheme.chars().any(|character| character.is_control()) || *grapheme == "\t"
+                })
+                .map(move |(byte, grapheme)| {
+                    (
+                        if grapheme == "\t" { " " } else { grapheme },
+                        line.style.patch(span.style),
+                        borrowed.then(|| {
+                            (
+                                address - body_start + byte,
+                                address - body_start + byte + grapheme.len(),
+                            )
+                        }),
+                    )
+                })
+        })
+        .peekable();
+    emit_units(&mut characters, width, fallback, window, visit);
+}
+
+fn emit_units<'a>(
+    characters: &mut impl Iterator<Item = (&'a str, Style, Option<(usize, usize)>)>,
+    width: usize,
+    fallback: Option<(usize, usize)>,
+    window: &RowWindow,
+    visit: &mut impl FnMut(Line<'static>, Option<(usize, usize)>),
+) {
+    let mut characters = characters.peekable();
+    let mut pending = std::collections::VecDeque::new();
+    let width = width.max(1);
+    let mut emitted = false;
+    loop {
+        if window.done() {
+            return;
+        }
+        let mut cells = Vec::new();
+        let mut used = 0usize;
+        while let Some((character, selected, source)) =
+            pending.pop_front().or_else(|| characters.next())
+        {
+            let count = character.width();
+            if used + count > width && !cells.is_empty() {
+                pending.push_front((character, selected, source));
+                break;
+            }
+            used += count;
+            cells.push((character, selected, source));
+        }
+        if cells.is_empty() {
+            if !emitted {
+                visit(Line::default(), fallback);
+            }
+            break;
+        }
+        if (!pending.is_empty() || characters.peek().is_some())
+            && let Some(boundary) = cells
+                .iter()
+                .rposition(|(character, _, _)| character.chars().all(char::is_whitespace))
+            && boundary + 1 > 2
+            && boundary + 1 < cells.len()
+        {
+            for cell in cells.drain(boundary + 1..).rev() {
+                pending.push_front(cell);
+            }
+        }
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut range = None;
+        for (character, selected, source) in cells {
+            if let Some((start, end)) = source {
+                range = Some(range.map_or((start, end), |(first, _)| (first, end)));
+            }
+            if window.wanted() {
+                if let Some(span) = spans.last_mut().filter(|span| span.style == selected) {
+                    span.content.to_mut().push_str(character);
+                } else {
+                    spans.push(Span::styled(character.to_owned(), selected));
+                }
+            }
+        }
+        visit(Line::from(spans), range.or(fallback));
+        emitted = true;
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private logical-row formatter carries only source/layout facts and the row visitor"
+)]
+fn emit_inline(
+    prefix: Line<'_>,
+    text: &str,
+    color: Color,
+    width: usize,
+    body: &str,
+    fallback: Option<(usize, usize)>,
+    window: &RowWindow,
+    visit: &mut impl FnMut(Line<'static>, Option<(usize, usize)>),
+) {
+    let mut remaining = text;
+    let mut pending = None;
+    let pieces = std::iter::from_fn(move || {
+        if let Some(piece) = pending.take() {
+            return Some(piece);
+        }
+        if remaining.is_empty() {
+            return None;
+        }
+        let marker = remaining
+            .find('`')
+            .map(|index| (index, "`", style(AMBER).bg(RAISED)))
+            .into_iter()
+            .chain(remaining.find("**").map(|index| (index, "**", bold(color))))
+            .min_by_key(|(index, _, _)| *index);
+        if let Some((start, delimiter, selected)) = marker {
+            let after = &remaining[start + delimiter.len()..];
+            if let Some(end) = after.find(delimiter) {
+                let before = &remaining[..start];
+                let selected_text = &after[..end];
+                remaining = &after[end + delimiter.len()..];
+                if before.is_empty() {
+                    return Some((selected_text, selected));
+                }
+                pending = Some((selected_text, selected));
+                return Some((before, style(color)));
+            }
+        }
+        let result = Some((remaining, style(color)));
+        remaining = "";
+        result
+    });
+    let start = body.as_ptr() as usize;
+    let prefix_units = prefix.spans.iter().flat_map(|span| {
+        span.content
+            .graphemes(true)
+            .map(move |grapheme| (grapheme, span.style, None))
+    });
+    let body_units = pieces.flat_map(|(piece, selected)| {
+        piece
+            .grapheme_indices(true)
+            .filter(|(_, grapheme)| !grapheme.chars().any(char::is_control) || *grapheme == "\t")
+            .map(move |(byte, grapheme)| {
+                (
+                    if grapheme == "\t" { " " } else { grapheme },
+                    selected,
+                    Some((
+                        piece.as_ptr() as usize - start + byte,
+                        piece.as_ptr() as usize - start + byte + grapheme.len(),
+                    )),
+                )
+            })
+    });
+    emit_units(
+        &mut prefix_units.chain(body_units),
+        width,
+        fallback,
+        window,
+        visit,
+    );
 }
 
 fn card_detail(lines: &mut Vec<Line<'static>>, text: &str, limit: usize, color: Color) {
@@ -673,6 +1209,7 @@ fn draw_card_lines(
     }
 }
 
+#[cfg(test)]
 fn inline_spans(text: &str, color: Color) -> Vec<Span<'static>> {
     let mut spans = vec![];
     let mut remaining = text;
