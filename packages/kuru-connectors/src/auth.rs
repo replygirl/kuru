@@ -131,6 +131,33 @@ impl AuthManager {
         })
     }
 
+    /// Seed an isolated synthetic subscription session for fresh-process tests.
+    #[cfg(feature = "test-support")]
+    pub async fn seed_test_subscription_session(
+        data_dir: PathBuf,
+        tool_root: PathBuf,
+    ) -> Result<()> {
+        let manager = Self::new(data_dir, tool_root, None)?;
+        let expires_at = now()? + 3600;
+        let session = store::Session {
+            access_token: "synthetic-canary-access-token".into(),
+            refresh_token: "synthetic-canary-refresh-token".into(),
+            id_token: "synthetic-canary-id-token".into(),
+            account_id: "synthetic-canary-account".into(),
+            expires_at,
+            session_id: "synthetic-canary-session".into(),
+            generation: 1,
+            refresh_pending: false,
+        };
+        let lease = manager
+            .inner
+            .store
+            .lease(true, manager.inner.http_timeout)
+            .await?
+            .expect("test credential directory was created");
+        lease.write(&store::Record::new(Some(session))?)
+    }
+
     pub async fn status(&self) -> Result<AuthStatus> {
         let record = self.inner.store.read()?;
         Ok(self.status_from(record.as_ref().and_then(|record| record.session.as_ref())))

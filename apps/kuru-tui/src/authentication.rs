@@ -8,7 +8,7 @@ use crate::cli::Command;
 #[cfg(unix)]
 use anyhow::ensure;
 use anyhow::{Context, Result, bail};
-use kuru_connectors::{AuthManager, AuthStatus};
+use kuru_connectors::{AuthManager, AuthStatus, CanaryReport, subscription_canary};
 
 pub(crate) async fn run(
     command: &Command,
@@ -56,6 +56,34 @@ pub(crate) async fn run(
         _ => unreachable!("only authentication commands are routed here"),
     }
     Ok(())
+}
+
+pub(crate) async fn canary(model: &str, data: &Path, cwd: &Path) -> CanaryReport {
+    #[cfg(feature = "test-support")]
+    if let Some(endpoint) = std::env::var_os("KURU_TEST_CHATGPT_BASE") {
+        let Some(endpoint) = endpoint.to_str() else {
+            return CanaryReport {
+                schema_version: 1,
+                state: kuru_connectors::CanaryState::Unverified,
+                reason: Some("test_endpoint_rejected"),
+                incompatibility: None,
+                action: Some("Use a numeric loopback endpoint in the test fixture."),
+                observed: Vec::new(),
+                unobserved: vec![
+                    kuru_connectors::CanaryStage::Credentials,
+                    kuru_connectors::CanaryStage::Catalog,
+                    kuru_connectors::CanaryStage::Completion,
+                    kuru_connectors::CanaryStage::Usage,
+                    kuru_connectors::CanaryStage::Refresh,
+                    kuru_connectors::CanaryStage::ToolCall,
+                    kuru_connectors::CanaryStage::Reasoning,
+                ],
+            };
+        };
+        return kuru_connectors::subscription_canary_test_endpoint(data, cwd, model, endpoint)
+            .await;
+    }
+    subscription_canary(data, cwd, model).await
 }
 
 async fn finish(login: impl Future<Output = Result<AuthStatus>>) -> Result<AuthStatus> {

@@ -18,7 +18,12 @@ the Codex CLI/app-server or switch billing routes after authentication failure.
 An automatic-ancestor Responses route MUST receive matching workspace approval
 before Kuru reads its named environment variable or contacts its API base;
 fixed ChatGPT login and logout MUST NOT read an unrelated workspace-selected
-API-key environment variable.
+API-key environment variable. The connector MUST report incompatibility only
+for complete bounded responses that positively contradict a required contract
+semantic; ordinary authentication, transport, incomplete-stream, optional-field,
+and model-output validation failures MUST retain their existing behavior. A
+positively incompatible completed tool response MUST stop before ambiguous tool
+dispatch and MUST NOT cause provider redispatch or billing-route fallback.
 
 #### Scenario: Future effort setting
 - **WHEN** the provider advertises an unfamiliar effort value
@@ -38,9 +43,11 @@ API-key environment variable.
 
 #### Scenario: Pending workspace API route
 - **WHEN** an unapproved automatic ancestor selects a Responses credential route
-- **THEN** login and logout still use their fixed ChatGPT route, while an
-  active Responses status check requires approval; none reads the selected
-  API-key environment value before its applicable preflight permits it.
+- **THEN** login and logout still use their fixed ChatGPT route, while an active Responses status check requires approval; none reads the selected API-key environment value before its applicable preflight permits it.
+
+#### Scenario: Completed incompatible tool response
+- **WHEN** a complete native response positively contradicts required tool identity or terminal reconciliation semantics
+- **THEN** the connector returns a fixed bounded reason before ToolHost and does not retry or switch authentication routes.
 
 ### Requirement: Provider-neutral inference boundary
 

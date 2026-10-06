@@ -157,6 +157,110 @@ async fn subscription(peer: &Peer) -> (ResponsesProvider, AuthManager, tempfile:
 }
 
 #[tokio::test]
+async fn explicit_subscription_canary_reports_only_observed_stages() {
+    let peer = Peer::new(vec![
+        Reply::json(json!({"models":[{"slug":"gpt-5.6-sol"}]})),
+        stream(vec![json!({"type":"response.completed","response":{
+            "id":"canary-completion",
+            "usage":{"input_tokens":7,"output_tokens":1},
+            "output":[{"type":"message","id":"message-1","content":[{"type":"output_text","text":"OK"}]}]
+        }})]),
+    ])
+    .await;
+    let (_provider, manager, _directory) = subscription(&peer).await;
+    let report = super::canary::with_manager(manager, "gpt-5.6-sol", Some(&peer.url)).await;
+    assert_eq!(report.schema_version, 1);
+    assert_eq!(report.state, crate::CanaryState::Verified);
+    assert_eq!(
+        report.observed,
+        [
+            crate::CanaryStage::Credentials,
+            crate::CanaryStage::Catalog,
+            crate::CanaryStage::Completion,
+            crate::CanaryStage::Usage,
+        ]
+    );
+    assert_eq!(
+        report.unobserved,
+        [
+            crate::CanaryStage::Refresh,
+            crate::CanaryStage::ToolCall,
+            crate::CanaryStage::Reasoning,
+        ]
+    );
+    let requests = peer.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].headers["authorization"],
+        "Bearer subscription-access"
+    );
+    assert_eq!(requests[1].body["tools"], json!([]));
+}
+
+#[tokio::test]
+async fn canary_protocol_contradiction_is_typed_and_never_falls_back() {
+    let peer = Peer::new(vec![Reply::json(json!({"catalog":[]}))]).await;
+    let (_provider, manager, _directory) = subscription(&peer).await;
+    let report = super::canary::with_manager(manager, "gpt-5.6-sol", Some(&peer.url)).await;
+    assert_eq!(report.state, crate::CanaryState::Incompatible);
+    assert_eq!(
+        report.incompatibility,
+        Some(crate::CompatibilityCode::MissingCatalogField)
+    );
+    assert_eq!(peer.requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn canary_terminal_tool_identity_contradiction_stops_without_redispatch() {
+    let peer = Peer::new(vec![
+        Reply::json(json!({"models":[{"slug":"gpt-5.6-luna"}]})),
+        stream(vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "id":"fc_1","type":"function_call","name":"file_read","call_id":"call_1","arguments":""
+            }}),
+            json!({"type":"response.completed","response":{
+                "id":"canary-contradiction",
+                "output":[{"id":"fc_1","type":"function_call","name":"shell","call_id":"call_1","arguments":"{}"}]
+            }}),
+        ]),
+    ])
+    .await;
+    let (_provider, manager, _directory) = subscription(&peer).await;
+    let report = super::canary::with_manager(manager, "gpt-5.6-luna", Some(&peer.url)).await;
+    assert_eq!(report.state, crate::CanaryState::Incompatible);
+    assert_eq!(
+        report.incompatibility,
+        Some(crate::CompatibilityCode::TerminalIdentityContradiction)
+    );
+    let requests = peer.requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "catalog plus exactly one completion request"
+    );
+    assert_eq!(requests[1].body["tools"], json!([]));
+}
+
+#[tokio::test]
+async fn canary_model_tool_call_is_unverified_not_protocol_drift_and_is_not_dispatched() {
+    let peer = Peer::new(vec![
+        Reply::json(json!({"models":[{"slug":"gpt-5.6-sol"}]})),
+        stream(vec![json!({"type":"response.completed","response":{
+            "id":"canary-tool-call",
+            "output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"file_read","arguments":json!({"path":"README.md"}).to_string()}]
+        }})]),
+    ])
+    .await;
+    let (_provider, manager, _directory) = subscription(&peer).await;
+    let report = super::canary::with_manager(manager, "gpt-5.6-sol", Some(&peer.url)).await;
+    assert_eq!(report.state, crate::CanaryState::Unverified);
+    assert_eq!(report.reason, Some("unexpected_tool_call"));
+    assert_eq!(report.incompatibility, None);
+    assert!(report.observed.contains(&crate::CanaryStage::ToolCall));
+    assert_eq!(peer.requests.lock().await.len(), 2);
+}
+
+#[tokio::test]
 async fn settled_reasoning_sidecar_follows_only_a_successful_terminal_response() {
     let peer = Peer::new(vec![stream(vec![
         json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-1","output_index":4,"summary_index":0,"delta":"checked"}),
@@ -1009,6 +1113,7 @@ async fn malformed_incomplete_and_oversized_subscription_responses_are_errors() 
         "event stream",
     ] {
         let error = provider.complete(request()).await.unwrap_err();
+        assert!(crate::incompatibility(&error).is_none());
         assert!(
             format!("{error:#}").contains(expected),
             "expected {expected}: {error:#}"

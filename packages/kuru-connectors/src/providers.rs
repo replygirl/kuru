@@ -21,15 +21,21 @@ use tokio::sync::Mutex;
 
 use crate::{
     auth::{AuthManager, AuthRoute, RequestCredentials},
+    compatibility::{CompatibilityCode, ConnectorIncompatibility},
     http,
     retry::{self, OperationBudget, RetryDecision},
 };
 
+mod canary;
 mod diagnostics;
 pub(crate) use diagnostics::TransportKind;
 mod sse;
 #[cfg(test)]
 mod subscription_tests;
+
+#[cfg(feature = "test-support")]
+pub use canary::subscription_canary_test_endpoint;
+pub use canary::{CanaryReport, CanaryStage, CanaryState, subscription_canary};
 
 const SUBSCRIPTION_BASE: &str = "https://chatgpt.com/backend-api/codex";
 /// Total budget of one completion operation, across retries, rotation and the
@@ -996,9 +1002,13 @@ fn input_items(
 
 fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Completion> {
     diagnostics::envelope(value, operation)?;
-    let output = value["output"]
-        .as_array()
-        .context("Responses response lacks output array")?;
+    let output = value["output"].as_array().ok_or_else(|| {
+        diagnostics::semantic_contradiction(
+            operation,
+            CompatibilityCode::MissingCompletionField,
+            "Responses response lacks output array",
+        )
+    })?;
     let mut blocks = Vec::new();
     let mut ids = BTreeSet::new();
     for item in output {
@@ -1017,11 +1027,21 @@ fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Comple
                 }
             }
             Some("function_call") => {
-                let id = item["call_id"]
-                    .as_str()
-                    .context("function call lacks call_id")?;
+                let id = item["call_id"].as_str().ok_or_else(|| {
+                    diagnostics::semantic_contradiction(
+                        operation,
+                        CompatibilityCode::TerminalIdentityContradiction,
+                        "function call lacks call_id",
+                    )
+                })?;
                 ensure!(ids.insert(id), "duplicate function call ID");
-                let name = item["name"].as_str().context("function call lacks name")?;
+                let name = item["name"].as_str().ok_or_else(|| {
+                    diagnostics::semantic_contradiction(
+                        operation,
+                        CompatibilityCode::TerminalIdentityContradiction,
+                        "function call lacks name",
+                    )
+                })?;
                 let arguments = serde_json::from_str(
                     item["arguments"]
                         .as_str()
@@ -1129,10 +1149,18 @@ impl Provider for ResponsesProvider {
 fn subscription_models(value: &Value) -> Result<Vec<ModelInfo>> {
     value["models"]
         .as_array()
-        .context("ChatGPT models response lacks models array")?
+        .ok_or_else(|| {
+            anyhow::Error::new(ConnectorIncompatibility::new(
+                CompatibilityCode::MissingCatalogField,
+            ))
+        })?
         .iter()
         .map(|model| {
-            let id = model["slug"].as_str().context("ChatGPT model lacks slug")?;
+            let id = model["slug"].as_str().ok_or_else(|| {
+                anyhow::Error::new(ConnectorIncompatibility::new(
+                    CompatibilityCode::MissingCatalogField,
+                ))
+            })?;
             ensure!(!id.is_empty(), "ChatGPT model has empty slug");
             let efforts = match model.get("supported_reasoning_levels") {
                 None | Some(Value::Null) => vec![],
@@ -1280,7 +1308,45 @@ struct SettledCompletion {
 mod tests {
     use super::*;
     use crate::test_support::{HttpFixture, Reply, request};
+    use crate::{CompatibilityCode, incompatibility};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn complete_native_catalog_and_response_omissions_are_typed_only_on_subscription() {
+        let missing_models = subscription_models(&json!({})).unwrap_err();
+        assert_eq!(
+            incompatibility(&missing_models).map(|error| error.code()),
+            Some(CompatibilityCode::MissingCatalogField)
+        );
+        let missing_slug =
+            subscription_models(&json!({"models":[{"display_name":"model"}]})).unwrap_err();
+        assert_eq!(
+            incompatibility(&missing_slug).map(|error| error.code()),
+            Some(CompatibilityCode::MissingCatalogField)
+        );
+        let compatible = subscription_models(&json!({
+            "models":[{"slug":"future-model","supported_reasoning_levels":[{"effort":"future-effort"}],"future_metadata":{"ok":true}}]
+        }))
+        .unwrap();
+        assert_eq!(compatible[0].id, "future-model");
+        assert_eq!(compatible[0].efforts, ["future-effort"]);
+
+        let chatgpt = completion(
+            &json!({"status":"completed"}),
+            diagnostics::Operation::ChatgptCompletion,
+        )
+        .unwrap_err();
+        assert_eq!(
+            incompatibility(&chatgpt).map(|error| error.code()),
+            Some(CompatibilityCode::MissingCompletionField)
+        );
+        let responses = completion(
+            &json!({"status":"completed"}),
+            diagnostics::Operation::ResponsesCompletion,
+        )
+        .unwrap_err();
+        assert!(incompatibility(&responses).is_none());
+    }
 
     struct EstimateOnlyProvider {
         dispatches: AtomicUsize,

@@ -27,7 +27,8 @@ async fn windows_dispatch() -> anyhow::Result<()> {
 
 fn finish_dispatch(result: anyhow::Result<()>) -> anyhow::Result<()> {
     if let Err(error) = &result
-        && let Some(code) = kuru::cli::headless_exit_code(error)
+        && let Some(code) =
+            kuru::cli::headless_exit_code(error).or_else(|| kuru::cli::canary_exit_code(error))
     {
         // All authority cleanup completed before the CLI returned this typed
         // status. Only a stdout/stdin-only OS thread may remain kernel-blocked.

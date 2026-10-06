@@ -126,6 +126,12 @@ pub enum Command {
     Logout,
     /// Show authentication status without displaying tokens.
     Auth,
+    /// Check the fixed ChatGPT subscription route without opening workspace tools or memory.
+    Canary {
+        /// Model to use for the bounded no-tool request.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Discover provider models and supported reasoning efforts.
     Models,
     /// Print merged effective configuration.
@@ -470,6 +476,23 @@ pub enum FileCommand {
 pub enum ExportFormat {
     Json,
     Markdown,
+}
+
+#[derive(Debug)]
+pub struct CanaryExitCode(pub u8);
+
+impl std::fmt::Display for CanaryExitCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "canary reported exit status {}", self.0)
+    }
+}
+
+impl std::error::Error for CanaryExitCode {}
+
+pub fn canary_exit_code(error: &anyhow::Error) -> Option<i32> {
+    error
+        .downcast_ref::<CanaryExitCode>()
+        .map(|exit| i32::from(exit.0))
 }
 
 #[derive(Debug, Subcommand)]
@@ -888,6 +911,23 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
             &cwd,
         )
         .await;
+    }
+
+    if let Some(Command::Canary { model }) = &cli.command {
+        let model = model
+            .as_deref()
+            .context("kuru canary requires --model MODEL")?;
+        let report = crate::authentication::canary(model, &data, &cwd).await;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        let exit = match report.state {
+            kuru_connectors::CanaryState::Verified => 0,
+            kuru_connectors::CanaryState::Incompatible => 3,
+            kuru_connectors::CanaryState::Unverified => 2,
+        };
+        if exit != 0 {
+            return Err(CanaryExitCode(exit).into());
+        }
+        return Ok(());
     }
 
     // Revocation must remain possible when current configuration is malformed.
@@ -1879,6 +1919,7 @@ fn command_claim_categories(
             | Command::Man
             | Command::Login { .. }
             | Command::Logout
+            | Command::Canary { .. }
             | Command::Config
             | Command::Update { .. }
             | Command::Trust { .. },

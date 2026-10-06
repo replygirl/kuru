@@ -89,6 +89,7 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru login --no-browser`                                      | Print the browser sign-in URL for you to open                                                       |
 | `kuru login --device`                                          | Use device authorization                                                                            |
 | `kuru auth`                                                    | Print redacted local authentication status as JSON                                                  |
+| `kuru canary --model MODEL_ID`                                 | Optionally check the fixed ChatGPT route with one bounded no-tool request                           |
 | `kuru logout`                                                  | Clear Kuru's stored ChatGPT credentials                                                             |
 | `kuru models`                                                  | Discover provider models and advertised efforts                                                     |
 | `kuru config`                                                  | Print captured base configuration with secret values redacted and saved preferences omitted         |
