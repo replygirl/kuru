@@ -1533,11 +1533,28 @@ impl Launcher for SystemLauncher {
             spec.stdout = Stdio::Pipe;
             spec.stderr = inherited_stdio(StandardStream::Error)?;
             let mut child = spec.spawn().await?;
+            // Recording must not short-circuit the owned Job/EOF supervision
+            // after spawn. Preserve its error until the same child settles.
+            let recorded = (|| -> Result<()> {
+                append_ledger_line(
+                    ledger,
+                    serde_json::to_vec(&spawns::SpawnRecord::new(
+                        child.id(),
+                        "test-run",
+                        &executable.to_string_lossy(),
+                        &partition::artifact_key(artifact),
+                        unix_now()?,
+                    ))?,
+                )
+            })();
+            if let Err(error) = &recorded {
+                eprintln!("coverage diagnostics: record actual selection failed: {error:#}");
+            }
             let output = child
                 .take_stdout()
                 .context("Cargo test process has no stdout pipe")?;
             let mut child = Native(child);
-            supervise(
+            let supervision = supervise(
                 &mut child,
                 output,
                 tokio::io::stdout(),
@@ -1545,7 +1562,9 @@ impl Launcher for SystemLauncher {
                 *remaining,
                 RUNNER_CLEANUP_TIMEOUT,
             )
-            .await?
+            .await?;
+            recorded.context("record actual selection after owned supervision")?;
+            supervision
         };
         #[cfg(unix)]
         let supervision = {
@@ -4824,7 +4843,9 @@ mod tests {
 
     /// No-op probes that the live libtest test lists and selects exactly.
     #[test]
-    fn libtest_probe_alpha() {}
+    fn libtest_probe_alpha() {
+        println!("coverage probe PID={}", std::process::id());
+    }
 
     #[test]
     fn libtest_probe_beta() {}
@@ -4884,7 +4905,7 @@ mod tests {
         for probe in PROBES {
             assert!(listed.binary_search(&probe.to_owned()).is_ok(), "{probe}");
         }
-        let mut args = vec!["--exact".to_owned()];
+        let mut args = vec!["--exact".to_owned(), "--nocapture".to_owned()];
         args.extend(PROBES.map(str::to_owned));
         let supervision = run_self(&args, temp.path().join("exact.log")).await;
         let Supervision::Exited(status, announced) = supervision else {
@@ -4892,6 +4913,48 @@ mod tests {
         };
         assert!(status.success(), "{status:?}");
         assert_eq!(announced, Some(2));
+        #[cfg(windows)]
+        {
+            let rows = plan::read_spawns(&temp.path().join("exact.ledger.jsonl")).unwrap();
+            let [row] = rows.as_slice() else {
+                panic!("expected one actual selection spawn: {rows:?}");
+            };
+            assert_eq!(row.role, "test-run");
+            assert_eq!(row.parent, std::process::id());
+            assert_ne!(row.pid, std::process::id());
+            assert_eq!(Path::new(&row.executable), executable);
+            let output = fs::read_to_string(temp.path().join("exact.log")).unwrap();
+            assert!(
+                output.contains(&format!("coverage probe PID={}", row.pid)),
+                "{output}"
+            );
+
+            // A recording failure after spawn still waits this exact selection
+            // through its completed output and native Job supervision.
+            let artifact = fixture::artifact("kuru-delivery", "lib", "kuru_delivery");
+            let failed_log = temp.path().join("recording-error.log");
+            let error = SystemLauncher
+                .run(&Launch {
+                    executable: &executable,
+                    artifact: &artifact,
+                    args: &args,
+                    log: failed_log.clone(),
+                    remaining: Duration::from_secs(120),
+                    ledger: temp.path(), // A directory cannot be a ledger.
+                })
+                .await
+                .err()
+                .expect("recording a ledger directory must fail after supervision");
+            assert!(
+                error.to_string().contains("after owned supervision"),
+                "{error:#}"
+            );
+            let completed = fs::read_to_string(failed_log).unwrap();
+            assert!(
+                completed.contains("test result: ok. 2 passed"),
+                "{completed}"
+            );
+        }
 
         // A selection sized to the command-line budget still starts: absent
         // names are ordinary filters that select nothing. Short names put the

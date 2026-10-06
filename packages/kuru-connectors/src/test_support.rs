@@ -371,17 +371,21 @@ fn fixture_binary(cache: &FixtureCache) -> Arc<CompiledPeer> {
         return binary;
     }
     let directory = tempfile::tempdir().unwrap();
-    #[cfg(windows)]
-    let path = snapshot_peer(&cargo_peer(), directory.path())
-        .expect("snapshot the Cargo-built native connector test peer");
-    #[cfg(unix)]
     let path = {
         let source = directory.path().join("stdio_peer.rs");
-        let path = directory.path().join("stdio_peer");
+        let path = directory.path().join(if cfg!(windows) {
+            "compiled_peer.exe"
+        } else {
+            "stdio_peer"
+        });
         std::fs::write(&source, include_str!("../tests/fixtures/stdio_peer.rs")).unwrap();
         // Only the compiler opens executable bytes for writing. Wait for it to exit
         // before publishing paths: the multithreaded test process never holds a
         // writable executable descriptor that another fork could inherit (ETXTBSY).
+        // This fake peer is deliberately force-terminated by protocol-failure
+        // tests. It must not begin an exit-time profile write that cleanup cuts
+        // short. Real application children retain their normal instrumentation.
+        #[cfg(unix)]
         let result =
             std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
                 .args([
@@ -390,21 +394,30 @@ fn fixture_binary(cache: &FixtureCache) -> Arc<CompiledPeer> {
                     "unsafe_code",
                     "-C",
                     "opt-level=1",
+                    "-C",
+                    "instrument-coverage=no",
                 ])
                 .arg(&source)
                 .arg("-o")
                 .arg(&path)
                 .output()
                 .expect("compile the native connector test peer with the Rust toolchain");
+        #[cfg(windows)]
+        let result = compile_windows_peer(&source, &path)
+            .expect("compile the native connector test peer with the Rust toolchain");
         assert!(
             result.status.success(),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
+        #[cfg(windows)]
+        let path = snapshot_peer(&path, directory.path())
+            .expect("snapshot the independently compiled native connector test peer");
         path
     };
     let binary = Arc::new(CompiledPeer { directory, path });
@@ -414,14 +427,70 @@ fn fixture_binary(cache: &FixtureCache) -> Arc<CompiledPeer> {
 }
 
 #[cfg(windows)]
-fn cargo_peer() -> PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("kuru-connectors-stdio-fixture.exe")
+fn compile_windows_peer(
+    source: &std::path::Path,
+    output: &std::path::Path,
+) -> io::Result<std::process::Output> {
+    use kuru_platform::windows::process::{Stdio as NativeStdio, configured_command};
+    use std::{ffi::OsString, fs::File, io::Read, os::windows::io::OwnedHandle, time::Duration};
+
+    let diagnostics = source.with_extension("compiler-stderr");
+    let errors = File::create(&diagnostics)?;
+    let args = [
+        "--edition=2024",
+        "--forbid",
+        "unsafe_code",
+        "-C",
+        "opt-level=1",
+        "-C",
+        "instrument-coverage=no",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain([
+        source.as_os_str().to_owned(),
+        "-o".into(),
+        output.as_os_str().to_owned(),
+    ])
+    .collect::<Vec<_>>();
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let mut spec = configured_command(
+        &compiler,
+        &args,
+        source.parent().unwrap(),
+        std::env::vars_os().collect(),
+    )?;
+    spec.stderr = NativeStdio::Handle(OwnedHandle::from(errors));
+    // Null/file stdio makes spawn independent of the caller's Tokio reactor.
+    // No compiler pipe or asynchronously retained task can outlive this owner.
+    let mut child = futures::executor::block_on(spec.spawn())?;
+    let mut wait_error = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                wait_error.get_or_insert(error);
+                // Preserve the same root/Job even if a wait observation fails.
+                // Drop alone requests cleanup; only try_wait confirms it.
+                let _ = child.terminate();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if let Some(error) = wait_error {
+        return Err(error);
+    }
+    let mut stderr = Vec::new();
+    File::open(diagnostics)?
+        .take(crate::MAX_BYTES as u64 + 1)
+        .read_to_end(&mut stderr)?;
+    stderr.truncate(crate::MAX_BYTES);
+    Ok(std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
 }
 
 #[cfg(windows)]
@@ -460,7 +529,7 @@ fn snapshot_peer(
         Ok(file)
     }
 
-    // Cargo's image and the OS temporary directory can be on different volumes.
+    // The selected image and the OS temporary directory can be on different volumes.
     // Snapshot once into the owning directory before making same-volume aliases.
     // Cargo may legitimately hard-link its source; never modify that artifact.
     let parent = Directory::open(
@@ -756,7 +825,7 @@ mod tests {
 
 #[cfg(windows)]
 mod windows_tests {
-    use super::{CompiledPeer, FixtureCache, StdioFixture, Step, cargo_peer, snapshot_peer};
+    use super::{CompiledPeer, FixtureCache, StdioFixture, Step, fixture_binary, snapshot_peer};
     use crate::{mcp::Admission, rpc::Rpc};
     use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info};
     use serde_json::json;
@@ -765,9 +834,10 @@ mod windows_tests {
     #[tokio::test]
     async fn native_fixture_snapshot_survives_source_replacement_and_cleans_its_aliases() {
         let sources = tempfile::tempdir().unwrap();
-        let source = sources.path().join("cargo-peer.exe");
-        std::fs::copy(cargo_peer(), &source).unwrap();
-        let compiled_link = sources.path().join("cargo-artifact.exe");
+        let source = sources.path().join("compiler-peer.exe");
+        let compiler_owner = fixture_binary(&FixtureCache::default());
+        std::fs::copy(&compiler_owner.path, &source).unwrap();
+        let compiled_link = sources.path().join("compiler-artifact.exe");
         std::fs::hard_link(&source, &compiled_link).unwrap();
         let original = File::open(&source).unwrap();
         assert_eq!(regular_file_info(&original).unwrap().links, 2);
@@ -803,10 +873,15 @@ mod windows_tests {
             regular_file_info(&alias).unwrap().identity
         );
         drop((source_image, alias));
+        let profiles = tempfile::tempdir().unwrap();
+        let profile_destination = profiles.path().join("fake-peer-%p-%m.profraw");
         let mut rpc = Rpc::spawn(
             fixture.command(),
             &[],
-            &BTreeMap::new(),
+            &BTreeMap::from([(
+                "LLVM_PROFILE_FILE".into(),
+                profile_destination.to_str().unwrap().into(),
+            )]),
             fixture.directory.path(),
             Arc::new(
                 Directory::open(
@@ -828,6 +903,11 @@ mod windows_tests {
         })
         .await;
         rpc.close().await.unwrap();
+        assert_eq!(
+            std::fs::read_dir(profiles.path()).unwrap().count(),
+            0,
+            "the fake stdio peer must not write coverage profiles even on normal exit"
+        );
         assert_eq!(exchange.unwrap(), json!({"snapshot":true}));
         fixture.assert_completed(1);
         assert_eq!(

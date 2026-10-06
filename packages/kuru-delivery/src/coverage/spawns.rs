@@ -1,19 +1,18 @@
-//! Spawn rows of the runner ledger, and the attribution of a raw profile to
-//! the process and test that wrote it.
+//! Spawn rows of the runner ledger and candidate matches for a raw profile.
 //!
 //! Every instrumented process writes `<prefix>-<pid>-<signature>[_<pool>].profraw`
 //! (`LLVM_PROFILE_FILE`'s `%p` and `%m`). The module signature is computed per
-//! executable, so it names a binary, not a test. Test support appends one
-//! spawn row to the runner ledger for each child that leaves the test's
-//! process group (memory supervisors and owners, terminal children), and the
-//! runner appends one for each test executable's own listing process. A
-//! profile that appears after the partition's tests is then named by its
-//! process ID: the test that started it, its role and its executable; its
-//! signature is named by every other profile of the same executable.
+//! executable, not per test; matching it is not proof of writer identity.
+//! Test support appends one spawn row to the runner ledger for each child that
+//! leaves the test's process group (memory supervisors and owners, terminal
+//! children), and the runner appends one for each test executable's own listing
+//! process and each Windows selection's actual test-run PID. Profile PIDs are
+//! matched against recorded rows, and sibling profile signatures suggest
+//! executable candidates.
 //!
 //! Spawn rows are informational, like the job ledger: they never change a
-//! plan, and a row from a later run of a reused process ID is reported as
-//! such rather than trusted.
+//! plan. PID reuse can prevent writer identification even with only one matching
+//! row, including the rows used to suggest sibling-signature candidates.
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -137,7 +136,7 @@ fn ancestry(row: &SpawnRecord, by_pid: &BTreeMap<u32, Vec<&SpawnRecord>>, target
             break;
         }
         text.push_str(&format!(
-            ", the {} {} started by test {}",
+            ", recorded parent candidate {} {} started by test {}",
             above.role,
             shown(&above.executable, target),
             above.test
@@ -147,8 +146,9 @@ fn ancestry(row: &SpawnRecord, by_pid: &BTreeMap<u32, Vec<&SpawnRecord>>, target
     text
 }
 
-/// Attribute each changed profile, `(change, name)` such as `("new",
-/// "kuru-1-2_0.profraw")`, to the process and test that wrote it.
+/// Describe recorded writer candidates for each changed profile, `(change,
+/// name)` such as `("new", "kuru-1-2_0.profraw")`. PID reuse can invalidate even
+/// a single matching row or its inferred sibling-signature executable.
 /// `profiles` is every profile name now in the target root.
 pub fn attribute(
     changes: &[(&str, &str)],
@@ -160,8 +160,8 @@ pub fn attribute(
     for spawn in spawns {
         by_pid.entry(spawn.pid).or_default().push(spawn);
     }
-    // A signature names the executables of every recorded process that wrote
-    // a profile with it.
+    // Sibling profiles with matching PIDs suggest executable candidates, not
+    // proven writers: a recorded row may belong to a later reuse of that PID.
     let mut executables: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for profile in profiles.iter().filter_map(|name| ProfileName::parse(name)) {
         if let Some(rows) = by_pid.get(&profile.pid) {
@@ -181,11 +181,11 @@ pub fn attribute(
             };
             let process = match by_pid.get(&profile.pid).map(Vec::as_slice) {
                 None | Some([]) => format!(
-                    "pid {} has no spawn row: it was not started by recorded test support",
+                    "pid {} has no recorded spawn match; writer identity is unknown",
                     profile.pid
                 ),
                 Some([row]) => format!(
-                    "pid {} is the {} {} started by test {} (parent pid {}{})",
+                    "pid {} recorded candidate: {} {} started by test {} (parent pid {}{}); PID reuse can prevent writer identification",
                     profile.pid,
                     row.role,
                     shown(&row.executable, target),
@@ -194,7 +194,7 @@ pub fn attribute(
                     ancestry(row, &by_pid, target)
                 ),
                 Some(rows) => format!(
-                    "pid {} was reused; its spawn rows name {}",
+                    "pid {} has multiple recorded candidates; writer identity is unknown: {}",
                     profile.pid,
                     rows.iter()
                         .map(|row| format!(
@@ -209,10 +209,10 @@ pub fn attribute(
                 ),
             };
             let binary = executables.get(&profile.signature).map_or_else(
-                || format!("no recorded process shares signature {}", profile.signature),
+                || format!("signature {} has no recorded sibling candidate", profile.signature),
                 |names| {
                     format!(
-                        "signature {} is {}",
+                        "signature {} sibling candidates: {} (PID reuse can prevent writer identification)",
                         profile.signature,
                         names.iter().cloned().collect::<Vec<_>>().join(" or ")
                     )
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn a_late_profile_names_its_test_role_and_executable_by_pid_and_signature() {
+    fn a_late_profile_reports_candidates_without_claiming_writer_identity() {
         let target = Path::new("/target");
         let spawns = [
             row(
@@ -320,16 +320,16 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "new kuru-12-2_0.profraw: pid 12 is the dolt-supervisor debug/kuru-memory started \
+                "new kuru-12-2_0.profraw: pid 12 recorded candidate: dolt-supervisor debug/kuru-memory started \
                  by test tests::last (parent pid "
                     .to_owned()
                     + &std::process::id().to_string()
-                    + "); signature 2 is debug/kuru-memory",
-                "new kuru-13-2_0.profraw: pid 13 has no spawn row: it was not started by \
-                 recorded test support; signature 2 is debug/kuru-memory"
+                    + "); PID reuse can prevent writer identification; signature 2 sibling candidates: debug/kuru-memory (PID reuse can prevent writer identification)",
+                "new kuru-13-2_0.profraw: pid 13 has no recorded spawn match; writer identity is unknown; \
+                 signature 2 sibling candidates: debug/kuru-memory (PID reuse can prevent writer identification)"
                     .to_owned(),
-                "changed kuru-14-3_0.profraw: pid 14 has no spawn row: it was not started by \
-                 recorded test support; no recorded process shares signature 3"
+                "changed kuru-14-3_0.profraw: pid 14 has no recorded spawn match; writer identity is unknown; \
+                 signature 3 has no recorded sibling candidate"
                     .to_owned(),
                 "removed odd.profraw (not a %p-%m profile name)".to_owned(),
             ]
@@ -353,9 +353,11 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "new kuru-22-4_0.profraw: pid 22 is the dolt-supervisor debug/kuru started by test \
-              main (parent pid 21, the memory-owner debug/kuru started by test main, the \
-              terminal-child debug/kuru started by test tests::pty); signature 4 is debug/kuru"
+                "new kuru-22-4_0.profraw: pid 22 recorded candidate: dolt-supervisor debug/kuru started by test \
+              main (parent pid 21, recorded parent candidate memory-owner debug/kuru started by test main, \
+              recorded parent candidate terminal-child debug/kuru started by test tests::pty); \
+              PID reuse can prevent writer identification; signature 4 sibling candidates: debug/kuru \
+              (PID reuse can prevent writer identification)"
             ]
         );
     }
@@ -375,9 +377,10 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "new kuru-5-9_0.profraw: pid 5 was reused; its spawn rows name the memory-owner \
+                "new kuru-5-9_0.profraw: pid 5 has multiple recorded candidates; writer identity is unknown: the memory-owner \
               /elsewhere/kuru started by test tests::a at 1; the terminal-child /elsewhere/kuru \
-              started by test tests::b at 1; signature 9 is /elsewhere/kuru"
+              started by test tests::b at 1; signature 9 sibling candidates: /elsewhere/kuru \
+              (PID reuse can prevent writer identification)"
             ]
         );
     }

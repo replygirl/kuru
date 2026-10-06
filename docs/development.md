@@ -101,7 +101,18 @@ between means an instrumented process outlived the partition's tests; the
 partition fails naming those profiles instead of blaming the port. A test must
 therefore not leave an instrumented child running after it returns.
 
-The failure also names each changed profile's writer. A raw profile is named
+The std-only fake connector peer in `tests/fixtures/stdio_peer.rs` is compiled
+separately with the pinned Rust compiler and explicit `instrument-coverage=no`
+on Unix and Windows. MCP protocol-failure tests deliberately force-terminate
+that peer; it must not start an exit-time profile write that termination can
+interrupt. Windows retains the compiler's full native Job through completion
+and checks an immutable snapshot before exposing fixture aliases. This is test
+scaffolding, already outside cargo-llvm-cov's default measured source scope.
+Real application children still inherit the runner's `LLVM_PROFILE_FILE`, and
+application instrumentation, strict profile export and the 90% gate are unchanged.
+
+The failure also reports recorded writer candidates for each changed profile.
+A raw profile is named
 `<prefix>-<pid>-<signature>_<pool>.profraw`, and the signature (`%m`) is
 computed per executable, not per test. The runner sets
 `KURU_COVERAGE_SPAWN_LEDGER` to its ledger on every test process, and test
@@ -110,10 +121,13 @@ executable and originating test) for every instrumented child that leaves the
 test's process group, which the runner's group cleanup never reaches: memory
 Dolt supervisors and service owners (`kuru_memory::test_support::spawn_ledger`,
 forwarded to an owner's own spawns) and pseudo-terminal children. The runner
-adds a row for each test executable's listing profile. The partition then
-reports a new profile as "pid N is the `<role>` `<executable>` started by test
-`<name>`" and names the executables that share its signature. Spawn rows share
-the runner ledger file but never enter a partition plan.
+adds a row for each test executable's listing profile and each Windows
+selection's actual run PID. PID-row matches and executables inferred from
+sibling signature matches are candidates, not proven writer identities. PID
+reuse can invalidate either inference even when only one spawn row matches;
+no matching row means only that no recorded match was found. Spawn rows share
+the runner ledger file but never enter a partition plan or change strict
+profile validation.
 
 A local memory store dropped without `close()` hands its supervisor to a
 detached reaper thread: the supervisor stops Dolt and exits on its own, and
@@ -1394,7 +1408,13 @@ Any count works locally; CI uses the counts in `PARTITIONS`. The instrumented
 build stays in `KURU_COVERAGE_TARGET`, separate from `target/`, so it never
 disturbs ordinary builds or the shared build cache; delete the scratch directory
 afterwards. On failure, `diagnostics-1/failure.txt` and any stall reports explain
-the stop. To exercise the merge, run every index from 1 to the count, each with
+the stop. Failed instrumented exports also retain bounded profile names, sizes,
+timestamps, existing spawn attribution and at most 64 raw bytes per profile in
+`failure.txt`. Windows selections record their actual run PID alongside the
+listing-process identities. These prefixes are partial, best-effort diagnostics;
+unchanged metadata does not prove immutable bytes, and later-section corruption
+still needs targeted evidence. No profiles are repaired, filtered or discarded
+to make the export pass. To exercise the merge, run every index from 1 to the count, each with
 its own fresh target, evidence and diagnostics directory, copy each partition's
 evidence (its `attempt-1` directory) into a directory named like the CI
 artifact, `$scratch/inputs/ci-coverage-local-partition-<k>-attempt-1/`, and run

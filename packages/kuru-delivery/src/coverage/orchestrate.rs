@@ -30,6 +30,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -1059,8 +1060,9 @@ async fn run_shard<H: Host>(
                 "coverage partition profiles exceed their limits ({profile_count} files, {profile_bytes} bytes)"
             );
             let root_text = root.to_str().context("coverage root is not UTF-8")?;
-            let lcov =
-                export_lcov(host, llvm_cov, &root, root_text, &env, &state, &mut phases).await?;
+            let lcov = export_lcov(host, llvm_cov, &root, root_text, &env, &state, &mut phases)
+                .await
+                .map_err(|error| with_profile_failure_evidence(error, &target, &ledger_path))?;
             let lines = export_lines(
                 host,
                 llvm_cov,
@@ -1073,7 +1075,8 @@ async fn run_shard<H: Host>(
                 &partition,
                 &mut phases,
             )
-            .await?;
+            .await
+            .map_err(|error| with_profile_failure_evidence(error, &target, &ledger_path))?;
             Some((lcov, lines))
         }
         None => None,
@@ -1268,6 +1271,72 @@ struct ProfileSet(BTreeMap<String, (u64, Option<std::time::SystemTime>)>);
 
 /// Profiles a changed-profile diagnostic names.
 const PROFILE_CHANGE_REPORT_LIMIT: usize = 10;
+
+/// Partial raw bytes only, not an LLVM decoder or a validity decision.
+const PROFILE_HEADER_PREFIX: u64 = 64;
+
+fn profile_header_prefix(path: &Path) -> Result<String> {
+    ensure!(
+        fs::symlink_metadata(path)?.file_type().is_file(),
+        "profile name is not a regular file"
+    );
+    let file = fs::File::open(path)?;
+    let before = file.metadata()?;
+    ensure!(before.is_file(), "profile is not a regular file");
+    let mut bytes = Vec::new();
+    let mut limited = (&file).take(PROFILE_HEADER_PREFIX);
+    limited.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    let changed = !named.is_file()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || after.len() != named.len()
+        || after.modified().ok() != named.modified().ok();
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!(
+        "partial raw prefix ({} bytes, at most {PROFILE_HEADER_PREFIX}, metadata_changed={changed}): {hex}",
+        bytes.len()
+    ))
+}
+
+/// Best-effort evidence in the existing error artifact. Never alters, removes
+/// or validates profiles; the failed strict export remains the primary cause.
+fn with_profile_failure_evidence(
+    error: anyhow::Error,
+    target: &Path,
+    ledger: &Path,
+) -> anyhow::Error {
+    let evidence = (|| -> Result<String> {
+        let profiles = profile_set(target)?;
+        let (count, bytes) = profiles.totals();
+        ensure!(
+            count <= super::PROFILE_COUNT_LIMIT && bytes <= super::PROFILE_TOTAL_LIMIT,
+            "profile evidence exceeds existing bounds ({count} files, {bytes} bytes)"
+        );
+        let spawns = super::plan::read_spawns(ledger)?;
+        let names: Vec<_> = profiles.0.keys().map(String::as_str).collect();
+        let changes: Vec<_> = names.iter().map(|name| ("profile", *name)).collect();
+        let writers = super::spawns::attribute(&changes, &names, &spawns, target);
+        let mut evidence = format!(
+            "Failed-export profile evidence ({count} files, {bytes} bytes); prefixes are partial and may race live writers; unchanged metadata is not immutable-byte proof.\n"
+        );
+        for ((name, (size, modified)), writer) in profiles.0.iter().zip(writers) {
+            let prefix = match profile_header_prefix(&target.join(name)) {
+                Ok(prefix) => prefix,
+                Err(error) => format!("prefix unavailable: {error:#}"),
+            };
+            evidence.push_str(&format!(
+                "{writer}; size={size}; modified={modified:?}; {prefix}\n"
+            ));
+        }
+        Ok(evidence)
+    })();
+    error.context(match evidence {
+        Ok(evidence) => evidence,
+        Err(error) => format!("Failed-export profile evidence unavailable: {error:#}"),
+    })
+}
 
 fn profile_set(target: &Path) -> Result<ProfileSet> {
     let mut profiles = BTreeMap::new();
@@ -1673,6 +1742,7 @@ mod tests {
         /// The call during which a test-started instrumented process exits
         /// late and writes `kuru-late-1.profraw` into the target root.
         late_profile: Option<Call>,
+        corrupt_export_profile: bool,
         /// Whether the seeded dependency was already in the target at build.
         seeded_at_build: Option<bool>,
         /// The deadline each capture, source check and receipt was given.
@@ -1714,6 +1784,7 @@ mod tests {
                 write_export: true,
                 summary_offset: 0,
                 late_profile: None,
+                corrupt_export_profile: false,
                 seeded_at_build: None,
                 deadlines: Vec::new(),
             }
@@ -2061,6 +2132,28 @@ mod tests {
                     let partition = Self::partition_of(&target);
                     let text = match format {
                         ["--lcov"] => {
+                            if self.corrupt_export_profile {
+                                let sibling = target.join("kuru-41-700_0.profraw");
+                                fs::write(sibling, b"sibling")?;
+                                fs::write(target.join("kuru-43-700_0.profraw"), [0, 1])?;
+                                let ledger = target.join(STATE).join(RUNNER_LEDGER_FILE);
+                                for (pid, role) in [(41, "test-executable"), (43, "test-run")] {
+                                    super::super::append_ledger_line(
+                                        &ledger,
+                                        serde_json::to_vec(
+                                            &super::super::spawns::SpawnRecord::new(
+                                                pid,
+                                                role,
+                                                &target
+                                                    .join("debug/deps/probe.exe")
+                                                    .to_string_lossy(),
+                                                "probe/selected",
+                                                unix_now()?,
+                                            ),
+                                        )?,
+                                    )?;
+                                }
+                            }
                             self.call(Call::Export)?;
                             fixture::lcov_for(&partition).replace(
                                 "SF:packages/",
@@ -2790,6 +2883,92 @@ mod tests {
         assert!(error.contains("differ from WORKSPACE_PACKAGES"), "{error}");
     }
 
+    #[tokio::test]
+    async fn failed_export_retains_profile_prefix_and_actual_run_attribution() {
+        let mut scenario = Scenario::new(INSTRUMENTED);
+        scenario.fake.corrupt_export_profile = true;
+        scenario.fake.fail = Some(Call::Export);
+        let error = format!("{:#}", scenario.run(INSTRUMENTED).await.unwrap_err());
+        assert!(error.contains("injected Export failure"), "{error}");
+        let failure = scenario.failure();
+        for proof in [
+            "kuru-43-700_0.profraw",
+            "pid 43 recorded candidate: test-run",
+            "signature 700 sibling candidates: debug/deps/probe.exe",
+            "PID reuse can prevent writer identification",
+            "size=2",
+            "modified=Some",
+            "partial raw prefix (2 bytes, at most 64, metadata_changed=false): 0001",
+            "injected Export failure",
+        ] {
+            assert!(failure.contains(proof), "missing {proof}: {failure}");
+        }
+        assert_eq!(
+            fs::read(scenario.job("target/kuru-43-700_0.profraw")).unwrap(),
+            [0, 1]
+        );
+        assert!(!scenario.job("evidence").exists());
+        assert!(!scenario.fake.calls.contains(&Call::Receipt));
+    }
+
+    #[test]
+    fn failed_profile_prefix_is_partial_and_capture_errors_are_qualified() {
+        let temp = TempDir::new().unwrap();
+        let profile = temp.path().join("kuru-9-7_0.profraw");
+        for (bytes, prefix) in [
+            (Vec::new(), "partial raw prefix (0 bytes".to_owned()),
+            (
+                vec![0xab; 128],
+                format!(
+                    "partial raw prefix (64 bytes, at most 64, metadata_changed=false): {}",
+                    "ab".repeat(64)
+                ),
+            ),
+        ] {
+            fs::write(&profile, bytes).unwrap();
+            assert!(profile_header_prefix(&profile).unwrap().contains(&prefix));
+        }
+        let ledger = temp.path().join("runner-ledger.jsonl");
+        fs::write(&ledger, "").unwrap();
+        fs::remove_file(&profile).unwrap();
+        fs::create_dir(&profile).unwrap();
+        let error = with_profile_failure_evidence(
+            anyhow::anyhow!("original strict failure"),
+            temp.path(),
+            &ledger,
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("prefix unavailable: profile name is not a regular file"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pid 9 has no recorded spawn match; writer identity is unknown"),
+            "{text}"
+        );
+        assert!(text.contains("original strict failure"), "{text}");
+    }
+
+    #[test]
+    fn failed_profile_evidence_preserves_error_when_existing_bounds_are_exceeded() {
+        let temp = TempDir::new().unwrap();
+        let profile = fs::File::create(temp.path().join("kuru-9-7_0.profraw")).unwrap();
+        profile
+            .set_len(super::super::PROFILE_TOTAL_LIMIT + 1)
+            .unwrap();
+        let error = with_profile_failure_evidence(
+            anyhow::anyhow!("original strict failure"),
+            temp.path(),
+            &temp.path().join("missing-ledger"),
+        );
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("profile evidence exceeds existing bounds"),
+            "{text}"
+        );
+        assert!(text.contains("original strict failure"), "{text}");
+    }
+
     /// CI run 37147327774 (macOS partition 3 of 4): a memory stand-in owner
     /// that its test left polling exited 120 s later, between the partition's
     /// `--json` and `--json --summary-only` reports. Both re-merge the raw
@@ -2864,8 +3043,8 @@ mod tests {
     }
 
     /// The CI shape: a supervisor a test dropped live writes its profile
-    /// during the export. Its spawn row names the test, and the listing row
-    /// of the executable that shares its signature names the binary.
+    /// during the export. Its spawn row and sibling signature suggest
+    /// candidates, without proving writer identity across PID reuse.
     #[test]
     fn a_late_profile_names_the_test_that_started_its_process() {
         use super::super::spawns::{SpawnRecord, TEST_EXECUTABLE};
@@ -2913,9 +3092,10 @@ mod tests {
             .to_string();
         assert!(
             error.contains(&format!(
-                "Writers: new kuru-12-222_0.profraw: pid 12 is the dolt-supervisor \
-                 debug/kuru-memory started by test tests::b (parent pid {}); signature 222 is \
-                 debug/kuru-memory",
+                "Writers: new kuru-12-222_0.profraw: pid 12 recorded candidate: dolt-supervisor \
+                 debug/kuru-memory started by test tests::b (parent pid {}); PID reuse can \
+                 prevent writer identification; signature 222 sibling candidates: \
+                 debug/kuru-memory (PID reuse can prevent writer identification)",
                 std::process::id()
             )),
             "{error}"
