@@ -1266,7 +1266,7 @@ pub async fn await_managed_quiescence(options: &OpenOptions) -> Result<()> {
 /// The project store, its `.staging-*` siblings and its stages preserved
 /// under `interrupted/` that exist now: every directory in which a managed
 /// open of this project may have run an engine.
-fn project_store_directories(directory: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn project_store_directories(directory: &Path) -> Result<Vec<PathBuf>> {
     let mut stores = Vec::new();
     if lifecycle_trace::exists(directory) {
         stores.push(directory.to_path_buf());
