@@ -518,6 +518,24 @@ impl Directory {
         self.anchor().identity
     }
 
+    /// Persist changes observed through this exact retained directory.
+    /// Recovery uses this after proving a publication effect whose sync failed.
+    #[cfg(unix)]
+    pub fn sync(&self) -> io::Result<()> {
+        self.revalidate()?;
+        self.anchor().file.sync_all()?;
+        self.revalidate()
+    }
+
+    /// Refuse unrecognized names in this exact retained Unix directory.
+    /// Stops at the first unknown entry without loading its bytes or inventory.
+    #[cfg(unix)]
+    pub fn require_known_entries(&self, allowed: &[&OsStr]) -> io::Result<()> {
+        self.revalidate()?;
+        native::require_known_entries(&self.anchor().file, allowed)?;
+        self.revalidate()
+    }
+
     /// Check that a held ordinary file belongs to the effective user and its
     /// retained parent permits replacement. This creates nothing and conveys
     /// no authority across subsequent filesystem changes.

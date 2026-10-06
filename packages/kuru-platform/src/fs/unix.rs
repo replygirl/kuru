@@ -405,3 +405,18 @@ pub(super) fn publish(
         .and_then(|()| destination_parent.sync_all())
         .map_err(|error| (PublicationPhase::Uncertain, error))
 }
+
+pub(super) fn require_known_entries(directory: &File, allowed: &[&OsStr]) -> io::Result<()> {
+    let mut entries = Dir::read_from(directory)?;
+    while let Some(entry) = entries.read() {
+        let entry = entry?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        if matches!(name.as_bytes(), b"." | b"..") {
+            continue;
+        }
+        if !allowed.contains(&name) {
+            return Err(denied("unknown retained directory evidence"));
+        }
+    }
+    Ok(())
+}

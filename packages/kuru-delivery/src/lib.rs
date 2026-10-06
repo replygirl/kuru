@@ -42,6 +42,10 @@ pub mod repo;
 pub mod shell_support;
 mod staging;
 pub mod targets;
+#[cfg(unix)]
+pub mod unix_source;
+#[cfg(unix)]
+pub mod unix_update;
 #[cfg(windows)]
 pub mod update;
 // The Windows handoff's waits; public only to the maintainer fixtures that

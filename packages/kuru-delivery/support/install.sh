@@ -150,6 +150,42 @@ kuru_destination="$kuru_directory/kuru"
 check_destination() {
   [[ ! -L $kuru_destination && ( ! -e $kuru_destination || -f $kuru_destination ) ]] || fail 'destination kuru must be a regular file, not a symlink or directory'
 }
+# Bootstrap is compiler-free: preserve pending native evidence without parsing
+# or executing an image. Native recovery owns the strict transaction lock;
+# these two shell checks retain the documented shell race limitation.
+check_pending_update() {
+  local pending="$kuru_directory/.kuru-update" field mode links retained before after
+  [[ -e $pending || -L $pending ]] || return 0
+  [[ ! -L $pending && -d $pending && -O $pending ]] || fail 'pending update directory is unsafe; state retained'
+  command -v stat >/dev/null || fail 'stat is required to inspect pending update state'
+  mode=$(stat -c '%a' -- "$pending" 2>/dev/null) || mode=$(stat -f '%Lp' "$pending")
+  [[ $mode == 700 ]] || fail 'pending update directory must be private; state retained'
+  if [[ ! -e $pending/receipt.json && ! -L $pending/receipt.json && ! -e $pending/receipt.next && ! -L $pending/receipt.next ]]; then
+    for field in "$pending"/* "$pending"/.[!.]* "$pending"/..?*; do
+      [[ -e $field || -L $field ]] || continue
+      [[ $field == "$pending/install.lock" && ! -L $field && -f $field && -O $field ]] || fail 'unknown pending update evidence; state retained'
+      mode=$(stat -c '%a:%h:%s' -- "$field" 2>/dev/null) || mode=$(stat -f '%Lp:%l:%z' "$field")
+      [[ $mode == 600:1:0 ]] || fail 'pending update lock is unsafe; state retained'
+    done
+    return 0
+  fi
+  for field in "$pending/receipt.json" "$pending/receipt.next"; do
+    [[ -e $field || -L $field ]] || continue
+    [[ ! -L $field && -f $field && -O $field ]] || fail 'pending receipt must be an owned regular file; state retained'
+    mode=$(stat -c '%a:%h:%s' -- "$field" 2>/dev/null) || mode=$(stat -f '%Lp:%l:%z' "$field")
+    [[ ${mode%:*} == 600:1 ]] || fail 'pending receipt permissions or links are unsafe; state retained'
+    links=${mode##*:}
+    (( links <= 65536 )) || fail 'pending receipt exceeds bounds; state retained'
+  done
+  [[ ! -e $kuru_directory/kuru && ! -L $kuru_directory/kuru ]] || fail 'pending update requires one ordinary Kuru run before installation; state retained'
+  before=$(stat -c '%d:%i' -- "$pending" 2>/dev/null) || before=$(stat -f '%d:%i' "$pending")
+  retained=$(mktemp -d "$kuru_directory/.kuru-update.abandoned.XXXXXX")
+  mv -- "$pending" "$retained/pending" || fail 'could not preserve pending update state'
+  after=$(stat -c '%d:%i' -- "$retained/pending" 2>/dev/null) || after=$(stat -f '%d:%i' "$retained/pending")
+  [[ $before == "$after" && ! -L $retained/pending && -d $retained/pending && -O $retained/pending ]] || fail 'pending update changed while being preserved; files retained'
+  printf 'kuru: pending update state preserved at %q; installing only the requested image.\n' "$retained/pending" >&2
+}
+check_pending_update
 check_destination
 kuru_stage=$(mktemp -d "$kuru_directory/.kuru-install.XXXXXX")
 
@@ -359,6 +395,7 @@ if (( kuru_marker_count == 1 )); then
   done
 fi
 
+check_pending_update
 check_destination
 mv -f -- "$kuru_stage/kuru" "$kuru_destination"
 if (( kuru_marker_count == 1 )); then

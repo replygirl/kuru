@@ -2080,10 +2080,10 @@ impl MemoryStore {
             progress,
         )
         .await?;
-        let supervisor = options
-            .supervisor
-            .clone()
-            .unwrap_or(std::env::current_exe()?);
+        let supervisor = match &options.supervisor {
+            Some(supervisor) => supervisor.clone(),
+            None => kuru_platform::running_executable()?,
+        };
         let timeout = Duration::from_secs(options.config.startup_timeout_secs);
         #[cfg(unix)]
         let lifecycle_root = None;

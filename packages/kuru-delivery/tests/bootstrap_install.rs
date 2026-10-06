@@ -52,7 +52,7 @@ impl Fixture {
         fs::write(destination.join("kuru"), PREVIOUS).unwrap();
         for name in [
             "bash", "mkdir", "mktemp", "mkfifo", "head", "wc", "cat", "gzip", "tar", "chmod", "mv",
-            "rm", "tr", "cmp", "sort", "cp",
+            "rm", "tr", "cmp", "sort", "cp", "stat", "dirname", "install",
         ] {
             symlink(system_tool(name), tools.join(name)).unwrap();
         }
@@ -1513,4 +1513,128 @@ async fn a_stalled_producer_ends_when_the_fixture_releases_it() {
         survivors.is_empty(),
         "released producer survived: {survivors:?}"
     );
+}
+
+#[tokio::test]
+async fn unix_bootstrap_pending_receipts_refuse_present_and_preserve_absent_images() {
+    for source in [false, true] {
+        let fixture = Fixture::new(TARGETS[0], "0.11.0");
+        let pending = fixture.destination.join(".kuru-update");
+        fs::create_dir(&pending).unwrap();
+        fs::set_permissions(&pending, fs::Permissions::from_mode(0o700)).unwrap();
+        let receipt = pending.join(if source {
+            "receipt.next"
+        } else {
+            "receipt.json"
+        });
+        fs::write(&receipt, b"unparsed pending evidence").unwrap();
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(pending.join("backup-original"), b"must remain retained").unwrap();
+        let build = fixture.path("fake build");
+        fs::create_dir_all(build.join("release")).unwrap();
+        executable(&build.join("release/kuru"), CANDIDATE);
+        executable(
+            &fixture.tools.join("mise"),
+            br#"#!/bin/bash
+printf 'build' > "$FIXTURE_BUILD_MARKER"
+if [[ $3 == exec ]]; then printf '%s\n' "$FIXTURE_HOST_TARGET"; fi
+"#,
+        );
+        let command = || {
+            if source {
+                let mut command = Command::new("/bin/bash");
+                command
+                    .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh"))
+                    .arg("--source");
+                let mut command = fixture.configure(command);
+                command
+                    .env("CARGO_TARGET_DIR", &build)
+                    .env_remove("CARGO_BUILD_TARGET")
+                    .env("FIXTURE_HOST_TARGET", fixture.target)
+                    .env("FIXTURE_BUILD_MARKER", fixture.path("build executed"));
+                command
+            } else {
+                fixture.explicit()
+            }
+        };
+        let pending_bytes = fs::read(&receipt).unwrap();
+        fs::remove_file(&receipt).unwrap();
+        let output = kuru_delivery::unix_source::test_support::output(command().into_std())
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unknown pending update evidence")
+        );
+        assert_eq!(
+            fs::read(pending.join("backup-original")).unwrap(),
+            b"must remain retained"
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join("kuru")).unwrap(),
+            PREVIOUS
+        );
+        assert!(!fixture.path("build executed").exists());
+        assert!(!fixture.path("executed").exists());
+        fs::write(&receipt, pending_bytes).unwrap();
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = kuru_delivery::unix_source::test_support::output(command().into_std())
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("one ordinary Kuru run"));
+        assert_eq!(
+            fs::read(fixture.destination.join("kuru")).unwrap(),
+            PREVIOUS
+        );
+        assert_eq!(fs::read(&receipt).unwrap(), b"unparsed pending evidence");
+        assert!(!fixture.path("build executed").exists());
+        assert!(!fixture.path("executed").exists());
+        fs::remove_file(fixture.destination.join("kuru")).unwrap();
+        let output = kuru_delivery::unix_source::test_support::output(command().into_std())
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join("kuru")).unwrap(),
+            CANDIDATE
+        );
+        assert!(!pending.exists());
+        let retained = fs::read_dir(&fixture.destination)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".kuru-update.abandoned.")
+            })
+            .expect("pending directory was not preserved")
+            .path()
+            .join("pending");
+        assert_eq!(
+            fs::read(retained.join(receipt.file_name().unwrap())).unwrap(),
+            b"unparsed pending evidence"
+        );
+        assert_eq!(
+            fs::read(retained.join("backup-original")).unwrap(),
+            b"must remain retained"
+        );
+        if source {
+            assert_eq!(
+                fs::read(fixture.path("executed")).unwrap(),
+                b"executed",
+                "source first-install smoke did not run the published image"
+            );
+        } else {
+            assert!(
+                !fixture.path("executed").exists(),
+                "release bootstrap ran selected image for validation"
+            );
+        }
+    }
 }

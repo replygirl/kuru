@@ -683,8 +683,9 @@ impl Server {
             // `crate::spawn_gate`.
             #[cfg(test)]
             let creation = crate::spawn_gate::child_creation().await;
-            let child = command
-                .spawn()
+            #[cfg(any(test, feature = "test-support"))]
+            let program = PathBuf::from(command.get_program());
+            let child = kuru_platform::unix::spawn_piped(command)
                 .context("start memory lifetime supervisor")?;
             let spawned = Instant::now();
             // The test gate guards this process's child creation, not the
@@ -697,7 +698,7 @@ impl Server {
             #[cfg(any(test, feature = "test-support"))]
             crate::test_support::spawn_ledger::record(
                 child.id(),
-                Path::new(command.get_program()),
+                &program,
                 crate::test_support::spawn_ledger::DOLT_SUPERVISOR,
             );
             crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);

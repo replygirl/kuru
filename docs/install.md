@@ -386,6 +386,22 @@ It keeps the running executable's target, so an x64 `kuru.exe` running under
 emulation on Windows on Arm keeps updating to x64 builds.
 It requires no compiler or interpreter. Kuru does not install background updates.
 
+On macOS and Linux, the native updater records checked replacement evidence
+beside the installation before preparing either image. An ordinary later Kuru
+invocation automatically reconciles a pending update before loading configuration
+or opening memory; recovery notices and retained-evidence refusals go to stderr.
+A confirmed replacement finishes forward and removes its displaced copy. Recovery
+never opens memory or rolls back a possibly published new version. Unknown or
+changed files remain untouched. A settled update leaves no backup executable.
+
+If a pending update still has an installed Kuru, run that executable once before
+rerunning the shell installer. If the installed name is missing, the installer
+preserves the pending directory separately and installs only your requested
+release; it does not execute or restore the retained backup. The shell installers
+check again before replacement but do not share the native transaction lock.
+An already-running Linux Kuru keeps self-launching its own mapped build for memory
+services after its installation pathname is replaced.
+
 On Windows, the current trusted executable performs replacement through a
 verified helper copy. It records publication before reporting success and waits
 for the old process to exit before cleanup. Publication has a two-minute
@@ -401,6 +417,13 @@ variable is set, otherwise `%LOCALAPPDATA%\kuru\update-helpers`.
 
 For a source installation, select the desired revision and install it again, or
 run `kuru update --source /path/to/kuru`.
+
+The native Unix source updater invokes the selected checkout's package-owned mise
+build directly and copies its verified output without executing it. Read-only
+Cargo hardlinks remain build inputs. Ctrl-C waits for the same owned build and its
+children, or an already-started installation transaction, to settle before exit.
+The source first-install script retains its existing installed `--version` smoke
+check after publication.
 
 ## Releasing
 
