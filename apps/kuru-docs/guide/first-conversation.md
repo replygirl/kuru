@@ -80,6 +80,14 @@ kuru --allow-write --allow-shell
 
 Shell commands use your account's process permissions, including access beyond the project. [Tools and permissions](/reference/tools) explains these boundaries and configured MCP tools.
 
+Tool calls appear as collapsed cards beneath their submitted prompt. Press
+<kbd>F6</kbd> to select a card and <kbd>F7</kbd> to expand or collapse it; your
+unsent draft stays in place. Shell previews are partial until the call settles.
+File changes can show the checked recorded diff, even if the workspace has
+changed since the write. Private peer and cognitive arguments and results stay
+withheld. Card details are temporary; resumed history does not reconstruct
+missing output. See [tool cards](/reference/tools#tool-cards).
+
 Kuru reads applicable ancestor and project-root `AGENTS.md` and `CLAUDE.md` files, with nearer instructions taking precedence. Checked `@relative/file.md` imports can add bounded Markdown sources. When an actor first reaches nested project instructions through an authorized file path, Kuru asks for separate workspace trust before using them. A newly instructed write pauses for replanning before changing the file. See [configuration and workspace trust](/reference/configuration).
 
 ## Return to the work

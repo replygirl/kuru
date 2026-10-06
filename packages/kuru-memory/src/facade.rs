@@ -82,6 +82,7 @@ struct RemoteSession {
     pending_candidate: Mutex<Option<PendingCandidate>>,
     pending_ledger: Mutex<Option<PendingLedger>>,
     pending_transition: Mutex<Option<PendingTransition>>,
+    pending_reconciliation: Mutex<Option<PendingReconciliation>>,
     pending_selected_abandon: Mutex<Option<PendingSelectedAbandon>>,
     factory: AttachmentFactory,
     options: OpenOptions,
@@ -98,7 +99,7 @@ struct RemoteSession {
     #[cfg(test)]
     replacement_hook: Mutex<Option<Arc<ReplacementHook>>>,
     /// Test observation: the owner refused this client a dream lease.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     dream_lease_refused: tokio::sync::Notify,
 }
 
@@ -274,6 +275,34 @@ struct PendingSelectedAbandon {
     target: String,
 }
 
+#[derive(Clone)]
+struct PendingReconciliation {
+    id: Uuid,
+    generation: String,
+    branch: String,
+    from: String,
+    live: String,
+    creation_id: Uuid,
+}
+
+#[derive(Debug)]
+pub struct CandidateReconciliation {
+    pub result: crate::CandidateReconciliationResult,
+    pub candidate: Option<Candidate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateReconciliationResolution {
+    Committed(String),
+    NotCommitted(crate::CandidateRefStatus),
+}
+
+#[derive(Debug)]
+pub struct CandidateReconciliationRecovery {
+    pub resolution: CandidateReconciliationResolution,
+    pub candidate: Candidate,
+}
+
 /// Typed result of an explicit exact-ref abandonment whose reply was lost.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SelectedAbandonResolution {
@@ -409,6 +438,7 @@ impl RemoteSession {
             pending_candidate: Mutex::new(None),
             pending_ledger: Mutex::new(None),
             pending_transition: Mutex::new(None),
+            pending_reconciliation: Mutex::new(None),
             pending_selected_abandon: Mutex::new(None),
             factory,
             options,
@@ -420,7 +450,7 @@ impl RemoteSession {
             successor: Mutex::new(None),
             #[cfg(test)]
             replacement_hook: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             dream_lease_refused: tokio::sync::Notify::new(),
         });
         let attachment = Arc::new(AsyncMutex::new(attachment));
@@ -1055,6 +1085,134 @@ impl RemoteSession {
     }
 }
 
+impl RemoteSession {
+    async fn recover_reconciliation(
+        self: &Arc<Self>,
+        branch: &str,
+        from: &str,
+        live: &str,
+    ) -> Result<Option<CandidateReconciliationRecovery>> {
+        let _mutation = self.mutations.lock().await;
+        self.ensure_open()?;
+        let pending = self
+            .pending_reconciliation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("memory pending reconciliation is poisoned"))?
+            .clone();
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        ensure!(
+            pending.branch == branch && pending.from == from && pending.live == live,
+            "candidate reconciliation recovery does not match the original tuple"
+        );
+        let mut attachment =
+            service::attach_or_start(&self.options, &self.project, &self.executable)
+                .await
+                .context("connect for candidate reconciliation outcome")?;
+        ensure!(
+            attachment.store_instance() == self.factory.store_instance(),
+            "memory store identity changed before reconciliation recovery"
+        );
+        let current_generation = attachment.generation() == pending.generation;
+        let reply = attachment
+            .call(ServiceCall::CandidateReconciliationOutcome {
+                original_id: pending.id,
+                original_generation: pending.generation.clone(),
+                branch: pending.branch.clone(),
+                from: pending.from.clone(),
+                live: pending.live.clone(),
+            })
+            .await?;
+        let ServiceValue::CandidateReconciliationOutcome(outcome) = reply else {
+            bail!("memory service returned the wrong reconciliation outcome response");
+        };
+        use service::rpc::CandidateReconciliationOutcome as Outcome;
+        let (committed, handle, status) = match outcome {
+            Outcome::Committed { handle, status } => (true, handle, status),
+            Outcome::NotCommitted { handle, status } => (false, handle, status),
+            Outcome::InFlight | Outcome::StillUncertain => {
+                bail!("candidate reconciliation remains uncertain")
+            }
+        };
+        ensure!(
+            status.branch == pending.branch,
+            "reconciliation outcome changed its exact branch"
+        );
+        let head = status
+            .head
+            .as_deref()
+            .context("proved reconciliation returned no head")?;
+        let base = status
+            .base
+            .clone()
+            .context("proved reconciliation returned no base")?;
+        store::validate_reconciliation_heads(head, &base)?;
+        ensure!(
+            matches!(
+                status.state,
+                crate::CandidateRefState::OpenUnchanged | crate::CandidateRefState::OpenConflict
+            ),
+            "reconciliation outcome did not preserve an open candidate"
+        );
+        let resolution = if committed {
+            ensure!(
+                base == pending.live,
+                "committed reconciliation changed its checked base"
+            );
+            CandidateReconciliationResolution::Committed(head.to_owned())
+        } else {
+            ensure!(
+                head == pending.from,
+                "uncommitted reconciliation changed its checked head"
+            );
+            CandidateReconciliationResolution::NotCommitted(status)
+        };
+        let mut successor = None;
+        let view = if current_generation {
+            let attachment = Arc::new(AsyncMutex::new(attachment));
+            self.register(&attachment)?;
+            RemoteView {
+                session: self.clone(),
+                attachment,
+                candidate: Some(handle),
+                candidate_creation_id: Some(pending.creation_id),
+                pinned_view: pending.branch,
+                read_only: false,
+            }
+        } else {
+            successor = Self::successor_fork(attachment.factory()).await;
+            RemoteSession::new_candidate_view(
+                attachment,
+                self.options.clone(),
+                self.project.clone(),
+                self.executable.clone(),
+                (handle, pending.creation_id, pending.branch),
+            )?
+        };
+        *self
+            .pending_reconciliation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("memory pending reconciliation is poisoned"))? = None;
+        if current_generation {
+            self.uncertain_write.store(false, Ordering::Release);
+        } else {
+            if let Some(successor) = successor {
+                self.keep_successor(successor);
+            }
+            self.retire_after_checked_recovery();
+        }
+        Ok(Some(CandidateReconciliationRecovery {
+            resolution,
+            candidate: Candidate {
+                backend: CandidateBackend::Remote(RemoteCandidate { view, handle, base }),
+                #[cfg(any(test, feature = "test-support"))]
+                reject_next_state_write: Arc::new(AtomicBool::new(false)),
+            },
+        }))
+    }
+}
+
 impl RemoteView {
     fn ensure_writable(&self) -> Result<()> {
         self.session.ensure_mutation_allowed()?;
@@ -1165,6 +1323,12 @@ impl RemoteView {
             } => Some((branch, base, target)),
             _ => None,
         };
+        let reconciliation = match &call {
+            ServiceCall::ReconcileCandidate {
+                branch, from, live, ..
+            } => Some((branch, from, live)),
+            _ => None,
+        };
         self.ensure_connected(attachment, mutating).await?;
         let candidate_begin = matches!(&call, ServiceCall::BeginCandidate { .. });
         if let Some((method, argument_digest)) = receipt {
@@ -1239,6 +1403,25 @@ impl RemoteView {
                 target: target.clone(),
             });
         }
+        if let Some((branch, from, live)) = reconciliation {
+            ensure!(
+                self.candidate.is_some() && branch == &self.pinned_view,
+                "candidate reconciliation names the wrong pinned view"
+            );
+            store::validate_reconciliation_heads(from, live)?;
+            *self.session.pending_reconciliation.lock().map_err(|_| {
+                anyhow::anyhow!("memory pending candidate reconciliation is poisoned")
+            })? = Some(PendingReconciliation {
+                id: request_id,
+                generation: attachment.generation().to_owned(),
+                branch: branch.clone(),
+                from: from.clone(),
+                live: live.clone(),
+                creation_id: self
+                    .candidate_creation_id
+                    .context("candidate reconciliation has no creation identity")?,
+            });
+        }
         let mut pending = mutating.then(|| PendingMutation {
             uncertain: &self.session.uncertain_write,
             complete: false,
@@ -1272,6 +1455,9 @@ impl RemoteView {
                 })? = None;
                 *self.session.pending_selected_abandon.lock().map_err(|_| {
                     anyhow::anyhow!("memory pending selected abandonment is poisoned")
+                })? = None;
+                *self.session.pending_reconciliation.lock().map_err(|_| {
+                    anyhow::anyhow!("memory pending candidate reconciliation is poisoned")
                 })? = None;
             }
         }
@@ -2169,9 +2355,28 @@ impl MemoryStore {
                 })
             }
             Backend::Remote(remote) => {
-                remote.ensure_writable()?;
+                remote.session.ensure_open()?;
+                ensure!(!remote.read_only, "this memory view is read-only");
                 tokio::time::timeout(DREAM_LEASE_WAIT, async {
-                    let dedicated = remote.fork().await?;
+                    // Ownership acquisition must precede exact uncertain-write
+                    // recovery. It does not authorize a mutation or clear that
+                    // view's fence; the dedicated attachment owns only the lease.
+                    let attachment = service::attach_or_start(
+                        &remote.session.options,
+                        &remote.session.project,
+                        &remote.session.executable,
+                    )
+                    .await?;
+                    ensure!(
+                        attachment.store_instance() == remote.session.factory.store_instance(),
+                        "memory store identity changed before dream lease acquisition"
+                    );
+                    let dedicated = RemoteSession::new_view(
+                        attachment,
+                        remote.session.options.clone(),
+                        remote.session.project.clone(),
+                        remote.session.executable.clone(),
+                    )?;
                     loop {
                         match dedicated
                             .call_raw(ServiceCall::TryAcquireDreamLease)
@@ -2183,8 +2388,8 @@ impl MemoryStore {
                                 });
                             }
                             ServiceValue::DreamLease { acquired: false } => {
-                                #[cfg(test)]
-                                dedicated.session.dream_lease_refused.notify_one();
+                                #[cfg(any(test, feature = "test-support"))]
+                                remote.session.dream_lease_refused.notify_one();
                                 tokio::time::sleep(DREAM_LEASE_POLL).await;
                             }
                             _ => bail!("memory service returned the wrong dream-lease response"),
@@ -2195,6 +2400,17 @@ impl MemoryStore {
                 .context("dream lease acquisition deadline exceeded")?
             }
         }
+    }
+
+    /// Observe a completed owned-service lease refusal, without guessing at
+    /// scheduler delay. This grants no ownership and never changes readiness.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fixture_wait_for_dream_lease_refusal(&self) -> Result<()> {
+        let Backend::Remote(remote) = &self.backend else {
+            bail!("dream-lease refusal observation needs a managed fixture")
+        };
+        remote.session.dream_lease_refused.notified().await;
+        Ok(())
     }
 
     pub async fn session_source_snapshot(
@@ -2755,6 +2971,15 @@ impl MemoryStore {
         }
     }
 
+    /// The name pinned when this handle selected its view. This is metadata,
+    /// not a liveness, revision, ownership or mutation-authority check.
+    pub fn selected_view_name(&self) -> &str {
+        match &self.backend {
+            Backend::Local(store) => store.pinned_view(),
+            Backend::Remote(remote) => &remote.pinned_view,
+        }
+    }
+
     pub async fn status(&self) -> Result<MemoryStatus> {
         match &self.backend {
             Backend::Local(store) => store.status().await,
@@ -2848,6 +3073,140 @@ impl std::fmt::Debug for RemoteCandidate {
 }
 
 impl Candidate {
+    /// Merge one captured live revision into this exact private head. Ordinary
+    /// promotion still requires its returned head/base and a fresh handle.
+    pub async fn reconcile_with_live(
+        &self,
+        expected_head: &str,
+        expected_live: &str,
+    ) -> Result<CandidateReconciliation> {
+        store::validate_reconciliation_heads(expected_head, expected_live)?;
+        match &self.backend {
+            CandidateBackend::Local(candidate) => {
+                let (result, fresh) = candidate
+                    .reconcile_with_live(expected_head, expected_live)
+                    .await?;
+                Ok(CandidateReconciliation {
+                    result,
+                    candidate: fresh.map(|candidate| Candidate {
+                        backend: CandidateBackend::Local(candidate),
+                        #[cfg(any(test, feature = "test-support"))]
+                        reject_next_state_write: Arc::new(AtomicBool::new(false)),
+                    }),
+                })
+            }
+            CandidateBackend::Remote(candidate) => {
+                let mut attachment = candidate.view.attachment.lock().await;
+                let _mutation = candidate.view.session.mutations.lock().await;
+                candidate.view.ensure_writable()?;
+                let reply = candidate
+                    .view
+                    .checked_call_locked(
+                        &mut attachment,
+                        ServiceCall::ReconcileCandidate {
+                            handle: candidate.handle,
+                            branch: candidate.view.pinned_view.clone(),
+                            from: expected_head.to_owned(),
+                            live: expected_live.to_owned(),
+                        },
+                    )
+                    .await?;
+                let ServiceValue::CandidateReconciled { result, handle } = reply else {
+                    bail!("memory service returned the wrong candidate reconciliation response");
+                };
+                let fresh = match &result {
+                    crate::CandidateReconciliationResult::Reconciled { head, base }
+                    | crate::CandidateReconciliationResult::Unchanged { head, base } => {
+                        store::validate_reconciliation_heads(head, base)?;
+                        ensure!(
+                            base == expected_live,
+                            "reconciliation changed its captured live base"
+                        );
+                        let handle =
+                            handle.context("proved reconciliation returned no fresh handle")?;
+                        let mut view = candidate.view.clone();
+                        view.candidate = Some(handle);
+                        Some(Candidate {
+                            backend: CandidateBackend::Remote(RemoteCandidate {
+                                view,
+                                handle,
+                                base: base.clone(),
+                            }),
+                            #[cfg(any(test, feature = "test-support"))]
+                            reject_next_state_write: Arc::new(AtomicBool::new(false)),
+                        })
+                    }
+                    crate::CandidateReconciliationResult::LiveMoved { .. }
+                    | crate::CandidateReconciliationResult::Conflict { .. } => {
+                        ensure!(
+                            handle.is_none(),
+                            "refused reconciliation returned a mutable handle"
+                        );
+                        None
+                    }
+                };
+                Ok(CandidateReconciliation {
+                    result,
+                    candidate: fresh,
+                })
+            }
+        }
+    }
+
+    /// Inspect the original supplied tuple without resending its mutation.
+    /// An unchanged head proves only NotCommitted, never an invented conflict.
+    pub async fn recover_reconciliation(
+        &self,
+        expected_head: &str,
+        expected_live: &str,
+    ) -> Result<Option<CandidateReconciliationRecovery>> {
+        store::validate_reconciliation_heads(expected_head, expected_live)?;
+        match &self.backend {
+            CandidateBackend::Local(candidate) => {
+                let recovery = candidate
+                    .reconciliation_outcome(expected_head, expected_live)
+                    .await?;
+                let resolution = match recovery.observation {
+                    store::CandidateReconciliationObservation::Committed { head } => {
+                        CandidateReconciliationResolution::Committed(head)
+                    }
+                    store::CandidateReconciliationObservation::NotCommitted => {
+                        CandidateReconciliationResolution::NotCommitted(
+                            recovery
+                                .status
+                                .context("uncommitted reconciliation has no checked status")?,
+                        )
+                    }
+                    store::CandidateReconciliationObservation::StillUncertain => {
+                        bail!("candidate reconciliation remains uncertain")
+                    }
+                };
+                let fresh = recovery
+                    .candidate
+                    .context("proved reconciliation has no fresh candidate")?;
+                Ok(Some(CandidateReconciliationRecovery {
+                    resolution,
+                    candidate: Candidate {
+                        backend: CandidateBackend::Local(fresh),
+                        #[cfg(any(test, feature = "test-support"))]
+                        reject_next_state_write: Arc::new(AtomicBool::new(false)),
+                    },
+                }))
+            }
+            CandidateBackend::Remote(candidate) => {
+                candidate
+                    .view
+                    .session
+                    .recover_reconciliation(
+                        &candidate.view.pinned_view,
+                        expected_head,
+                        expected_live,
+                    )
+                    .await
+            }
+        }
+    }
+
     async fn remote_transition(
         candidate: &RemoteCandidate,
         kind: CandidateTransitionKind,
@@ -5112,6 +5471,534 @@ mod tests {
             )
             .await;
         root.release(outcome)
+    }
+
+    #[tokio::test]
+    async fn candidate_reconciliation_managed_lost_reply_and_restart() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(2, 4),
+            "managed candidate reconciliation fixture",
+        );
+        for restart_owner in [false, true] {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let membership = format!("{scope}/ifs/membership");
+            let options =
+                crate::test_support::warmed_open_options(root.path().join("private"), scope)
+                    .await?;
+            let outcome = deadline
+                .serve(
+                    async |served| {
+                        let gate = crate::spawn_gate::spawning().await;
+                        let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                        served.serve(owner)?;
+                        let executable = std::env::current_exe()?;
+                        let memory = MemoryStore::open_managed_observed(
+                            options.clone(),
+                            project.clone(),
+                            executable.clone(),
+                        )
+                        .1
+                        .await?;
+                        memory.put(&membership, &json!({"parts":[]})).await?;
+                        let candidate = memory.begin_candidate("checked reconciliation").await?;
+                        let creation_base = candidate.base().to_owned();
+                        let private = candidate.view();
+                        private.put("dream/undo", &json!("candidate-owned")).await?;
+                        private
+                            .put(&membership, &json!({"parts":["dream"]}))
+                            .await?;
+                        let from = private.revision().await?;
+                        memory
+                            .put_many(&[
+                                ("session/live".into(), json!("SESSION_SENTINEL")),
+                                ("report/live".into(), json!(17)),
+                            ])
+                            .await?;
+                        let live = memory.revision().await?;
+                        let Backend::Remote(remote) = &private.backend else {
+                            bail!("reconciliation fixture is not managed");
+                        };
+                        let pause = Arc::new(service::rpc::ReplyPause::default());
+                        remote
+                            .attachment
+                            .lock()
+                            .await
+                            .pause_after_next_send(pause.clone());
+                        let writer = tokio::spawn({
+                            let candidate = candidate.clone();
+                            let from = from.clone();
+                            let live = live.clone();
+                            async move { candidate.reconcile_with_live(&from, &live).await }
+                        });
+                        let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                        tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                            .await
+                            .context("reconciliation frame was not flushed")?;
+                        let pending = remote
+                            .session
+                            .pending_reconciliation
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("pending reconciliation poisoned"))?
+                            .clone()
+                            .context("flushed reconciliation lost its tuple")?;
+                        ensure!(
+                            pending.branch == candidate.branch()
+                                && pending.from == from
+                                && pending.live == live
+                        );
+                        let mut witness =
+                            service::attach_or_start(&options, &project, &executable).await?;
+                        let unknown = witness
+                            .call(ServiceCall::CandidateReconciliationOutcome {
+                                original_id: Uuid::new_v4(),
+                                original_generation: pending.generation.clone(),
+                                branch: pending.branch.clone(),
+                                from: from.clone(),
+                                live: live.clone(),
+                            })
+                            .await?;
+                        ensure!(
+                            matches!(
+                                unknown,
+                                ServiceValue::CandidateReconciliationOutcome(
+                                    service::rpc::CandidateReconciliationOutcome::StillUncertain
+                                )
+                            ),
+                            "unknown same-generation request invented persisted proof"
+                        );
+                        let proof = witness
+                            .call(ServiceCall::CandidateReconciliationOutcome {
+                                original_id: pending.id,
+                                original_generation: pending.generation.clone(),
+                                branch: pending.branch.clone(),
+                                from: from.clone(),
+                                live: live.clone(),
+                            })
+                            .await?;
+                        let ServiceValue::CandidateReconciliationOutcome(
+                            service::rpc::CandidateReconciliationOutcome::Committed {
+                                status, ..
+                            },
+                        ) = proof
+                        else {
+                            bail!("exact accepted reconciliation had no committed proof");
+                        };
+                        let merged = status.head.context("committed proof has no head")?;
+                        ensure!(
+                            status.base.as_deref() == Some(live.as_str())
+                                && merged != from
+                                && merged != live
+                        );
+                        witness.close();
+                        writer.abort();
+                        ensure!(
+                            tokio::time::timeout(Duration::from_secs(5), writer)
+                                .await?
+                                .is_err_and(|error| error.is_cancelled())
+                        );
+                        ensure!(memory.put("fenced", &json!(true)).await.is_err());
+                        ensure!(
+                            candidate
+                                .recover_reconciliation(&from, &creation_base)
+                                .await
+                                .is_err(),
+                            "different selected live tuple resolved a pending request"
+                        );
+                        let gate = if restart_owner {
+                            let Backend::Remote(main_remote) = &memory.backend else {
+                                bail!("managed main view lost");
+                            };
+                            main_remote.attachment.lock().await.close();
+                            remote.attachment.lock().await.close();
+                            let ((), gate) = crate::spawn_gate::excluding_spawns(gate, async {
+                                let permit = tokio::time::timeout(
+                                    service::maintenance_deadline(&options),
+                                    async {
+                                        loop {
+                                            match service::acquire_maintenance_permit(&options)
+                                                .await
+                                            {
+                                                Ok(permit) => break Ok::<_, anyhow::Error>(permit),
+                                                Err(error)
+                                                    if error.to_string().contains(
+                                                        "memory service has active clients",
+                                                    ) =>
+                                                {
+                                                    tokio::time::sleep(Duration::from_millis(20))
+                                                        .await
+                                                }
+                                                Err(error) => break Err(error),
+                                            }
+                                        }
+                                    },
+                                )
+                                .await
+                                .context("reconciliation old clients did not drain")??;
+                                served
+                                    .reap(
+                                        owner_reap_within(),
+                                        "reconciliation old owner did not reap",
+                                    )
+                                    .await?;
+                                drop(permit);
+                                served.serve(
+                                    service::ServiceOwner::open(options.clone(), &project).await?,
+                                )
+                            })
+                            .await?;
+                            gate
+                        } else {
+                            gate
+                        };
+                        // Lease ownership is available while the original mutation
+                        // fence remains intact, including after checked owner reap.
+                        let lease = memory.acquire_dream_lease().await?;
+                        ensure!(memory.put("still-fenced", &json!(true)).await.is_err());
+                        ensure!(
+                            private
+                                .put("private-still-fenced", &json!(true))
+                                .await
+                                .is_err()
+                        );
+                        let recovered = candidate
+                            .recover_reconciliation(&from, &live)
+                            .await?
+                            .context("accepted reconciliation lost its recovery")?;
+                        ensure!(
+                            recovered.resolution
+                                == CandidateReconciliationResolution::Committed(merged.clone())
+                        );
+                        let fresh = recovered.candidate;
+                        ensure!(
+                            fresh.branch() == candidate.branch()
+                                && fresh.base() == live
+                                && candidate.base() == creation_base
+                        );
+                        let active = if restart_owner {
+                            memory
+                                .reopen_after_checked_recovery()
+                                .await?
+                                .context("recovered main did not rebind")?
+                        } else {
+                            memory.clone()
+                        };
+                        ensure!(active.revision().await? == live);
+                        ensure!(fresh.view().get("report/live").await? == Some(json!(17)));
+                        ensure!(fresh.promote_exact(&merged).await? == merged);
+                        ensure!(
+                            active.get("session/live").await? == Some(json!("SESSION_SENTINEL"))
+                        );
+                        ensure!(active.get("dream/undo").await? == Some(json!("candidate-owned")));
+                        ensure!(
+                            active
+                                .get_versioned("report/live")
+                                .await?
+                                .context("live report absent")?
+                                .version
+                                == 0
+                        );
+                        active.put("after-proof", &json!(true)).await?;
+                        drop(lease);
+                        active.close().await?;
+                        memory.close().await?;
+                        drop(gate);
+                        Ok::<(), anyhow::Error>(())
+                    },
+                    async |served| {
+                        served
+                            .retire(
+                                &options,
+                                None,
+                                owner_reap_within(),
+                                "reconciliation final owner did not reap",
+                            )
+                            .await
+                    },
+                )
+                .await;
+            root.release(outcome)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_reconciliation_lost_fast_forward_noop_and_conflict_are_exact() -> Result<()>
+    {
+        crate::test_support::warm_runtime_cache().await?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(6, 6),
+            "managed terminal reconciliation outcomes",
+        );
+        for restart_owner in [false, true] {
+            for kind in ["fast-forward", "unchanged", "conflict"] {
+                let root = crate::test_support::tempdir()?;
+                let project = root.path().join("project");
+                std::fs::create_dir(&project)?;
+                let project = project.canonicalize()?;
+                let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+                let scope = format!(
+                    "project/{}",
+                    digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                );
+                let membership = format!("{scope}/ifs/membership");
+                let options =
+                    crate::test_support::warmed_open_options(root.path().join("private"), scope)
+                        .await?;
+                let outcome = deadline
+                    .serve(
+                        async |served| {
+                            let gate = crate::spawn_gate::spawning().await;
+                            served.serve(
+                                service::ServiceOwner::open(options.clone(), &project).await?,
+                            )?;
+                            let executable = std::env::current_exe()?;
+                            let memory = MemoryStore::open_managed_observed(
+                                options.clone(),
+                                project.clone(),
+                                executable.clone(),
+                            )
+                            .1
+                            .await?;
+                            memory.put(&membership, &json!({"parts":[]})).await?;
+                            let candidate = memory.begin_candidate("lost terminal outcome").await?;
+                            let private = candidate.view();
+                            if kind != "fast-forward" {
+                                private.put("private-only", &json!("retained")).await?;
+                            }
+                            if kind == "conflict" {
+                                private.put(&membership, &json!({"parts":["same"]})).await?;
+                            }
+                            let from = private.revision().await?;
+                            if kind != "unchanged" {
+                                memory.put("live-only", &json!("retained")).await?;
+                            }
+                            if kind == "conflict" {
+                                memory.put(&membership, &json!({"parts":["same"]})).await?;
+                            }
+                            let live = memory.revision().await?;
+                            let Backend::Remote(remote) = &private.backend else {
+                                bail!("terminal fixture is not managed");
+                            };
+                            let pause = Arc::new(service::rpc::ReplyPause::default());
+                            remote
+                                .attachment
+                                .lock()
+                                .await
+                                .pause_after_next_send(pause.clone());
+                            let writer = tokio::spawn({
+                                let candidate = candidate.clone();
+                                let from = from.clone();
+                                let live = live.clone();
+                                async move { candidate.reconcile_with_live(&from, &live).await }
+                            });
+                            let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                                .await
+                                .context("terminal reconciliation frame not sent")?;
+                            let pending = remote
+                                .session
+                                .pending_reconciliation
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("pending reconciliation poisoned"))?
+                                .clone()
+                                .context("terminal request tuple missing")?;
+                            let mut witness =
+                                service::attach_or_start(&options, &project, &executable).await?;
+                            let proof = tokio::time::timeout(OWNER_COMMIT_WITHIN, async {
+                                loop {
+                                    let reply = witness
+                                        .call(ServiceCall::CandidateReconciliationOutcome {
+                                            original_id: pending.id,
+                                            original_generation: pending.generation.clone(),
+                                            branch: pending.branch.clone(),
+                                            from: from.clone(),
+                                            live: live.clone(),
+                                        })
+                                        .await?;
+                                    if matches!(
+                                        reply,
+                                        ServiceValue::CandidateReconciliationOutcome(
+                                            service::rpc::CandidateReconciliationOutcome::InFlight
+                                        )
+                                    ) {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                        continue;
+                                    }
+                                    break Ok::<_, anyhow::Error>(reply);
+                                }
+                            })
+                            .await
+                            .context("terminal worker did not settle")??;
+                            match proof {
+                                ServiceValue::CandidateReconciliationOutcome(
+                                    service::rpc::CandidateReconciliationOutcome::Committed {
+                                        status,
+                                        ..
+                                    },
+                                ) if kind == "fast-forward" => {
+                                    ensure!(
+                                        status.head.as_deref() == Some(live.as_str())
+                                            && status.base.as_deref() == Some(live.as_str())
+                                    );
+                                }
+                                ServiceValue::CandidateReconciliationOutcome(
+                                    service::rpc::CandidateReconciliationOutcome::NotCommitted {
+                                        status,
+                                        ..
+                                    },
+                                ) if kind != "fast-forward" => {
+                                    ensure!(status.head.as_deref() == Some(from.as_str()));
+                                }
+                                _ => bail!("terminal {kind} proof invented a different outcome"),
+                            }
+                            witness.close();
+                            writer.abort();
+                            ensure!(
+                                tokio::time::timeout(Duration::from_secs(5), writer)
+                                    .await?
+                                    .is_err_and(|error| error.is_cancelled())
+                            );
+                            ensure!(memory.put("before-proof", &json!(1)).await.is_err());
+                            let gate = if restart_owner {
+                                let Backend::Remote(main) = &memory.backend else {
+                                    bail!("main not managed");
+                                };
+                                main.attachment.lock().await.close();
+                                remote.attachment.lock().await.close();
+                                let ((), gate) = crate::spawn_gate::excluding_spawns(gate, async {
+                                    let permit = tokio::time::timeout(
+                                        service::maintenance_deadline(&options),
+                                        async {
+                                            loop {
+                                                match service::acquire_maintenance_permit(&options)
+                                                    .await
+                                                {
+                                                    Ok(permit) => {
+                                                        break Ok::<_, anyhow::Error>(permit);
+                                                    }
+                                                    Err(error)
+                                                        if error.to_string().contains(
+                                                            "memory service has active clients",
+                                                        ) =>
+                                                    {
+                                                        tokio::time::sleep(Duration::from_millis(
+                                                            20,
+                                                        ))
+                                                        .await
+                                                    }
+                                                    Err(error) => break Err(error),
+                                                }
+                                            }
+                                        },
+                                    )
+                                    .await
+                                    .context("terminal old attachments did not drain")??;
+                                    served
+                                        .reap(
+                                            owner_reap_within(),
+                                            "terminal old owner did not reap",
+                                        )
+                                        .await?;
+                                    drop(permit);
+                                    served.serve(
+                                        service::ServiceOwner::open(options.clone(), &project)
+                                            .await?,
+                                    )
+                                })
+                                .await?;
+                                gate
+                            } else {
+                                gate
+                            };
+                            let recovered = candidate
+                                .recover_reconciliation(&from, &live)
+                                .await?
+                                .context("terminal outcome lacked recovery")?;
+                            let head = if kind == "fast-forward" {
+                                ensure!(
+                                    recovered.resolution
+                                        == CandidateReconciliationResolution::Committed(
+                                            live.clone()
+                                        )
+                                );
+                                live.clone()
+                            } else {
+                                let CandidateReconciliationResolution::NotCommitted(status) =
+                                    recovered.resolution
+                                else {
+                                    bail!("unchanged/refused request invented committed proof");
+                                };
+                                ensure!(status.head.as_deref() == Some(from.as_str()));
+                                ensure!(
+                                    matches!(status.state, store::CandidateRefState::OpenConflict)
+                                        == (kind == "conflict")
+                                );
+                                from.clone()
+                            };
+                            let fresh = recovered.candidate;
+                            ensure!(
+                                fresh.branch() == candidate.branch()
+                                    && fresh.view().revision().await? == head
+                            );
+                            let active = if restart_owner {
+                                memory
+                                    .reopen_after_checked_recovery()
+                                    .await?
+                                    .context("terminal main failed to rebind")?
+                            } else {
+                                memory.clone()
+                            };
+                            ensure!(active.revision().await? == live);
+                            if kind == "conflict" {
+                                ensure!(
+                                    active.get(&membership).await?
+                                        == Some(json!({"parts":["same"]}))
+                                );
+                                ensure!(
+                                    fresh.view().get("private-only").await?
+                                        == Some(json!("retained"))
+                                );
+                            }
+                            active.put("after-proof", &json!(1)).await?;
+                            fresh.abandon_exact(&head).await?;
+                            active.close().await?;
+                            memory.close().await?;
+                            drop(gate);
+                            Ok::<(), anyhow::Error>(())
+                        },
+                        async |served| {
+                            served
+                                .retire(
+                                    &options,
+                                    None,
+                                    owner_reap_within(),
+                                    "terminal reconciliation owner did not reap",
+                                )
+                                .await
+                        },
+                    )
+                    .await;
+                root.release(
+                    outcome.with_context(|| format!("kind={kind}, restart_owner={restart_owner}")),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

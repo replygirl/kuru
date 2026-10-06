@@ -148,10 +148,18 @@ periodic and session-end triggers share the same validation path.
 Each dream runs on a candidate branch, including its actor histories, summaries,
 tool receipts and proposed membership. The candidate's coherent membership is
 read before proposal inference; its writes do not change session focus or live
-modeled-state reports. Promotion requires the recorded live base;
-an interruption before promotion or a stale candidate leaves active memory intact.
-An accepted promotion may finish after cancellation; the runtime reconciles its
-durable result before further work. Undo adds a new
+modeled-state reports. The project service serializes dream writers through its
+owned lease, including inference and recovery; ordinary memory writes do not hold
+that lease. If live memory advances, the runtime reconciles the exact captured
+live revision into the private candidate before checked fast-forward promotion.
+An independently advanced membership token conflicts when the dream also changed
+that membership, even if the resulting row values are identical. Reports, session
+rows and nonoverlapping histories remain intact. The retained retry count bounds
+reconciliation to three attempts without repeating inference.
+An accepted merge or promotion may finish after cancellation; exact branch/head/
+live evidence settles it before further writes. Recovery checks the new effective
+base and rebinds the checked main successor before publishing shared state. Undo
+uses the same dream lease and adds a new
 revision restoring membership while retaining later conversations, modeled-state
 reports and choices. Historical full-topology undo records remain readable, but
 their old focus and reports are not restored.

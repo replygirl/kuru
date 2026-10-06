@@ -15,6 +15,37 @@ built-ins, filtered MCP metadata, and a `disabled`, `live`, `stale`, or
 tool on a live MCP alias; names are generated to stay distinct across servers.
 Stale cached metadata is inspectable but cannot be routed or treated as a grant.
 
+## Tool cards
+
+In the terminal conversation, <kbd>F6</kbd> selects the next observed tool call
+and <kbd>F7</kbd> expands or collapses its card. Permission prompts, pickers and
+prompt search keep their own key handling. <kbd>Page Up</kbd> and
+<kbd>Page Down</kbd> scroll expanded details without changing your draft.
+Calls keep their admitted order even when parallel results arrive out of order.
+The header distinguishes pending, complete, failed, denied, cancelled and
+interrupted calls. An interrupted call with no exact settlement says its
+outcome is unavailable; a partial preview does not prove success or no effects.
+
+External arguments and results pass through Kuru's credential projection and
+display bounds. Shell stdout and stderr have separate partial previews;
+truncation or omitted updates is marked, and the settled result remains
+authoritative. Private cognitive and peer-message arguments and results are
+withheld. Expanding a card never invokes or retries a tool.
+
+File-write, edit and delete cards read the exact checked checkpoint's retained
+before/after snapshots. They do not compare the current workspace. Missing,
+pruned, uncertain, binary, oversized or corrupt snapshots show an unavailable
+label. Explicit checkpoint pruning can therefore remove a card's diff without
+changing the conversation or current file. The diff marks a missing final
+newline and displays bounded text after credential projection.
+
+Detailed cards are temporary in the current harness and session, bounded to
+64 calls and a 1 MiB presentation window. Older evicted detail is marked
+unavailable. Resume, historical replay and completed-turn retries cannot
+recreate missing tool bodies or admission order; they do not rerun tools to
+populate cards. The saved public conversation and private actor memories are
+unchanged by these display limits.
+
 ## Built-in tools
 
 A [`[[permissions]]` rule](./configuration#tool-permissions) can `allow`, `ask`, or `deny` any of these by exact name, and can additionally pattern-match file mutations — `file_write`, `file_edit` (sharing `file_write`'s selector), and `file_delete` — by anchored, project-relative path. Absent a matching rule, reads and listing stay allowed; `file_write`/`file_edit`/`file_delete` fall back to `allow_write`, while `shell` and `web_fetch` ask for approval. Add an explicit `deny` rule to refuse a tool outright.

@@ -4,7 +4,10 @@ use kuru_core::{
     ActorPhase, Config, Mode, Part, ToolSpec, canonical_peer_instruction,
     validate_consolidation_plan,
 };
-use kuru_memory::{Candidate, CandidateConflict, MemoryStore, StateExpectation};
+use kuru_memory::{
+    Candidate, CandidateConflict, CandidateReconciliationResolution, CandidateReconciliationResult,
+    MemoryStore, StateExpectation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -12,16 +15,17 @@ use uuid::Uuid;
 use crate::{
     Event,
     engine::{
-        CancellationToken, CandidatePromotionStatus, Harness, OfferedTools,
-        PendingCandidateResolution, PendingPublication, PublicationProof, PublicationScope,
-        Session, ToolHookAdmission, Topology, checked_state_keys, prepared_actor_namespaces,
-        run_post_tool_hooks, spec, turn_was_cancelled, user, validate_topology_with_profile,
+        CancellationToken, CandidatePromotionStatus, CandidateResolutionRequired, Harness,
+        OfferedTools, PendingCandidateResolution, PendingPublication, PublicationProof,
+        PublicationScope, Session, ToolHookAdmission, Topology, checked_state_keys,
+        prepared_actor_namespaces, run_post_tool_hooks, spec, turn_was_cancelled, user,
+        validate_topology_with_profile,
     },
     topology_state::{self, MembershipRecord},
 };
 
 #[cfg(test)]
-use crate::engine::{CandidateResolutionRequired, read_topology};
+use crate::engine::read_topology;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -335,46 +339,242 @@ impl Harness {
                 target: target.clone(),
                 report: report.clone(),
                 status: CandidatePromotionStatus::Pending,
+                reconciliation_attempts: 0,
             },
             scope: PublicationScope::Membership { session: false },
         });
         #[cfg(test)]
         self.pause_before_dream_promotion().await?;
+        self.drive_dream_promotion(true, cancellation).await?;
         #[cfg(test)]
-        if let Some(barrier) = self.dream_transition_reply_pause.take() {
-            memory.fixture_pause_next_service_reply(&barrier).await?;
-        }
-        let promoted = match candidate.promote_exact(&target).await {
-            Ok(revision) => revision,
-            Err(error) if error.is::<CandidateConflict>() => {
-                // The direct local store returned a definite stale-ref result.
-                // Remote transport loss takes the typed outcome-query path.
+        self.pause_after_memory_write().await?;
+        self.publish_pending_dream().await?;
+        Ok(())
+    }
+
+    /// Continue only the already staged dream. The retained counter bounds live
+    /// movement retries across cancellation and recovery as well as one call.
+    pub(crate) async fn drive_dream_promotion(
+        &mut self,
+        mut reconcile_first: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        loop {
+            cancellation.check()?;
+            let candidate = self
+                .pending_candidate
+                .clone()
+                .context("staged dream lost its checked candidate")?;
+            let Some(PendingPublication {
+                proof:
+                    PublicationProof::CandidatePromotion {
+                        base,
+                        target,
+                        reconciliation_attempts,
+                        ..
+                    },
+                ..
+            }) = self.pending_publication.as_ref()
+            else {
+                anyhow::bail!("staged dream lost its publication proof");
+            };
+            ensure!(candidate.base() == base, "dream candidate base changed");
+            let target = target.clone();
+            if reconcile_first {
+                if *reconciliation_attempts >= 3 {
+                    self.mark_dream_open(true)?;
+                    return Err(CandidateResolutionRequired(
+                        "live memory kept moving; dream candidate remains open for explicit resolution",
+                    ).into());
+                }
+                let live = self.memory.revision().await?;
                 if let Some(PendingPublication {
-                    proof: PublicationProof::CandidatePromotion { status, .. },
+                    proof:
+                        PublicationProof::CandidatePromotion {
+                            status,
+                            reconciliation_attempts,
+                            ..
+                        },
                     ..
                 }) = &mut self.pending_publication
                 {
-                    *status = CandidatePromotionStatus::OpenConflict;
+                    *reconciliation_attempts += 1;
+                    *status = CandidatePromotionStatus::Reconciling {
+                        from: target.clone(),
+                        live: live.clone(),
+                    };
                 }
-                return Err(error);
+                let outcome = candidate.reconcile_with_live(&target, &live).await?;
+                match outcome.result {
+                    CandidateReconciliationResult::Reconciled { head, base }
+                    | CandidateReconciliationResult::Unchanged { head, base } => {
+                        ensure!(
+                            base == live,
+                            "dream reconciliation changed its selected live base"
+                        );
+                        self.adopt_reconciled_dream(
+                            outcome
+                                .candidate
+                                .context("reconciled dream lost its fresh handle")?,
+                            head,
+                        )?;
+                    }
+                    CandidateReconciliationResult::LiveMoved { .. } => {
+                        // A terminal no-effect reply is not an in-flight merge.
+                        // Keep its consumed attempt, but discard that pending tuple.
+                        if let Some(PendingPublication {
+                            proof: PublicationProof::CandidatePromotion { status, .. },
+                            ..
+                        }) = &mut self.pending_publication
+                        {
+                            *status = CandidatePromotionStatus::Pending;
+                        }
+                        continue;
+                    }
+                    CandidateReconciliationResult::Conflict { .. } => {
+                        self.mark_dream_open(true)?;
+                        return Err(CandidateConflict.into());
+                    }
+                }
             }
-            Err(error) => return Err(error),
-        };
+            cancellation.check()?;
+            let candidate = self
+                .pending_candidate
+                .clone()
+                .context("reconciled dream lost its checked candidate")?;
+            let Some(PendingPublication {
+                proof: PublicationProof::CandidatePromotion { target, .. },
+                ..
+            }) = self.pending_publication.as_ref()
+            else {
+                anyhow::bail!("reconciled dream lost its publication proof");
+            };
+            let target = target.clone();
+            // Adoption above replaces handle, effective base and target before
+            // the facade captures the next exact promotion tuple.
+            #[cfg(test)]
+            if let Some(barrier) = self.dream_transition_reply_pause.take() {
+                candidate
+                    .view()
+                    .fixture_pause_next_service_reply(&barrier)
+                    .await?;
+            }
+            match candidate.promote_exact(&target).await {
+                Ok(promoted) => {
+                    ensure!(
+                        promoted == target,
+                        "dream promoted a different candidate revision"
+                    );
+                    if let Some(PendingPublication {
+                        proof: PublicationProof::CandidatePromotion { status, .. },
+                        ..
+                    }) = &mut self.pending_publication
+                    {
+                        *status = CandidatePromotionStatus::Confirmed(promoted);
+                    }
+                    return Ok(());
+                }
+                Err(error) if error.is::<CandidateConflict>() => reconcile_first = true,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn adopt_reconciled_dream(&mut self, candidate: Candidate, head: String) -> Result<()> {
+        let previous = self
+            .pending_candidate
+            .as_ref()
+            .context("reconciled dream lost its original branch")?;
         ensure!(
-            promoted == target,
-            "dream promoted a different candidate revision"
+            previous.branch() == candidate.branch(),
+            "dream reconciliation changed its branch"
         );
-        if let Some(PendingPublication {
+        let Some(PendingPublication {
+            proof:
+                PublicationProof::CandidatePromotion {
+                    base,
+                    target,
+                    status,
+                    ..
+                },
+            ..
+        }) = &mut self.pending_publication
+        else {
+            anyhow::bail!("reconciled dream lost its publication proof");
+        };
+        *base = candidate.base().to_owned();
+        *target = head;
+        *status = CandidatePromotionStatus::Pending;
+        self.pending_candidate = Some(candidate);
+        Ok(())
+    }
+
+    fn mark_dream_open(&mut self, conflict: bool) -> Result<()> {
+        let Some(PendingPublication {
             proof: PublicationProof::CandidatePromotion { status, .. },
             ..
         }) = &mut self.pending_publication
-        {
-            *status = CandidatePromotionStatus::Confirmed(promoted);
-        }
-        #[cfg(test)]
-        self.pause_after_memory_write().await?;
-        self.publish_pending();
+        else {
+            anyhow::bail!("open dream lost its publication proof");
+        };
+        *status = if conflict {
+            CandidatePromotionStatus::OpenConflict
+        } else {
+            CandidatePromotionStatus::OpenUnchanged
+        };
+        self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
         Ok(())
+    }
+
+    pub(crate) async fn recover_dream_reconciliation(
+        &mut self,
+        candidate: &Candidate,
+        from: &str,
+        live: &str,
+    ) -> Result<()> {
+        let Some(recovery) = candidate.recover_reconciliation(from, live).await? else {
+            // A drop before the facade installed a request cannot prove a merge.
+            let inspected = self.memory.candidate_ref_status(candidate.branch()).await?;
+            ensure!(
+                inspected.head.as_deref() == Some(from)
+                    && inspected.base.as_deref() == Some(candidate.base()),
+                "unsent dream reconciliation changed its exact candidate"
+            );
+            match inspected.state {
+                kuru_memory::CandidateRefState::OpenUnchanged => self.mark_dream_open(false)?,
+                kuru_memory::CandidateRefState::OpenConflict => self.mark_dream_open(true)?,
+                _ => anyhow::bail!("dream reconciliation remains unproved"),
+            }
+            return Err(CandidateResolutionRequired(
+                "dream reconciliation was not committed; explicit resolution is required",
+            )
+            .into());
+        };
+        match recovery.resolution {
+            CandidateReconciliationResolution::Committed(head) => {
+                ensure!(
+                    recovery.candidate.base() == live,
+                    "recovered dream changed its selected live base"
+                );
+                self.adopt_reconciled_dream(recovery.candidate, head)
+            }
+            CandidateReconciliationResolution::NotCommitted(status) => {
+                ensure!(
+                    status.head.as_deref() == Some(from),
+                    "uncommitted dream head changed"
+                );
+                self.adopt_reconciled_dream(recovery.candidate, from.to_owned())?;
+                match status.state {
+                    kuru_memory::CandidateRefState::OpenUnchanged => self.mark_dream_open(false)?,
+                    kuru_memory::CandidateRefState::OpenConflict => self.mark_dream_open(true)?,
+                    _ => anyhow::bail!("uncommitted dream is not an exact open candidate"),
+                }
+                Err(CandidateResolutionRequired(
+                    "dream reconciliation was not committed; explicit resolution is required",
+                )
+                .into())
+            }
+        }
     }
 
     async fn resolve_candidate_outcome(
@@ -394,7 +594,12 @@ impl Harness {
                         .is_some_and(|retained| { retained.branch() == candidate.branch() }),
                     "dream lost its exact pending candidate"
                 );
-                self.pending_candidate_resolution = PendingCandidateResolution::AutomaticCleanup;
+                // Staged reconciliation/promotion must retain its exact proof.
+                // A definite conflict is already marked Explicit by the driver.
+                if self.pending_publication.is_none() {
+                    self.pending_candidate_resolution =
+                        PendingCandidateResolution::AutomaticCleanup;
+                }
                 Err(error)
             }
         }
@@ -552,6 +757,7 @@ impl Harness {
 
     pub async fn undo_dream(&mut self) -> Result<()> {
         self.reconcile().await?;
+        let _dream_lease = self.memory.acquire_dream_lease().await?;
         let undo = prepare_undo_dream(
             &self.config,
             &self.scope,
@@ -580,6 +786,7 @@ pub async fn undo_dream(
     memory: &MemoryStore,
     resume: Option<&str>,
 ) -> Result<()> {
+    let _dream_lease = memory.acquire_dream_lease().await?;
     let undo = prepare_undo_dream(config, scope, memory, resume, None).await?;
     memory
         .put_many_conditional(
@@ -725,6 +932,327 @@ mod cancellation_tests {
         }
     }
 
+    struct SerialDreamProvider {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Semaphore,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl kuru_connectors::Provider for SerialDreamProvider {
+        async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn complete(
+            &self,
+            request: kuru_core::CompletionRequest,
+        ) -> Result<kuru_core::Completion> {
+            ensure!(request.instructions.contains("Phase: dream"));
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered
+                .send(())
+                .map_err(|_| anyhow::anyhow!("serial dream observer disappeared"))?;
+            self.release.acquire().await?.forget();
+            Ok(kuru_core::Completion::from_legacy(
+                "owned serialized summary",
+                vec![],
+                0,
+                0,
+            ))
+        }
+
+        async fn stream(
+            &self,
+            request: kuru_core::CompletionRequest,
+            sink: &mut dyn kuru_connectors::ProviderSink,
+        ) -> Result<()> {
+            sink.emit(kuru_connectors::ProviderEvent::Completed(
+                self.complete(request).await?,
+            ))
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_dreams_serialize_inference_while_ordinary_writes_progress() -> Result<()> {
+        kuru_memory::test_support::closing(async {
+            use futures::FutureExt as _;
+            let project_dir = tempfile::tempdir()?;
+            let project = project_dir.path().canonicalize()?;
+            let data = kuru_memory::test_support::tempdir()?;
+            let options = kuru_memory::test_support::warmed_open_options(data.path().into(), crate::project_scope(&project)?).await?;
+            let executable = options.supervisor.clone().context("serial dream supervisor absent")?;
+            let mut opened = Vec::new();
+            let mut harnesses = Vec::new();
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let first_memory = MemoryStore::open_managed_observed(options.clone(), project.clone(), executable.clone()).1.await?;
+                opened.push(first_memory.clone());
+                let second_memory = MemoryStore::open_managed_observed(options.clone(), project.clone(), executable).1.await?;
+                opened.push(second_memory.clone());
+                let (first_entered, mut first_events) = tokio::sync::mpsc::unbounded_channel();
+                let (second_entered, mut second_events) = tokio::sync::mpsc::unbounded_channel();
+                let first_provider = Arc::new(SerialDreamProvider { entered: first_entered, release: tokio::sync::Semaphore::new(0), calls: std::sync::atomic::AtomicUsize::new(0) });
+                let second_provider = Arc::new(SerialDreamProvider { entered: second_entered, release: tokio::sync::Semaphore::new(0), calls: std::sync::atomic::AtomicUsize::new(0) });
+                harnesses.push(Harness::new(config(), &project, first_memory.clone(), first_provider.clone(), None).await?);
+                harnesses.push(Harness::new(config(), &project, second_memory.clone(), second_provider.clone(), None).await?);
+                let (left, right) = harnesses.split_at_mut(1);
+                let first = &mut left[0];
+                let second = &mut right[0];
+                let participants = first.topology.parts.len();
+                let mut first_work = Box::pin(first.dream());
+                for _ in 0..participants {
+                    tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+                        tokio::select! {
+                            event = first_events.recv() => event.context("first provider events closed"),
+                            result = &mut first_work => anyhow::bail!("first dream returned before held inference: {result:?}"),
+                        }
+                    }).await.context("first provider did not enter held inference")??;
+                }
+                let mut second_work = Box::pin(second.dream());
+                tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+                    tokio::select! {
+                        result = second_memory.fixture_wait_for_dream_lease_refusal() => result,
+                        result = &mut second_work => anyhow::bail!("second dream returned before owned lease refusal: {result:?}"),
+                        result = &mut first_work => anyhow::bail!("first held dream unexpectedly returned: {result:?}"),
+                    }
+                }).await.context("second dream did not reach its owned lease wait")??;
+                ensure!(second_provider.calls.load(std::sync::atomic::Ordering::SeqCst) == 0);
+                second_memory.append("ordinary-live", "user", "while first inference held").await?;
+                ensure!(second_provider.calls.load(std::sync::atomic::Ordering::SeqCst) == 0);
+                first_provider.release.add_permits(participants);
+                ensure!(first_work.await?.summaries == participants);
+                for _ in 0..participants {
+                    tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+                        tokio::select! {
+                            event = second_events.recv() => event.context("second provider events closed"),
+                            result = &mut second_work => anyhow::bail!("second dream returned before held inference: {result:?}"),
+                        }
+                    }).await.context("released lease did not admit second inference")??;
+                }
+                second_provider.release.add_permits(participants);
+                ensure!(second_work.await?.summaries == participants);
+                ensure!(first_provider.calls.load(std::sync::atomic::Ordering::SeqCst) == participants);
+                ensure!(second_provider.calls.load(std::sync::atomic::Ordering::SeqCst) == participants);
+                ensure!(first_memory.history("ordinary-live", 10).await?[0].plain_text() == Some("while first inference held"));
+                Ok::<(), anyhow::Error>(())
+            }).catch_unwind().await;
+            let mut cleanup_errors = Vec::new();
+            for harness in &mut harnesses {
+                if let Err(error) = harness.shutdown(false).await { cleanup_errors.push(format!("shutdown: {error:#}")); }
+                opened.push(harness.memory.clone());
+                if let Some(candidate) = &harness.pending_candidate { opened.push(candidate.view()); }
+            }
+            for memory in opened { if let Err(error) = memory.close().await { cleanup_errors.push(format!("close: {error:#}")); } }
+            if let Err(error) = kuru_memory::test_support::await_managed_quiescence(&options).await { cleanup_errors.push(format!("quiescence: {error:#}")); }
+            match outcome {
+                Ok(result) => data.release(result.and_then(|()| { ensure!(cleanup_errors.is_empty(), "{}", cleanup_errors.join("; ")); Ok(()) })),
+                Err(panic) => { let _ = data.release::<()>(Err(anyhow::anyhow!("serial dream fixture panicked; cleanup: {}", cleanup_errors.join("; ")))); std::panic::resume_unwind(panic) }
+            }
+        }).await
+    }
+
+    async fn stage_reconciliation_dream(harness: &mut Harness) -> Result<Candidate> {
+        let original = harness.topology.clone();
+        let (topology, report) = harness.plan_dream(
+            &original,
+            vec![DreamProposal::Add {
+                name: "Checked reconciled peer".into(),
+                role: original.parts[0].role.clone(),
+                instruction: "Preserve independent live work".into(),
+            }],
+        )?;
+        let candidate = harness
+            .memory
+            .begin_candidate("runtime reconciliation")
+            .await?;
+        let keys = checked_state_keys(&harness.scope, &harness.profile)?;
+        let updates = vec![
+            (
+                keys.membership,
+                serde_json::to_value(MembershipRecord::from_topology(&topology))?,
+            ),
+            (
+                keys.dream_undo,
+                serde_json::to_value(MembershipRecord::from_topology(&original))?,
+            ),
+        ];
+        candidate.view().put_many(&updates).await?;
+        candidate
+            .view()
+            .append(
+                &format!("{}/{}/dream-log", harness.scope, harness.config.mode),
+                "dream",
+                &serde_json::to_string(&report)?,
+            )
+            .await?;
+        let target = candidate.view().revision().await?;
+        let actor_namespaces =
+            prepared_actor_namespaces(&harness.scope, &harness.profile, &topology)?;
+        harness.pending_candidate = Some(candidate.clone());
+        harness.pending_publication = Some(PendingPublication {
+            config: harness.config.clone(),
+            profile: harness.profile.clone(),
+            actor_namespaces,
+            topology,
+            session: harness.session.clone(),
+            updates,
+            proof: PublicationProof::CandidatePromotion {
+                base: candidate.base().to_owned(),
+                target,
+                report,
+                status: CandidatePromotionStatus::Pending,
+                reconciliation_attempts: 0,
+            },
+            scope: PublicationScope::Membership { session: false },
+        });
+        Ok(candidate)
+    }
+
+    #[tokio::test]
+    async fn reconciled_dream_retries_moved_promotion_and_retains_attempt_budget() -> Result<()> {
+        kuru_memory::test_support::closing(async {
+            let project = tempfile::tempdir()?;
+            let memory = MemoryStore::temporary().await?;
+            let mut harness = Harness::new(config(), project.path(), memory.clone(), Arc::new(DemoProvider), None).await?;
+            let original_count = harness.topology.parts.len();
+            let lease = memory.acquire_dream_lease().await?;
+            let candidate = stage_reconciliation_dream(&mut harness).await?;
+            let from = candidate.view().revision().await?;
+            memory.append("sibling/notes", "user", "before reconciliation").await?;
+            let first_live = memory.revision().await?;
+            let reconciled = candidate.reconcile_with_live(&from, &first_live).await?;
+            let CandidateReconciliationResult::Reconciled { head, .. } = reconciled.result else { anyhow::bail!("runtime fixture did not merge"); };
+            harness.adopt_reconciled_dream(reconciled.candidate.context("fresh handle absent")?, head)?;
+            let Some(PendingPublication { proof: PublicationProof::CandidatePromotion { reconciliation_attempts, .. }, .. }) = &mut harness.pending_publication else { anyhow::bail!("proof absent"); };
+            *reconciliation_attempts = 1;
+            memory.put("sibling/session", &json!({"focus":"later"})).await?;
+            memory.append("sibling/notes", "user", "between reconcile and promotion").await?;
+            let later_live = memory.revision().await?;
+            harness.drive_dream_promotion(false, &CancellationToken::new()).await?;
+            let Some(PendingPublication { proof: PublicationProof::CandidatePromotion { base, target, status, reconciliation_attempts, .. }, .. }) = &harness.pending_publication else { anyhow::bail!("proof absent"); };
+            ensure!(*reconciliation_attempts == 2 && *base == later_live);
+            ensure!(matches!(status, CandidatePromotionStatus::Confirmed(revision) if revision == target));
+            let accepted = target.clone();
+            let fresh = harness.pending_candidate.as_ref().context("accepted fresh handle absent")?.clone();
+            ensure!(fresh.promote_exact(&accepted).await? == accepted);
+            harness.publish_pending_dream().await?;
+            ensure!(harness.topology.parts.len() == original_count + 1);
+            ensure!(memory.history("sibling/notes", 10).await?.len() == 2);
+            ensure!(memory.get("sibling/session").await? == Some(json!({"focus":"later"})));
+            drop(lease);
+            harness.undo_dream().await?;
+            ensure!(harness.topology.parts.iter().filter(|part| part.active).count() == original_count);
+            ensure!(memory.history("sibling/notes", 10).await?.len() == 2);
+            // A resumed operation cannot reset a previously consumed budget.
+            let lease = memory.acquire_dream_lease().await?;
+            stage_reconciliation_dream(&mut harness).await?;
+            let Some(PendingPublication { proof: PublicationProof::CandidatePromotion { reconciliation_attempts, .. }, .. }) = &mut harness.pending_publication else { anyhow::bail!("proof absent"); };
+            *reconciliation_attempts = 3;
+            let live = memory.revision().await?;
+            ensure!(harness.drive_dream_promotion(true, &CancellationToken::new()).await.unwrap_err().is::<CandidateResolutionRequired>());
+            ensure!(memory.revision().await? == live);
+            drop(lease);
+            harness.abandon_pending_dream().await?;
+            harness.shutdown(false).await?;
+            memory.close().await
+        }).await
+    }
+
+    #[tokio::test]
+    async fn managed_reconciled_dream_recovers_lost_reply_and_adopts_new_promotion_tuple()
+    -> Result<()> {
+        kuru_memory::test_support::closing(async {
+            use futures::FutureExt as _;
+            for restart_owner in [false, true] {
+            let project_directory = tempfile::tempdir()?;
+            let project = project_directory.path().canonicalize()?;
+            let data = kuru_memory::test_support::tempdir()?;
+            let options = kuru_memory::test_support::warmed_open_options(data.path().to_owned(), crate::project_scope(&project)?).await?;
+            let executable = options.supervisor.clone().context("fixture supervisor absent")?;
+            let mut opened = Vec::new();
+            let mut retained_harness = None;
+            let outcome = std::panic::AssertUnwindSafe(async {
+            let memory = MemoryStore::open_managed_observed(options.clone(), project.clone(), executable.clone()).1.await?;
+            opened.push(memory.clone());
+            let sibling = MemoryStore::open_managed_observed(options.clone(), project.clone(), executable.clone()).1.await?;
+            opened.push(sibling.clone());
+            retained_harness = Some(Harness::new(config(), &project, memory.clone(), Arc::new(DemoProvider), None).await?);
+            let harness = retained_harness.as_mut().context("managed fixture harness absent")?;
+            let original_count = harness.topology.parts.len();
+            let lease = memory.acquire_dream_lease().await?;
+            let candidate = stage_reconciliation_dream(harness).await?;
+            let from = candidate.view().revision().await?;
+            sibling.append("sibling/notes", "user", "newer live history").await?;
+            let live = sibling.revision().await?;
+            let barrier = kuru_memory::test_support::ReplyBarrier::default();
+            candidate.view().fixture_pause_next_service_reply(&barrier).await?;
+            let cancellation = CancellationToken::new();
+            let mut operation = Box::pin(harness.drive_dream_promotion(true, &cancellation));
+            tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+                tokio::select! {
+                    () = barrier.wait_sent() => Ok::<(), anyhow::Error>(()),
+                    result = &mut operation => anyhow::bail!("reconciliation returned before paused reply: {result:?}"),
+                }
+            }).await.context("reconciliation frame was not sent")??;
+            tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+                loop {
+                    let status = sibling.candidate_ref_status(candidate.branch()).await?;
+                    if status.head.as_deref().is_some_and(|head| head != from) { break Ok::<(), anyhow::Error>(()); }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }).await.context("owner did not accept reconciliation")??;
+            drop(operation);
+            drop(lease);
+            ensure!(matches!(harness.pending_publication.as_ref().map(|pending| &pending.proof),
+                Some(PublicationProof::CandidatePromotion { status: CandidatePromotionStatus::Reconciling { from: retained_from, live: retained_live }, reconciliation_attempts: 1, .. }) if retained_from == &from && retained_live == &live));
+            ensure!(memory.put("fenced", &json!(true)).await.is_err());
+            if restart_owner {
+                candidate.view().close_transport_for_test().await?;
+                memory.close_transport_for_test().await?;
+                sibling.close_transport_for_test().await?;
+                kuru_memory::test_support::retire_idle_service(&options).await?;
+            }
+            harness.reconcile().await?;
+            ensure!(harness.topology.parts.len() == original_count + 1 && harness.pending_candidate.is_none());
+            let observer = if restart_owner {
+                ensure!(memory.revision().await.is_err());
+                MemoryStore::open_managed_observed(options.clone(), project.clone(), executable).1.await?
+            } else { sibling.clone() };
+            opened.push(observer.clone());
+            ensure!(observer.history("sibling/notes", 10).await?.len() == 1);
+            ensure!(observer.history(&format!("{}/{}/dream-log", harness.scope, harness.config.mode), 10).await?.len() == 1);
+            harness.reconcile().await?;
+            Ok::<(), anyhow::Error>(())
+            }).catch_unwind().await;
+            let mut cleanup_errors = Vec::new();
+            if let Some(harness) = &mut retained_harness {
+                if let Err(error) = harness.shutdown(false).await { cleanup_errors.push(format!("shutdown: {error:#}")); }
+                opened.push(harness.memory.clone());
+                if let Some(candidate) = &harness.pending_candidate { opened.push(candidate.view()); }
+            }
+            for memory in opened {
+                if let Err(error) = memory.close().await { cleanup_errors.push(format!("close: {error:#}")); }
+            }
+            if let Err(error) = kuru_memory::test_support::await_managed_quiescence(&options).await {
+                cleanup_errors.push(format!("quiescence: {error:#}"));
+            }
+            let outcome = match outcome {
+                Ok(result) => result.with_context(|| format!("restart_owner={restart_owner}; managed reconciliation cleanup: {}", cleanup_errors.join("; "))),
+                Err(panic) => {
+                    let _ = data.release::<()>(Err(anyhow::anyhow!("managed reconciliation fixture panicked; cleanup: {}", cleanup_errors.join("; "))));
+                    std::panic::resume_unwind(panic)
+                }
+            }.and_then(|()| {
+                ensure!(cleanup_errors.is_empty(), "{}", cleanup_errors.join("; "));
+                Ok(())
+            });
+            data.release(outcome)?;
+            }
+            Ok(())
+        }).await
+    }
+
     #[tokio::test]
     async fn cancelled_dream_keeps_an_accepted_candidate_write_isolated() {
         kuru_memory::test_support::closing(async {
@@ -827,6 +1355,7 @@ mod cancellation_tests {
             let expected = serde_json::to_value(&topology).unwrap();
             let before = memory.revision().await.unwrap();
             let candidate = memory.begin_candidate("accepted promotion").await.unwrap();
+            harness.pending_candidate = Some(candidate.clone());
             let original = harness.topology.clone();
             let expectation = StateExpectation::Version(
                 candidate
@@ -881,7 +1410,10 @@ mod cancellation_tests {
             result.unwrap();
             assert_eq!(memory.revision().await.unwrap(), accepted);
             assert!(candidate.view().revision().await.is_err());
-            assert_eq!(candidate.promote().await.unwrap(), accepted);
+            // Successful publication consumed the fresh handle and proof.
+            // The obsolete pre-reconciliation handle cannot replay that ref.
+            assert!(harness.pending_candidate.is_none());
+            assert!(candidate.promote().await.is_err());
             assert_eq!(serde_json::to_value(&harness.topology).unwrap(), expected);
             assert_eq!(
                 serde_json::to_value(
@@ -1091,6 +1623,7 @@ mod cancellation_tests {
                     target,
                     report,
                     status: CandidatePromotionStatus::Confirmed(promoted),
+                    reconciliation_attempts: 0,
                 },
                 scope: PublicationScope::Membership { session: false },
             });
@@ -1351,7 +1884,14 @@ mod cancellation_tests {
     async fn stale_dream_candidate_keeps_its_report_and_open_ref_until_explicit_abandon() {
         kuru_memory::test_support::closing(async {
             let project = tempfile::tempdir().unwrap();
-            let memory = MemoryStore::temporary().await.unwrap();
+            let data = kuru_memory::test_support::tempdir().unwrap();
+            let options = kuru_memory::test_support::warmed_open_options(
+                data.path().into(),
+                crate::project_scope(project.path()).unwrap(),
+            )
+            .await
+            .unwrap();
+            let memory = MemoryStore::open(options).await.unwrap();
             let mut harness = Harness::new(
                 config(),
                 project.path(),
@@ -1363,6 +1903,10 @@ mod cancellation_tests {
             .unwrap();
             let original_parts = harness.topology.parts.len();
             let role = harness.topology.parts[0].role.clone();
+            let membership = checked_state_keys(&harness.scope, &harness.profile)
+                .unwrap()
+                .membership;
+            let original_membership = memory.get(&membership).await.unwrap().unwrap();
             let (staged, release) = harness.pause_before_next_dream_promotion();
             let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
             let gap = crate::progress_wait::unhooked_gap_bound(&watch.hooks);
@@ -1380,10 +1924,7 @@ mod cancellation_tests {
                 .await
                 .expect("dream did not stage its candidate before promotion")
                 .unwrap();
-            memory
-                .append("sibling/notes", "user", "advance live before promotion")
-                .await
-                .unwrap();
+            memory.put(&membership, &original_membership).await.unwrap();
             let live_revision = memory.revision().await.unwrap();
             watch
                 .timings

@@ -694,6 +694,18 @@ async fn rewritten_file_read_is_checked_against_the_final_root_before_execution(
         )
         .unwrap();
         assert_eq!(receipt["call_id"], "root-check");
+        let cards = harness.tool_card_feed().snapshot().0;
+        let card = cards
+            .iter()
+            .find(|card| card.call_id == "root-check")
+            .unwrap();
+        assert_eq!(card.name, "file_read");
+        assert!(card.arguments.as_deref().unwrap().contains("outside.txt"));
+        assert!(!card.arguments.as_deref().unwrap().contains("first.txt"));
+        assert_eq!(
+            card.state,
+            crate::ToolCardState::Settled(crate::ToolOutcome::Error)
+        );
         assert_eq!(receipt["is_error"], true);
         assert!(!receipt.to_string().contains("ORIGINAL_FILE_SENTINEL"));
         assert!(!receipt.to_string().contains("OUTSIDE_FILE_SENTINEL"));
@@ -1213,6 +1225,16 @@ async fn parallel_post_hooks_settle_independently_but_rejoin_in_original_call_or
             })
             .collect::<Vec<_>>();
         assert_eq!(settled, ["parallel-second", "parallel-first"]);
+        let cards = harness.tool_card_feed().snapshot().0;
+        let reads = cards.iter().filter(|card| card.name == "file_read").collect::<Vec<_>>();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].call_id, "parallel-first");
+        assert_eq!(reads[1].call_id, "parallel-second");
+        assert!(reads[0].ordinal < reads[1].ordinal);
+        assert_ne!(reads[0].id, reads[1].id);
+        assert!(reads.iter().all(|card| card.state == crate::ToolCardState::Settled(crate::ToolOutcome::Ok)));
+        assert!(reads[0].output.as_deref().unwrap().contains("first bytes"));
+        assert!(reads[1].output.as_deref().unwrap().contains("second bytes"));
         let requests = provider.requests.lock().unwrap().clone();
         let continuation = requests
             .iter()

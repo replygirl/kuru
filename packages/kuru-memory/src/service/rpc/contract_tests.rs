@@ -393,6 +393,19 @@ pub(super) fn service_call_samples() -> Result<Vec<ServiceCall>> {
             base: "base".into(),
             target: "target".into(),
         },
+        ServiceCall::ReconcileCandidate {
+            handle: HANDLE,
+            branch: "branch".into(),
+            from: "from".into(),
+            live: "live".into(),
+        },
+        ServiceCall::CandidateReconciliationOutcome {
+            original_id: HANDLE,
+            original_generation: GENERATION.into(),
+            branch: "branch".into(),
+            from: "from".into(),
+            live: "live".into(),
+        },
         ServiceCall::CandidateTransitionOutcome {
             original_id: HANDLE,
             original_generation: GENERATION.into(),
@@ -518,6 +531,8 @@ const CLASSIFICATION: &[(&str, bool, Option<&str>)] = &[
     ("candidate_outcome", false, None),
     ("promote_candidate", true, None),
     ("abandon_candidate", true, None),
+    ("reconcile_candidate", true, None),
+    ("candidate_reconciliation_outcome", false, None),
     ("candidate_transition_outcome", false, None),
     ("selected_abandon_outcome", false, None),
     ("candidate_inventory", false, None),
@@ -615,6 +630,7 @@ const TYPED_PROOFS: &[(&str, Receipt)] = &[
     ("begin_candidate", Receipt::CandidateCreation),
     ("promote_candidate", Receipt::CandidateTransition),
     ("abandon_candidate", Receipt::CandidateTransition),
+    ("reconcile_candidate", Receipt::CandidateReconciliation),
     ("abandon_candidate_ref", Receipt::SelectedAbandon),
     ("ledger.mark_new_session", Receipt::UsageProof),
     ("ledger.admit", Receipt::UsageProof),
@@ -845,6 +861,20 @@ fn wire_enums() -> Result<Vec<(&'static str, Vec<String>)>> {
             serde_variants::<CandidateTransitionResult>(
                 "CandidateTransitionResult",
                 unknown_adjacent("status"),
+            )?,
+        ),
+        (
+            "candidate_reconciliation_outcome",
+            serde_variants::<CandidateReconciliationOutcome>(
+                "CandidateReconciliationOutcome",
+                unknown_tag("outcome"),
+            )?,
+        ),
+        (
+            "candidate_reconciliation_result",
+            serde_variants::<crate::CandidateReconciliationResult>(
+                "CandidateReconciliationResult",
+                unknown_tag("result"),
             )?,
         ),
         (
@@ -1131,6 +1161,58 @@ fn wire_surface() -> Result<String> {
             external(values_of(&cache_write_terms_samples())?)?,
         ),
         ("export_phase", external(export_phase_samples()?)?),
+        (
+            "candidate_reconciliation_result",
+            internal(
+                &[
+                    crate::CandidateReconciliationResult::Reconciled {
+                        head: "head".into(),
+                        base: "base".into(),
+                    },
+                    crate::CandidateReconciliationResult::Unchanged {
+                        head: "head".into(),
+                        base: "base".into(),
+                    },
+                    crate::CandidateReconciliationResult::LiveMoved {
+                        head: "head".into(),
+                    },
+                    crate::CandidateReconciliationResult::Conflict {
+                        tables: vec!["state".into()],
+                        state_keys: vec!["key".into()],
+                        coordinates_available: true,
+                    },
+                ],
+                "result",
+            )?,
+        ),
+        (
+            "candidate_reconciliation_outcome",
+            internal(
+                &[
+                    CandidateReconciliationOutcome::InFlight,
+                    CandidateReconciliationOutcome::Committed {
+                        handle: HANDLE,
+                        status: CandidateRefStatus {
+                            branch: "branch".into(),
+                            head: Some("head".into()),
+                            base: Some("base".into()),
+                            state: crate::CandidateRefState::OpenUnchanged,
+                        },
+                    },
+                    CandidateReconciliationOutcome::NotCommitted {
+                        handle: HANDLE,
+                        status: CandidateRefStatus {
+                            branch: "branch".into(),
+                            head: Some("head".into()),
+                            base: Some("base".into()),
+                            state: crate::CandidateRefState::OpenConflict,
+                        },
+                    },
+                    CandidateReconciliationOutcome::StillUncertain,
+                ],
+                "outcome",
+            )?,
+        ),
     ];
     for (name, shapes) in sets {
         sampled(name, shapes, variants(name)?, &mut lines)?;

@@ -106,6 +106,19 @@ pub enum ServiceCall {
         base: String,
         target: String,
     },
+    ReconcileCandidate {
+        handle: Uuid,
+        branch: String,
+        from: String,
+        live: String,
+    },
+    CandidateReconciliationOutcome {
+        original_id: Uuid,
+        original_generation: String,
+        branch: String,
+        from: String,
+        live: String,
+    },
     CandidateTransitionOutcome {
         original_id: Uuid,
         original_generation: String,
@@ -189,6 +202,8 @@ pub(crate) enum Receipt {
     CandidateCreation,
     /// The exact candidate ref transition, keyed by its pinned branch.
     CandidateTransition,
+    /// The immutable branch/from/live tuple selected for private merge.
+    CandidateReconciliation,
     /// The exact inspected branch/base/head chosen for abandonment.
     SelectedAbandon,
     /// The usage ledger's natural-key proof.
@@ -258,6 +273,8 @@ impl ServiceCall {
             Self::CandidateOutcome { .. } => C::READ,
             Self::PromoteCandidate { .. } => C::write(Receipt::CandidateTransition),
             Self::AbandonCandidate { .. } => C::write(Receipt::CandidateTransition),
+            Self::ReconcileCandidate { .. } => C::write(Receipt::CandidateReconciliation),
+            Self::CandidateReconciliationOutcome { .. } => C::READ,
             Self::CandidateTransitionOutcome { .. } => C::READ,
             Self::SelectedAbandonOutcome { .. } => C::READ,
             Self::CandidateInventory { .. } => C::READ,
@@ -291,6 +308,7 @@ impl ServiceCall {
             Receipt::None
             | Receipt::CandidateCreation
             | Receipt::CandidateTransition
+            | Receipt::CandidateReconciliation
             | Receipt::SelectedAbandon
             | Receipt::UsageProof => None,
         }
@@ -655,6 +673,11 @@ pub enum ServiceValue {
     },
     CandidateOutcome(CandidateCreationOutcome),
     CandidateTransitionOutcome(CandidateTransitionResult),
+    CandidateReconciled {
+        result: crate::CandidateReconciliationResult,
+        handle: Option<Uuid>,
+    },
+    CandidateReconciliationOutcome(CandidateReconciliationOutcome),
     CandidateInventory(CandidateInventoryPage),
     CandidateRefStatus(CandidateRefStatus),
     ExportStarted {
@@ -697,6 +720,21 @@ pub enum CandidateCreationOutcome {
 pub enum CandidateTransitionKind {
     Promote,
     Abandon,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateReconciliationOutcome {
+    InFlight,
+    Committed {
+        handle: Uuid,
+        status: CandidateRefStatus,
+    },
+    NotCommitted {
+        handle: Uuid,
+        status: CandidateRefStatus,
+    },
+    StillUncertain,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1770,6 +1808,29 @@ async fn process<S: AsyncRead + Unpin>(
             )
             .await
         }
+        ServiceCall::CandidateReconciliationOutcome {
+            original_id,
+            original_generation,
+            branch,
+            from,
+            live,
+        } => {
+            candidate_reconciliation_outcome(
+                store,
+                state,
+                authority,
+                progress,
+                ReconciliationQuery {
+                    id: original_id,
+                    generation: &original_generation,
+                    branch: &branch,
+                    from: &from,
+                    live: &live,
+                },
+                client,
+            )
+            .await
+        }
         ServiceCall::SelectedAbandonOutcome {
             original_id,
             original_generation,
@@ -1844,6 +1905,27 @@ fn receipt_progress_key(
             };
             selected_abandon_progress_view(branch, base, target)
         }
+        Receipt::CandidateReconciliation => {
+            let ServiceCall::ReconcileCandidate {
+                handle,
+                branch,
+                from,
+                live,
+            } = call
+            else {
+                bail!("candidate-reconciliation contract names a different call");
+            };
+            let candidate = state
+                .candidates
+                .get(handle)
+                .context("candidate does not belong to this attachment")?;
+            ensure!(
+                candidate.branch() == branch,
+                "candidate reconciliation names a different branch"
+            );
+            crate::store::validate_reconciliation_heads(from, live)?;
+            reconciliation_progress_view(branch, from, live)
+        }
     };
     Ok(Some(ReceiptKey { view, id }))
 }
@@ -1881,6 +1963,8 @@ fn unit_receipt_view(call: &ServiceCall, state: &AttachmentState) -> Result<Stri
         | ServiceCall::CandidateOutcome { .. }
         | ServiceCall::PromoteCandidate { .. }
         | ServiceCall::AbandonCandidate { .. }
+        | ServiceCall::ReconcileCandidate { .. }
+        | ServiceCall::CandidateReconciliationOutcome { .. }
         | ServiceCall::CandidateTransitionOutcome { .. }
         | ServiceCall::SelectedAbandonOutcome { .. }
         | ServiceCall::CandidateInventory { .. }
@@ -1926,6 +2010,106 @@ enum OutcomeProbe<'a> {
         store: &'a MemoryStore,
         proof: &'a UsageProof,
     },
+}
+
+fn reconciliation_progress_view(branch: &str, from: &str, live: &str) -> String {
+    let mut digest = Sha256::new();
+    for field in ["kuru.candidate.reconciliation.v1", branch, from, live] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    let digest: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("candidate-reconciliation:{digest}")
+}
+
+struct ReconciliationQuery<'a> {
+    id: Uuid,
+    generation: &'a str,
+    branch: &'a str,
+    from: &'a str,
+    live: &'a str,
+}
+
+async fn candidate_reconciliation_outcome<S: AsyncRead + Unpin>(
+    store: &MemoryStore,
+    state: &mut AttachmentState,
+    authority: &EndpointAuthority,
+    progress: &ReceiptProgress,
+    query: ReconciliationQuery<'_>,
+    client: &mut S,
+) -> Result<ServiceValue> {
+    ensure!(
+        Uuid::parse_str(query.generation)?.to_string() == query.generation,
+        "invalid original service generation"
+    );
+    crate::store::validate_reconciliation_heads(query.from, query.live)?;
+    let key = ReceiptKey {
+        view: reconciliation_progress_view(query.branch, query.from, query.live),
+        id: query.id,
+    };
+    let (sample, deadline) = match gate_outcome(progress, &key, OutcomeProbe::None, client).await? {
+        OutcomeGate::Committed => unreachable!("candidate reconciliation has no lock-free probe"),
+        OutcomeGate::InFlight => {
+            return Ok(ServiceValue::CandidateReconciliationOutcome(
+                CandidateReconciliationOutcome::InFlight,
+            ));
+        }
+        OutcomeGate::StillUncertain => {
+            return Ok(ServiceValue::CandidateReconciliationOutcome(
+                CandidateReconciliationOutcome::StillUncertain,
+            ));
+        }
+        OutcomeGate::Read { sample, deadline } => (sample, deadline),
+    };
+    if !matches!(sample, ReceiptProgressState::Completed)
+        && query.generation == authority.service_generation
+    {
+        return Ok(ServiceValue::CandidateReconciliationOutcome(
+            CandidateReconciliationOutcome::StillUncertain,
+        ));
+    }
+    ensure!(
+        state.candidates.len() < 8,
+        "too many candidates on this attachment"
+    );
+    let recovered = tokio::time::timeout_at(
+        deadline,
+        store.candidate_reconciliation_outcome(query.branch, query.from, query.live),
+    )
+    .await;
+    let result = match recovered {
+        Ok(Ok(recovery)) => {
+            use crate::store::CandidateReconciliationObservation as Observation;
+            match recovery.observation {
+                Observation::StillUncertain => CandidateReconciliationOutcome::StillUncertain,
+                observation => {
+                    let candidate = recovery
+                        .candidate
+                        .context("proved reconciliation has no checked candidate")?;
+                    let status = recovery
+                        .status
+                        .context("proved reconciliation has no checked status")?;
+                    let handle = Uuid::new_v4();
+                    state.candidates.insert(handle, candidate);
+                    match observation {
+                        Observation::Committed { .. } => {
+                            CandidateReconciliationOutcome::Committed { handle, status }
+                        }
+                        Observation::NotCommitted => {
+                            CandidateReconciliationOutcome::NotCommitted { handle, status }
+                        }
+                        Observation::StillUncertain => unreachable!(),
+                    }
+                }
+            }
+        }
+        Ok(Err(_)) | Err(_) => CandidateReconciliationOutcome::StillUncertain,
+    };
+    Ok(ServiceValue::CandidateReconciliationOutcome(result))
 }
 
 impl OutcomeProbe<'_> {
@@ -2509,6 +2693,9 @@ async fn dispatch(
         ServiceCall::SelectedAbandonOutcome { .. } => {
             unreachable!("selected abandonment outcome queries are handled before dispatch")
         }
+        ServiceCall::CandidateReconciliationOutcome { .. } => {
+            unreachable!("candidate reconciliation outcomes are handled before dispatch")
+        }
         ServiceCall::CandidateInventory { after, limit } => ServiceValue::CandidateInventory(
             store.candidate_inventory(after.as_deref(), limit).await?,
         ),
@@ -2602,6 +2789,31 @@ async fn dispatch(
             candidate.abandon_exact(&target).await?;
             state.candidates.remove(&handle);
             ServiceValue::Unit
+        }
+        ServiceCall::ReconcileCandidate {
+            handle,
+            branch,
+            from,
+            live,
+        } => {
+            let candidate = state
+                .candidates
+                .get(&handle)
+                .context("candidate does not belong to this attachment")?;
+            ensure!(
+                candidate.branch() == branch,
+                "candidate reconciliation identity changed"
+            );
+            let (result, fresh) = candidate.reconcile_with_live(&from, &live).await?;
+            let handle = if let Some(fresh) = fresh {
+                state.candidates.remove(&handle);
+                let handle = Uuid::new_v4();
+                state.candidates.insert(handle, fresh);
+                Some(handle)
+            } else {
+                None
+            };
+            ServiceValue::CandidateReconciled { result, handle }
         }
         ServiceCall::Ledger { operation } => dispatch_ledger(store, *operation).await?,
         ServiceCall::BeginExport => {

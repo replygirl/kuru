@@ -760,6 +760,17 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
         #[cfg(unix)]
         assert_cancelled_post_tool(&project, &events, "accepted-state");
         assert_eq!(harness.topology.states[&target].activation, 0.75);
+        let cards = harness.tool_card_feed().snapshot().0;
+        assert!(cards.iter().any(|card| card.name == "state_report"));
+        assert!(cards.iter().all(|card| card.private_content
+            && card.arguments.is_none()
+            && card.output.is_none()
+            && card.progress.is_none()));
+        let presentation =
+            serde_json::to_string(&cards.iter().map(AsRef::as_ref).collect::<Vec<_>>()).unwrap();
+        assert!(!presentation.contains("accepted before cancellation"));
+        assert!(!presentation.contains("retain this accepted note once"));
+        assert!(!presentation.contains("must not be delivered"));
         assert_eq!(
             harness
                 .memory
@@ -824,7 +835,7 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
             "held-shell",
             "shell",
             json!({
-                "command":"printf '%s' \"$$\" > shell-owner.pid; exec /bin/sleep 120",
+                "command":"printf 'CARD_SAFE sk-proj-abcdefgh01234567'; printf '%s' \"$$\" > shell-owner.pid; exec /bin/sleep 120",
                 "timeout_ms":120000
             }),
         ));
@@ -839,6 +850,8 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
         .await;
         let target = harness.topology.parts[0].id.clone();
         let mut events = harness.subscribe();
+        let cards = harness.tool_card_feed();
+        let session_id = harness.session.id.clone();
         let cancellation = CancellationToken::new();
         let controlled = cancellation.clone();
         let mut watch = crate::progress_wait::TaskWatch::attach(&mut harness);
@@ -865,6 +878,7 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
                 if let Ok(value) = std::fs::read_to_string(&pid_path)
                     && let Ok(pid) = value.parse::<i32>()
                     && pid > 0
+                    && cards.snapshot().0.iter().any(|card| card.call_id == "held-shell" && card.progress.as_ref().is_some_and(|progress| progress.snapshot().stdout.is_some_and(|preview| preview.text.contains("CARD_SAFE") && !preview.text.contains("sk-proj-"))))
                 {
                     break pid;
                 }
@@ -873,6 +887,12 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
         })
         .await
         .expect("shell never published its admitted process identity");
+        let admitted_card = cards.snapshot().0.into_iter().find(|card| card.call_id == "held-shell").expect("real shell has no admitted card");
+        assert_eq!(admitted_card.session_id, session_id);
+        assert_eq!(admitted_card.turn_id, "owned-shell");
+        assert_eq!(admitted_card.source_view, "main");
+        assert_eq!(admitted_card.name, "shell");
+        assert_eq!(admitted_card.state, crate::ToolCardState::Pending);
         cancellation.cancel();
         let (mut harness, result, target) = crate::progress_wait::join_on_progress(
             &mut task,
@@ -906,6 +926,11 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
             "no second settlement can be hidden behind a different outcome"
         );
         assert_cancelled_post_tool(&project, &events, "held-shell");
+        let settled_card = cards.snapshot().0.into_iter().find(|card| card.id == admitted_card.id).expect("cancelled card disappeared");
+        assert_eq!(settled_card.state, crate::ToolCardState::Settled(crate::ToolOutcome::Cancelled));
+        assert!(settled_card.output.is_none() && settled_card.progress.is_none());
+        assert!(settled_card.stdout.as_deref().is_some_and(|text| text.contains("CARD_SAFE") && !text.contains("sk-proj-")));
+        let before_retry = cards.snapshot().0.iter().map(|card| card.id.clone()).collect::<Vec<_>>();
         let retry = harness
             .run_controlled(
                 "start one owned shell",
@@ -917,6 +942,7 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
             .unwrap_err();
         assert!(retry.to_string().contains("may have reached external work"));
         assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
+        assert_eq!(cards.snapshot().0.iter().map(|card| card.id.clone()).collect::<Vec<_>>(), before_retry);
         tokio::time::timeout(crate::tests::shutdown_guard(), harness.shutdown(false))
             .await
             .expect(
@@ -2649,7 +2675,7 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
             dropped: Mutex::new(Some(dropped)),
         });
     let max_parallel = 2;
-        let (_dir, harness) = fixture(
+        let (_dir, mut harness) = fixture(
             Config {
             max_parallel,
                 ..config(Mode::Freudian)
@@ -2657,6 +2683,12 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
             provider.clone(),
         )
         .await;
+        // Deliberately model a lost transient settlement for this exact upcoming
+        // turn. The real provider abort/recovery below is unchanged; this is
+        // not proof that a shell effect occurred.
+        let missing_actor = harness.topology.parts[0].id.clone();
+        let missing_id = harness.fixture_pending_tool_card("aborted-owned-id", &missing_actor, &call("missing-observation", "shell", json!({"command":"fixture only"}))).unwrap();
+        let cards = harness.tool_card_feed();
         let initial_peers = harness
             .topology
             .parts
@@ -2788,6 +2820,9 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
     .expect("persisted recovery turn must complete")
     .unwrap();
     assert_eq!(output.text, "Recovered after cancellation");
+    let recovered_card = cards.snapshot().0.into_iter().find(|card| card.id == missing_id).expect("missing-observation card disappeared");
+    assert_eq!(recovered_card.state, crate::ToolCardState::Interrupted);
+    assert!(recovered_card.output.is_none() && recovered_card.progress.is_none());
     assert_eq!(provider.active.load(Ordering::SeqCst), 0);
     assert_eq!(
         provider.starts.load(Ordering::SeqCst),

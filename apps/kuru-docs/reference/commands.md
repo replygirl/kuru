@@ -14,6 +14,8 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 | <kbd>Escape</kbd> during prompt search           | Restore the unsent draft                                                         |
 | <kbd>Ctrl</kbd>+<kbd>G</kbd> on a paste chip     | Expand or compact its display                                                    |
 | <kbd>Ctrl</kbd>+<kbd>X</kbd> on a paste chip     | Remove exactly the pasted text                                                   |
+| <kbd>F6</kbd>                                    | Select the next tool card observed in this session                               |
+| <kbd>F7</kbd>                                    | Expand or collapse the selected tool card                                        |
 | <kbd>F2</kbd>                                    | Choose a model                                                                   |
 | <kbd>F3</kbd>                                    | Choose reasoning effort                                                          |
 | <kbd>F4</kbd>                                    | Choose a framework                                                               |

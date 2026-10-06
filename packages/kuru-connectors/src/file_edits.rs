@@ -21,6 +21,12 @@ const MAX_RECEIPT_BYTES: usize = 6 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
 const FORMAT: u8 = 1;
+const MAX_DIFF_INPUT_BYTES: usize = crate::MAX_BYTES;
+const MAX_DIFF_LINES: usize = 32_768;
+const MAX_DIFF_SIDE_PREVIEW: usize = 1920;
+const MAX_DIFF_OUTPUT_BYTES: usize = 8 * 1024;
+const DIFF_TRUNCATED: &str = "\n[diff truncated]\n";
+const DIFF_NO_NEWLINE: &str = "\\ No newline at end of file\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +59,14 @@ pub struct CheckpointSummary {
     pub state: CheckpointState,
     pub undo_of: Option<String>,
     pub created: bool,
+}
+
+/// Checked receipt projection for the conversation surface. Raw snapshots
+/// never leave the connector, and explicit receipt pruning removes the source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckpointDiff {
+    Available { text: String, truncated: bool },
+    Unavailable { reason: &'static str },
 }
 
 type CheckpointSnapshots = (CheckpointSummary, Option<Vec<u8>>, Option<Vec<u8>>);
@@ -167,6 +181,21 @@ pub struct CheckpointStore {
     root: Arc<Directory>,
     project: String,
     project_identity: [u8; 24],
+}
+
+/// Project-bound read-only access to checked, recorded snapshots. It cannot
+/// mutate, prune or address current workspace files.
+#[derive(Clone)]
+pub struct CheckpointDiffReader(Arc<CheckpointStore>);
+
+impl CheckpointDiffReader {
+    pub(crate) fn new(store: Arc<CheckpointStore>) -> Self {
+        Self(store)
+    }
+
+    pub fn read(&self, id: &str) -> Result<CheckpointDiff> {
+        self.0.diff(id)
+    }
 }
 
 pub struct CheckpointLease<'a> {
@@ -335,12 +364,166 @@ impl CheckpointStore {
         self.lease()?.inspect(id)
     }
 
+    pub fn diff(&self, id: &str) -> Result<CheckpointDiff> {
+        let Some((summary, before, after)) = self.lease()?.snapshots(id)? else {
+            return Ok(CheckpointDiff::Unavailable {
+                reason: "checked receipt unavailable (missing or pruned)",
+            });
+        };
+        if summary.state != CheckpointState::Applied {
+            return Ok(CheckpointDiff::Unavailable {
+                reason: "checked receipt has no proven applied effect",
+            });
+        }
+        Ok(project_checked_diff(before.as_deref(), after.as_deref()))
+    }
+
     pub fn list(&self, limit: usize) -> Result<Vec<CheckpointSummary>> {
         self.lease()?.list(limit)
     }
 
     pub fn prune(&self, id: &str, discard_uncertain: bool) -> Result<bool> {
         self.lease()?.prune(id, discard_uncertain)
+    }
+}
+
+fn project_checked_diff(before: Option<&[u8]>, after: Option<&[u8]>) -> CheckpointDiff {
+    let before = before.unwrap_or_default();
+    let after = after.unwrap_or_default();
+    if before.len() > MAX_DIFF_INPUT_BYTES || after.len() > MAX_DIFF_INPUT_BYTES {
+        return CheckpointDiff::Unavailable {
+            reason: "checked snapshot exceeds the 2 MiB diff scan limit",
+        };
+    }
+    if before.contains(&0) || std::str::from_utf8(before).is_err() {
+        return CheckpointDiff::Unavailable {
+            reason: "checked before snapshot is binary",
+        };
+    }
+    if after.contains(&0) || std::str::from_utf8(after).is_err() {
+        return CheckpointDiff::Unavailable {
+            reason: "checked after snapshot is binary",
+        };
+    }
+    let line_count = |bytes: &[u8]| {
+        bytes.iter().filter(|&&byte| byte == b'\n').count()
+            + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
+    };
+    if line_count(before) > MAX_DIFF_LINES || line_count(after) > MAX_DIFF_LINES {
+        return CheckpointDiff::Unavailable {
+            reason: "checked snapshot exceeds the diff line/work limit",
+        };
+    }
+    if before == after {
+        return CheckpointDiff::Available {
+            text: "No content change".into(),
+            truncated: false,
+        };
+    }
+    // Scan the entire checked file so a secret opener before the changed line
+    // still controls projection. Scanner growth is capped at six times the
+    // already checked 2 MiB input; hunk matching below remains linear.
+    let (Ok(before), Ok(after)) = (
+        crate::redaction::text(std::str::from_utf8(before).expect("validated UTF-8")),
+        crate::redaction::text(std::str::from_utf8(after).expect("validated UTF-8")),
+    ) else {
+        return CheckpointDiff::Unavailable {
+            reason: "checked snapshot cannot be safely projected",
+        };
+    };
+    if before == after {
+        return CheckpointDiff::Available {
+            text: "No visible change after redaction".into(),
+            truncated: false,
+        };
+    }
+    let before = before.as_bytes();
+    let after = after.as_bytes();
+    let common_prefix = before
+        .iter()
+        .zip(after)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let prefix = before[..common_prefix]
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let prefix_line = line_count(&before[..prefix]) + 1;
+    let mut suffix = 0;
+    while suffix < before.len() - prefix
+        && suffix < after.len() - prefix
+        && before[before.len() - 1 - suffix] == after[after.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let common_start_before = before.len() - suffix;
+    let common_start_after = after.len() - suffix;
+    let whole_line_boundary = (common_start_before == 0
+        || before[common_start_before - 1] == b'\n')
+        && (common_start_after == 0 || after[common_start_after - 1] == b'\n');
+    let advance = if whole_line_boundary {
+        0
+    } else {
+        before[common_start_before..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(suffix, |position| position + 1)
+    };
+    let removed = &before[prefix..common_start_before + advance];
+    let added = &after[prefix..common_start_after + advance];
+    let removed = std::str::from_utf8(removed).expect("whole-line redacted UTF-8");
+    let added = std::str::from_utf8(added).expect("whole-line redacted UTF-8");
+    let removed_truncated = removed.len() > MAX_DIFF_SIDE_PREVIEW;
+    let added_truncated = added.len() > MAX_DIFF_SIDE_PREVIEW;
+    let removed_text = crate::redaction::truncate_tool_output(removed, MAX_DIFF_SIDE_PREVIEW);
+    let added_text = crate::redaction::truncate_tool_output(added, MAX_DIFF_SIDE_PREVIEW);
+    let mut output = format!(
+        "--- before\n+++ after\n@@ -{},{} +{},{} @@\n",
+        prefix_line,
+        line_count(removed.as_bytes()),
+        prefix_line,
+        line_count(added.as_bytes())
+    );
+    let mut truncated = removed_truncated || added_truncated;
+    for (marker, projected, side_truncated) in [
+        ('-', removed_text.as_str(), removed_truncated),
+        ('+', added_text.as_str(), added_truncated),
+    ] {
+        for line in projected.split_inclusive('\n') {
+            let extra_newline = usize::from(!line.ends_with('\n'));
+            let annotation = if extra_newline == 1 && !side_truncated {
+                DIFF_NO_NEWLINE
+            } else {
+                ""
+            };
+            if output.len()
+                + 1
+                + line.len()
+                + extra_newline
+                + annotation.len()
+                + DIFF_TRUNCATED.len()
+                > MAX_DIFF_OUTPUT_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            output.push(marker);
+            output.push_str(line);
+            if extra_newline == 1 {
+                output.push('\n');
+            }
+            output.push_str(annotation);
+        }
+        if output.len() + DIFF_TRUNCATED.len() >= MAX_DIFF_OUTPUT_BYTES {
+            break;
+        }
+    }
+    if truncated {
+        output.push_str(DIFF_TRUNCATED);
+    }
+    CheckpointDiff::Available {
+        text: output,
+        truncated,
     }
 }
 
@@ -1164,6 +1347,179 @@ mod tests {
         drop(reacquired);
         drop(duplicate);
         Ok(())
+    }
+
+    #[test]
+    fn checked_diff_uses_receipt_bytes_after_later_changes_and_loses_them_on_prune() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project)?;
+        let root = Arc::new(Directory::open(
+            &project,
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )?);
+        let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable)?;
+        let private_parent =
+            Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable)?;
+        let private = private_parent.create_private_directory(OsStr::new("private"))?;
+        let store = CheckpointStore::new(private.path(), root)?;
+        let name = OsStr::new("note.txt");
+        {
+            let lease = store.lease()?;
+            lease.mutate(
+                "create-diff",
+                &hash(b"create-diff-args"),
+                "note.txt",
+                FileEffect::Write,
+                &parent,
+                name,
+                |_| Ok(Some(b"first\n".to_vec())),
+            )?;
+            lease.mutate(
+                "edit-diff",
+                &hash(b"edit-diff-args"),
+                "note.txt",
+                FileEffect::Edit,
+                &parent,
+                name,
+                |_| Ok(Some(b"second\n".to_vec())),
+            )?;
+            lease.undo("edit-diff", &parent, name)?;
+            lease.mutate(
+                "delete-diff",
+                &hash(b"delete-diff-args"),
+                "note.txt",
+                FileEffect::Delete,
+                &parent,
+                name,
+                |_| Ok(None),
+            )?;
+            lease.prepare(
+                "uncertain-diff",
+                &hash(b"uncertain-diff-args"),
+                "note.txt",
+                FileEffect::Edit,
+                Some(b"first\n"),
+                Some(b"other\n"),
+                None,
+                None,
+                None,
+                None,
+            )?;
+            lease.settle("uncertain-diff", CheckpointState::Uncertain, None)?;
+        }
+        ensure!(
+            matches!(store.diff("uncertain-diff")?, CheckpointDiff::Unavailable { reason } if reason.contains("no proven applied effect")),
+            "uncertain receipt fabricated an applied diff"
+        );
+        for (id, expected) in [
+            ("create-diff", "+first"),
+            ("edit-diff", "-first\n+second"),
+            (&format!("undo-{}", hash(b"edit-diff")), "-second\n+first"),
+            ("delete-diff", "-first"),
+        ] {
+            let CheckpointDiff::Available { text, truncated } = store.diff(id)? else {
+                anyhow::bail!("applied receipt {id} lost its checked diff")
+            };
+            ensure!(
+                !truncated && text.contains(expected),
+                "wrong {id} diff: {text}"
+            );
+        }
+        std::fs::write(project.join("note.txt"), b"later unrelated target bytes")?;
+        let CheckpointDiff::Available { text, .. } = store.diff("edit-diff")? else {
+            anyhow::bail!("later target change erased immutable edit receipt")
+        };
+        ensure!(
+            text.contains("-first\n+second") && !text.contains("later unrelated"),
+            "diff reread the current target: {text}"
+        );
+        let receipt_path = store.directory.path().join(receipt_name("edit-diff")?);
+        let original_receipt = std::fs::read(&receipt_path)?;
+        let mut corrupt: Receipt = serde_json::from_slice(&original_receipt)?;
+        corrupt.before_sha256 = Some("0".repeat(64));
+        std::fs::write(&receipt_path, serde_json::to_vec(&corrupt)?)?;
+        ensure!(
+            store.diff("edit-diff").is_err(),
+            "corrupt snapshot produced a diff"
+        );
+        std::fs::write(&receipt_path, original_receipt)?;
+        ensure!(store.prune("edit-diff", false)?);
+        ensure!(
+            matches!(store.diff("edit-diff")?, CheckpointDiff::Unavailable { reason } if reason.contains("missing or pruned")),
+            "pruned receipt retained its diff"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_diff_redacts_and_bounds_binary_oversized_and_noisy_snapshots() {
+        for (before, after, expected) in [
+            ("a\n", "a", "-a\n+a\n\\ No newline at end of file\n"),
+            ("a", "a\n", "-a\n\\ No newline at end of file\n+a\n"),
+            (
+                "猫\n夏\n",
+                "猫\n秋",
+                "-夏\n+秋\n\\ No newline at end of file\n",
+            ),
+        ] {
+            let CheckpointDiff::Available { text, truncated } =
+                project_checked_diff(Some(before.as_bytes()), Some(after.as_bytes()))
+            else {
+                panic!("EOF/Unicode text diff was unavailable")
+            };
+            assert!(!truncated && text.contains(expected), "{text}");
+            assert_eq!(text.matches(DIFF_NO_NEWLINE).count(), 1);
+            assert!(text.len() <= MAX_DIFF_OUTPUT_BYTES);
+        }
+        let secret = b"openai_api_key=sk-proj-abcdefghijklmnop0123456789\n";
+        let CheckpointDiff::Available { text, .. } = project_checked_diff(None, Some(secret))
+        else {
+            panic!("small text snapshot was unavailable")
+        };
+        assert!(!text.contains("sk-proj-abcdefghijklmnop0123456789"));
+        assert!(matches!(
+            project_checked_diff(Some(b"\0binary"), Some(b"text")),
+            CheckpointDiff::Unavailable { reason } if reason.contains("binary")
+        ));
+        assert!(matches!(
+            project_checked_diff(None, Some(&vec![b'a'; MAX_DIFF_INPUT_BYTES + 1])),
+            CheckpointDiff::Unavailable { reason } if reason.contains("2 MiB")
+        ));
+        let noisy = "a\n".repeat(MAX_DIFF_LINES + 1);
+        assert!(matches!(
+            project_checked_diff(None, Some(noisy.as_bytes())),
+            CheckpointDiff::Unavailable { reason } if reason.contains("line/work")
+        ));
+        let bounded = "long line\n".repeat(900);
+        let CheckpointDiff::Available { text, truncated } =
+            project_checked_diff(None, Some(bounded.as_bytes()))
+        else {
+            panic!("bounded text snapshot was unavailable")
+        };
+        assert!(truncated && text.len() <= MAX_DIFF_OUTPUT_BYTES);
+
+        let mut before = "same unchanged line\n".repeat(5000);
+        before.push_str("old line\n");
+        before.push_str(&"same trailing line\n".repeat(5000));
+        let after = before.replacen("old line\n", "new line\n", 1);
+        assert!(before.len() > 64 * 1024 && after.len() < MAX_DIFF_INPUT_BYTES);
+        let CheckpointDiff::Available { text, truncated } =
+            project_checked_diff(Some(before.as_bytes()), Some(after.as_bytes()))
+        else {
+            panic!("small edit in a larger checked file lost its diff")
+        };
+        assert!(!truncated && text.contains("-old line\n+new line"));
+
+        let before = "-----BEGIN PRIVATE KEY-----\nsecret before\n-----END PRIVATE KEY-----\n";
+        let after = "-----BEGIN PRIVATE KEY-----\nsecret after\n-----END PRIVATE KEY-----\n";
+        let CheckpointDiff::Available { text, .. } =
+            project_checked_diff(Some(before.as_bytes()), Some(after.as_bytes()))
+        else {
+            panic!("private-key change was unavailable")
+        };
+        assert!(!text.contains("secret before") && !text.contains("secret after"));
     }
 
     #[test]

@@ -4359,6 +4359,191 @@ async fn permission_complete(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_tool_cards_expand_checked_recorded_diffs_at_120_and_80() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        for (rows, columns) in [(35, 120), (24, 80)] {
+            let sandbox = Sandbox::warmed().await?;
+            let target = sandbox.project.join("card-note.txt");
+            std::fs::write(&target, "before\nsk-proj-abcdefgh01234567\n")?;
+            let app = Router::new()
+                .route(
+                    "/v1/models",
+                    get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+                )
+                .route("/v1/responses", post(permission_complete))
+                .with_state(PermissionProvider {
+                    tool: "file_write".into(),
+                    arguments:
+                        json!({"path":"card-note.txt","content":"after\nsk-proj-ijklmnop01234567\n"})
+                            .to_string(),
+                });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let config = sandbox.root.path().join("tool-card-provider.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=3\n",
+                    listener.local_addr()?
+                ),
+            )?;
+            let _server = Server(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            let mut command = sandbox.command("responses");
+            command
+                .args([
+                    "--model",
+                    "fixture",
+                    "--mode",
+                    "freudian",
+                    "--allow-write",
+                    "--config",
+                ])
+                .arg(&config)
+                .env("KURU_FIXTURE_KEY", "fixture")
+                .env("KURU_REDUCED_MOTION", "1");
+            let mut terminal = Terminal::spawn(command, rows, columns)?;
+            terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+            terminal.submit("edit this note")?;
+            terminal.wait_composer_frame(
+                &["file_write", "Complete", "PERMISSION_FINAL", "F6 select"],
+                READY_TIMEOUT,
+            )?;
+            ensure!(
+                terminal.screen().matches("PERMISSION_FINAL").count() == 1,
+                "final answer rendered twice: {}",
+                terminal.screen()
+            );
+            // Expansion reads retained checked snapshots, not the now changed
+            // workspace. This mutation cannot become the card's recorded diff.
+            std::fs::write(&target, "UNRELATED_WORKSPACE_CONTENT")?;
+            terminal.send(b"\x1b[17~\x1b[18~")?;
+            terminal.wait_composer_frame(&["-before", "+after"], READY_TIMEOUT)?;
+            // The expanded card can exceed the viewport. Observe its heading
+            // through completed scrolling frames, separately from the hunk.
+            let navigation_deadline = Instant::now() + READY_TIMEOUT;
+            while !terminal.screen().contains("checked recorded file diff") {
+                let previous_screen = terminal.screen();
+                let previous_output = terminal.output.len();
+                terminal.send(b"\x1b[5~")?;
+                terminal.wait(
+                    "recorded diff heading after PageUp",
+                    navigation_deadline.saturating_duration_since(Instant::now()),
+                    |terminal| {
+                        Ok(terminal.screen() != previous_screen
+                            && terminal.completed_frame_after(previous_output))
+                    },
+                )?;
+            }
+            ensure!(!terminal.screen().contains("UNRELATED_WORKSPACE_CONTENT"));
+            ensure!(!String::from_utf8_lossy(&terminal.output).contains("sk-proj-abcdefgh01234567"));
+            ensure!(!String::from_utf8_lossy(&terminal.output).contains("sk-proj-ijklmnop01234567"));
+            let previous_output = terminal.output.len();
+            terminal.send(b"\x1b[18~")?;
+            terminal.wait(
+                "collapsed recorded diff frame",
+                navigation_deadline.saturating_duration_since(Instant::now()),
+                |terminal| Ok(terminal.completed_frame_after(previous_output)),
+            )?;
+            // Collapsing preserves a valid history position. Return through
+            // the ordinary scroll control rather than assuming it jumps down.
+            while !(terminal.screen().contains("file_write")
+                && terminal.screen().contains("PERMISSION_FINAL"))
+            {
+                let previous_screen = terminal.screen();
+                let previous_output = terminal.output.len();
+                terminal.send(b"\x1b[6~")?;
+                terminal.wait(
+                    "collapsed card after PageDown",
+                    navigation_deadline.saturating_duration_since(Instant::now()),
+                    |terminal| {
+                        Ok(terminal.screen() != previous_screen
+                            && terminal.completed_frame_after(previous_output))
+                    },
+                )?;
+            }
+            ensure!(!terminal.screen().contains("checked recorded file diff"));
+            terminal.resize(rows, if columns == 120 { 80 } else { 120 })?;
+            terminal.wait_composer_frame(
+                &["file_write", "PERMISSION_FINAL", "enter send"],
+                READY_TIMEOUT,
+            )?;
+            terminal.send(b"/quit\r")?;
+            terminal.wait_exit(EXIT_TIMEOUT)?;
+            terminal.assert_restored()?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_tool_cards_keep_safe_partial_preview_after_owned_shell_cancellation() -> Result<()>
+{
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+            )
+            .route("/v1/responses", post(permission_complete))
+            .with_state(PermissionProvider {
+                tool: "shell".into(),
+                arguments:
+                    json!({"command":"printf 'CARD_SAFE sk-proj-abcdefgh01234567\\n'; exec /bin/sleep 120"})
+                        .to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = sandbox.root.path().join("partial-card-provider.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=3\n",
+                listener.local_addr()?
+            ),
+        )?;
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        let mut command = sandbox.command("responses");
+        command
+            .args([
+                "--model",
+                "fixture",
+                "--mode",
+                "freudian",
+                "--allow-shell",
+                "--config",
+            ])
+            .arg(&config)
+            .env("KURU_FIXTURE_KEY", "fixture")
+            .env("KURU_REDUCED_MOTION", "1");
+        let mut terminal = Terminal::spawn(command, 24, 80)?;
+        terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+        terminal.submit("run the held shell")?;
+        terminal.wait_composer_frame(&["shell", "Pending", "F6 select"], READY_TIMEOUT)?;
+        terminal.send(b"\x1b[17~\x1b[18~")?;
+        // Pending was observed before expansion; its header can now be above
+        // the viewport. The cancel hint proves this safe preview is still live.
+        terminal.wait_composer_frame(
+            &["stdout (partial)", "CARD_SAFE", "esc cancel"],
+            READY_TIMEOUT,
+        )?;
+        terminal.send(b"\x1b")?;
+        terminal.wait_composer_frame(&["Cancelled", "CARD_SAFE", "enter send"], READY_TIMEOUT)?;
+        ensure!(!String::from_utf8_lossy(&terminal.output).contains("sk-proj-abcdefgh01234567"));
+        ensure!(!terminal.screen().contains("PERMISSION_FINAL"));
+        terminal.resize(35, 120)?;
+        terminal.wait_composer_frame(&["Cancelled", "CARD_SAFE", "enter send"], READY_TIMEOUT)?;
+        terminal.send(b"/quit\r")?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        terminal.assert_restored()
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_permission_choices_show_exact_file_scope_and_revoke_grants() -> Result<()> {
     kuru_memory::test_support::closing(async {
         for (answer, dimensions, granted, remembered) in [
@@ -4958,6 +5143,11 @@ async fn real_pty_shell_permission_cancel_closes_reply_and_preserves_draft() -> 
         );
         terminal.send(b"\x1b")?;
         terminal.wait_composer_frame(&["Cancelled", "Next draft", "enter send"], READY_TIMEOUT)?;
+        ensure!(
+            terminal.screen().contains("shell") && terminal.screen().contains("F6 select"),
+            "cancelled card missing: {}",
+            terminal.screen()
+        );
         terminal.send(b"\x1b1")?;
         ensure!(
             !marker.exists(),
@@ -4978,6 +5168,10 @@ async fn real_pty_shell_permission_cancel_closes_reply_and_preserves_draft() -> 
                 && terminal.screen().contains("enter send"))
         })?;
         ensure!(!marker.exists(), "denied shell created a marker");
+        terminal.wait_composer_frame(
+            &["shell", "Denied", "F6 select", "enter send"],
+            READY_TIMEOUT,
+        )?;
         terminal.send(b"/quit\r")?;
         terminal.wait_exit(EXIT_TIMEOUT)?;
         terminal.assert_restored()
