@@ -15,6 +15,8 @@ use kuru_delivery::{archive, command::Command, shell_support};
 use kuru_memory::test_support::{self, TemplateCacheReceipt};
 use kuru_memory::{MemoryStore, OpenOptions};
 use kuru_platform::fs::{Directory, regular_file_info};
+#[cfg(unix)]
+use kuru_platform::fs::{NameRetention, Privacy};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -1886,10 +1888,29 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .retire_memory()
         .await
         .context("retire the updated installation's managed memory owner")?;
+    let mut installed_names = fs::read_dir(&install_dir)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    installed_names.sort();
+    let executable_name = if cfg!(windows) { "kuru.exe" } else { "kuru" };
     ensure!(
-        fs::read_dir(&install_dir)?.count() == 2 + usize::from(cfg!(windows)),
-        "self-update left an unexpected companion alongside Kuru and shell support"
+        installed_names == [".kuru-update", executable_name, "share"].map(std::ffi::OsString::from),
+        "self-update left unexpected installation entries: {installed_names:?}"
     );
+    #[cfg(unix)]
+    {
+        let state = Directory::open(
+            &install_dir.join(".kuru-update"),
+            Privacy::OwnerOnly,
+            NameRetention::Movable,
+        )?;
+        state.require_known_entries(&[OsStr::new("install.lock")])?;
+        let lock = state.read(OsStr::new("install.lock"))?;
+        ensure!(regular_file_info(&lock)?.len == 0, "update lock has bytes");
+        state.verify(OsStr::new("install.lock"), &lock)?;
+        ensure!(kuru_delivery::unix_update::recover(&install_dir)?.is_none());
+        state.revalidate()?;
+    }
     eprintln!(
         "embedded runtime accepted: target={target} executable_bytes={} archive_bytes={} engine={dolt_version}; direct install and self-update each persisted chat from {}",
         fs::metadata(&binary)?.len(),

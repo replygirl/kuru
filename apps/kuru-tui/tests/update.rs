@@ -737,7 +737,7 @@ async fn replaced_linux_running_image_opens_its_own_managed_memory_without_candi
         use std::{io::Write, os::unix::fs::PermissionsExt, time::Duration};
         let root = kuru_memory::test_support::tempdir()?;
         let data = root.path().join("data");
-        let cleanup = linux_memory::ServiceCleanup::new(root, &data);
+        let cleanup = linux_memory::ServiceCleanup::new(root, &data.join("kuru"));
         let outcome = async {
             let root = cleanup.path();
             let configuration = linux_memory::configuration_warmed(root).await?;
