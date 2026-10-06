@@ -101,6 +101,16 @@ between means an instrumented process outlived the partition's tests; the
 partition fails naming those profiles instead of blaming the port. A test must
 therefore not leave an instrumented child running after it returns.
 
+The std-only fake connector peer in `tests/fixtures/stdio_peer.rs` is compiled
+separately with the pinned Rust compiler and explicit `instrument-coverage=no`
+on Unix and Windows. MCP protocol-failure tests deliberately force-terminate
+that peer; it must not start an exit-time profile write that termination can
+interrupt. Windows retains the compiler's full native Job through completion
+and checks an immutable snapshot before exposing fixture aliases. This is test
+scaffolding, already outside cargo-llvm-cov's default measured source scope.
+Real application children still inherit the runner's `LLVM_PROFILE_FILE`, and
+application instrumentation, strict profile export and the 90% gate are unchanged.
+
 The failure also names each changed profile's writer. A raw profile is named
 `<prefix>-<pid>-<signature>_<pool>.profraw`, and the signature (`%m`) is
 computed per executable, not per test. The runner sets
