@@ -67,32 +67,10 @@ async fn open(options: ServerOptions) -> Result<Server> {
 
 async fn wait_removed(path: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut last_error: Option<std::io::Error> = None;
-    loop {
-        match path.try_exists() {
-            Ok(false) => return Ok(()),
-            Ok(true) => {}
-            // A delete-sharing handle can leave an owned Windows directory
-            // deletion pending. An access-denied probe proves neither presence
-            // nor absence; keep observing within the original cleanup budget.
-            #[cfg(windows)]
-            Err(error) if error.raw_os_error() == Some(5) => last_error = Some(error),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("observe owned memory fixture removal: {}", path.display())
-                });
-            }
-        }
-        if Instant::now() >= deadline
-            && let Some(error) = last_error.take()
-        {
-            return Err(error).with_context(|| {
-                format!(
-                    "owned memory fixture removal remained unconfirmed at deadline: {}",
-                    path.display()
-                )
-            });
-        }
+    while path
+        .try_exists()
+        .with_context(|| format!("observe owned memory fixture removal: {}", path.display()))?
+    {
         ensure!(
             Instant::now() < deadline,
             "owned memory fixture was not cleaned: {}",
@@ -100,6 +78,7 @@ async fn wait_removed(path: &Path) -> Result<()> {
         );
         sleep(Duration::from_millis(25)).await;
     }
+    Ok(())
 }
 
 #[tokio::test]
@@ -270,63 +249,31 @@ async fn authenticated_readers_branch_pools_and_reopen_share_only_committed_stat
 #[tokio::test]
 async fn retained_fixture_is_deleted_only_after_drop_reaps_the_supervisor() -> Result<()> {
     let _permit = SERVERS.acquire().await?;
-    let root = tempfile::tempdir()?;
-    let path = root.path().to_path_buf();
-    let server = open(options(root.path(), engine().await?)).await?;
-    server
-        .retain_directory(root)
-        .await
-        .context("handoff retained fixture directory to owned supervisor")?;
-    let pool = server
-        .pool("main")
-        .await
-        .context("acquire retained fixture main pool")?;
-    drop(pool);
-    drop(server);
-    wait_removed(&path).await
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn retained_fixture_removal_waits_for_delete_pending_root_handle() -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    let parent = tempfile::tempdir()?;
-    let path = parent.path().join("held-root");
-    fs::create_dir(&path)?;
-    // BACKUP_SEMANTICS opens a directory; share-delete permits the actual
-    // removal while this exact handle retains the pending directory object.
-    let held = fs::OpenOptions::new()
-        .access_mode(0)
-        .share_mode(1 | 2 | 4)
-        .custom_flags(0x0200_0000)
-        .open(&path)
-        .context("open delete-sharing fixture root handle")?;
-    fs::remove_dir(&path).context("mark held fixture root for actual deletion")?;
-    let denied = path
-        .try_exists()
-        .expect_err("held deletion-pending root must not be confirmed absent");
-    ensure!(
-        denied.raw_os_error() == Some(5),
-        "unexpected root probe: {denied}"
-    );
-
-    let mut removal = std::pin::pin!(wait_removed(&path));
-    // Poll the actual observer after the denied probe, before releasing the
-    // handle. This causal acknowledgement requires no elapsed-time guess.
-    let pending =
-        std::future::poll_fn(|cx| Poll::Ready(matches!(removal.as_mut().poll(cx), Poll::Pending)))
-            .await;
-    ensure!(
-        pending,
-        "removal observer settled while the root handle was held"
-    );
-    drop(held);
-    removal.await?;
-    ensure!(
-        !path.try_exists()?,
-        "root removal was not confirmed after handle release"
-    );
+    // Bounded phase attribution on the actual reaper path, not retries after
+    // failure: every iteration owns a fresh root and must complete cleanup.
+    let iterations = if cfg!(windows) { 8 } else { 1 };
+    for iteration in 1..=iterations {
+        let root = tempfile::tempdir()
+            .with_context(|| format!("retained fixture iteration {iteration}: create root"))?;
+        let path = root.path().to_path_buf();
+        let binary = engine()
+            .await
+            .with_context(|| format!("retained fixture iteration {iteration}: warm engine"))?;
+        let server = open(options(root.path(), binary))
+            .await
+            .with_context(|| format!("retained fixture iteration {iteration}: open supervisor"))?;
+        server.retain_directory(root).await.with_context(|| {
+            format!("retained fixture iteration {iteration}: handoff directory to supervisor")
+        })?;
+        let pool = server.pool("main").await.with_context(|| {
+            format!("retained fixture iteration {iteration}: acquire main pool")
+        })?;
+        drop(pool);
+        drop(server);
+        wait_removed(&path).await.with_context(|| {
+            format!("retained fixture iteration {iteration}: observe removal after owner drop")
+        })?;
+    }
     Ok(())
 }
 
