@@ -2893,8 +2893,9 @@ mod tests {
         let failure = scenario.failure();
         for proof in [
             "kuru-43-700_0.profraw",
-            "pid 43 is the test-run",
-            "signature 700 is debug/deps/probe.exe",
+            "pid 43 recorded candidate: test-run",
+            "signature 700 sibling candidates: debug/deps/probe.exe",
+            "PID reuse can prevent writer identification",
             "size=2",
             "modified=Some",
             "partial raw prefix (2 bytes, at most 64, metadata_changed=false): 0001",
@@ -2941,7 +2942,10 @@ mod tests {
             text.contains("prefix unavailable: profile name is not a regular file"),
             "{text}"
         );
-        assert!(text.contains("pid 9 has no spawn row"), "{text}");
+        assert!(
+            text.contains("pid 9 has no recorded spawn match; writer identity is unknown"),
+            "{text}"
+        );
         assert!(text.contains("original strict failure"), "{text}");
     }
 
@@ -3039,8 +3043,8 @@ mod tests {
     }
 
     /// The CI shape: a supervisor a test dropped live writes its profile
-    /// during the export. Its spawn row names the test, and the listing row
-    /// of the executable that shares its signature names the binary.
+    /// during the export. Its spawn row and sibling signature suggest
+    /// candidates, without proving writer identity across PID reuse.
     #[test]
     fn a_late_profile_names_the_test_that_started_its_process() {
         use super::super::spawns::{SpawnRecord, TEST_EXECUTABLE};
@@ -3088,9 +3092,10 @@ mod tests {
             .to_string();
         assert!(
             error.contains(&format!(
-                "Writers: new kuru-12-222_0.profraw: pid 12 is the dolt-supervisor \
-                 debug/kuru-memory started by test tests::b (parent pid {}); signature 222 is \
-                 debug/kuru-memory",
+                "Writers: new kuru-12-222_0.profraw: pid 12 recorded candidate: dolt-supervisor \
+                 debug/kuru-memory started by test tests::b (parent pid {}); PID reuse can \
+                 prevent writer identification; signature 222 sibling candidates: \
+                 debug/kuru-memory (PID reuse can prevent writer identification)",
                 std::process::id()
             )),
             "{error}"
