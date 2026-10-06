@@ -1842,3 +1842,81 @@ fn stored_preferences_reject_malformed_choices_without_restricting_future_capabi
         assert!(serde_json::from_value::<ProjectPreferences>(value).is_err());
     }
 }
+
+#[test]
+fn update_notice_is_personal_and_captured_before_repository_overrides() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    assert!(!Config::load(None, &project, None).unwrap().update.notice);
+    let user = dir.path().join("user.toml");
+    let local = project.join(".kuru/config.local.toml");
+    let explicit = dir.path().join("explicit.toml");
+    write(&user, "[update]\nnotice=true\n");
+    assert!(
+        Config::load(Some(&user), &project, None)
+            .unwrap()
+            .update
+            .notice
+    );
+    write(&explicit, "[update]\nnotice=true\n");
+    assert!(
+        Config::load(None, &project, Some(&explicit))
+            .unwrap()
+            .update
+            .notice
+    );
+    write(&local, "[update]\nnotice=true\n");
+    let captured = fs::read_to_string(&local).unwrap();
+    let snapshot = ConfigSnapshot::parse_with_sources(
+        None,
+        None,
+        &project,
+        Some((&local, &captured)),
+        None,
+        None,
+        &[],
+        InvocationOverrides::default(),
+    )
+    .unwrap();
+    assert!(
+        snapshot
+            .finalize(&ProjectPreferences::default())
+            .unwrap()
+            .update
+            .notice
+    );
+    let mut invocation = InvocationOverrides::default();
+    invocation.typed_config.push("update.notice=true".into());
+    assert!(
+        ConfigSnapshot::parse(None, &project, None, invocation)
+            .unwrap()
+            .finalize(&ProjectPreferences::default())
+            .unwrap()
+            .update
+            .notice
+    );
+    // Capture rejection happens before trust or a later explicit false patch.
+    write(project.join(".kuru/config.toml"), "[update]\nnotice=true\n");
+    write(&explicit, "[update]\nnotice=false\n");
+    let error = Config::load(None, &project, Some(&explicit))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("personal preference"));
+    fs::remove_file(project.join(".kuru/config.toml")).unwrap();
+    let policy = dir.path().join("managed.toml");
+    write(&policy, "[constraints.update]\nnotice=false\n");
+    assert!(
+        ConfigSnapshot::parse_with_sources(
+            Some(&user),
+            None,
+            &project,
+            None,
+            None,
+            Some(&policy),
+            &[],
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+}

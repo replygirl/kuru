@@ -22,7 +22,7 @@ pub use config::{
     ConfigDisplayBounds, ConfigDisplayProjection, ConfigDisplayRow, ConfigSnapshot, HookCommand,
     HookEvent, InvocationOverrides, LifecycleHooks, ManifestDigest, McpConfig, McpOAuthConfig,
     MemoryConfig, ModelPreference, ProjectPreferences, ResponsesRouteConfig, SafeClaimDisplay,
-    SafeManifest, SafeSource, SelectionOverrides, load_instructions,
+    SafeManifest, SafeSource, SelectionOverrides, UpdateConfig, load_instructions,
 };
 pub use context::{
     ContextBudget, ContextCompactionPolicy, ContextEstimate, ContextSizing, ContextSourceKind,

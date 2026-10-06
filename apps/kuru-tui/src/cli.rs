@@ -1587,6 +1587,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         let tools = permission_host(&data, root.clone(), &config, &snapshot, true)?
             .with_instruction_gate(prompt_gate.clone())
             .with_skill_gate(prompt_gate, has_skills);
+        let update_notice_enabled = config.update.notice;
         let mut harness = Harness::with_admission_and_instructions(
             config,
             &cwd,
@@ -1717,14 +1718,38 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                         max_total_bytes: 48 * 1024,
                     },
                 )?;
-                crate::ui::run_with_notice_commands_and_config(
+                let update_notice = if update_notice_enabled
+                    && io::stdin().is_terminal()
+                    && io::stdout().is_terminal()
+                    && io::stderr().is_terminal()
+                {
+                    kuru_delivery::archive::host_target().ok().map(|target| {
+                        kuru_delivery::notice::Session::start(
+                            data.clone(),
+                            env!("CARGO_PKG_VERSION").to_owned(),
+                            target.to_owned(),
+                        )
+                    })
+                } else {
+                    None
+                };
+                let interactive = crate::ui::run_with_notice_commands_and_config(
                     harness,
                     models,
                     notice,
                     registry,
                     Some(config_projection),
                 )
-                .await?
+                .await;
+                // This function returns only after owned terminal restoration.
+                // Advice has no authority to delay exit or replace a TUI error.
+                let advice = update_notice.and_then(kuru_delivery::notice::Session::finish);
+                if interactive.is_ok()
+                    && let Some(advice) = advice
+                {
+                    let _ = writeln!(io::stderr().lock(), "{advice}");
+                }
+                interactive?
             }
             Some(Command::Mcp { .. }) => unreachable!("MCP command returned before memory setup"),
             _ => unreachable!("early-return commands handled above"),

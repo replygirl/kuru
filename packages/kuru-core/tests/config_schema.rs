@@ -369,3 +369,25 @@ fn permission_schema_and_parser_agree_on_documented_and_invalid_rules() {
         assert!(!validator.is_valid(&value));
     }
 }
+
+#[test]
+fn update_notice_schema_matches_personal_native_preference() {
+    let dir = TempDir::new().unwrap();
+    let user = dir.path().join("user.toml");
+    let validator = schema();
+    for (text, accepted) in [
+        ("[update]\nnotice=true", true),
+        ("[update]\nnotice=false", true),
+        ("[update]\nnotice='yes'", false),
+        ("[update]\nunknown=true", false),
+    ] {
+        assert_eq!(validator.is_valid(&json_from_toml(text)), accepted);
+        write(&user, text);
+        assert_eq!(
+            Config::load(Some(&user), dir.path(), None).is_ok(),
+            accepted
+        );
+    }
+    assert!(!Config::default().update.notice);
+    assert!(managed_schema().is_valid(&json_from_toml("[constraints.update]\nnotice=false")));
+}

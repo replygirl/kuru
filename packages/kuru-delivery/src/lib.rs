@@ -10,6 +10,7 @@ pub mod command;
 pub mod coverage;
 #[cfg(feature = "tooling")]
 pub mod docs;
+pub mod notice;
 #[cfg(unix)]
 pub mod ownership;
 // Shared with the advisory integration tests and scanner fixture.
