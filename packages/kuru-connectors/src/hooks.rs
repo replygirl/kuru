@@ -300,6 +300,7 @@ pub struct HookBudget {
     max_invocations: usize,
     max_annotation_bytes: usize,
     clock: Clock,
+    _hold: Option<crate::InvocationHold>,
 }
 
 struct HookLease(Arc<HookBudget>);
@@ -321,6 +322,7 @@ impl HookBudget {
             max_invocations: hooks.max_invocations,
             max_annotation_bytes: hooks.max_annotation_bytes,
             clock,
+            _hold: None,
         })
     }
 
@@ -419,6 +421,16 @@ impl HookHost {
 
     pub fn budget(&self) -> Arc<HookBudget> {
         HookBudget::new(&self.hooks)
+    }
+
+    /// One operation's immutable ownership is retained by each HookLease;
+    /// neither this reusable host nor another session can replace it.
+    pub fn budget_with_lifetime(&self, hold: crate::InvocationHold) -> Arc<HookBudget> {
+        let mut budget = HookBudget::with_clock(&self.hooks, Arc::new(Instant::now));
+        Arc::get_mut(&mut budget)
+            .expect("new private hook budget")
+            ._hold = Some(hold);
+        budget
     }
 
     /// Await every in-flight owned hook worker, including one whose caller
@@ -836,22 +848,47 @@ async fn invoke(
     std::thread::Builder::new()
         .name("kuru-lifecycle-hook".into())
         .spawn(move || {
-            let outcome = tokio::runtime::Builder::new_current_thread()
+            let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .context("lifecycle hook runtime failed")
-                .and_then(|runtime| {
-                    runtime.block_on(run_owned(root, hook, request, &reply, aggregate_deadline))
-                });
-            if outcome
-                .as_ref()
-                .is_err_and(|error| error.is::<CleanupUnconfirmed>())
-            {
+                .context("lifecycle hook runtime failed");
+            let mut owner = None;
+            let outcome = match &runtime {
+                Ok(runtime) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(run_owned(
+                        root,
+                        hook,
+                        request,
+                        &reply,
+                        aggregate_deadline,
+                        &mut owner,
+                    ))
+                })),
+                Err(_) => Ok(Err(anyhow::anyhow!("lifecycle hook runtime failed"))),
+            };
+            // Only checked tree absence clears the retained owner. Generic
+            // setup/wait errors and panics cannot authorize releasing it.
+            let retaining = owner.is_some();
+            if retaining {
                 slot.cleanup_unconfirmed();
+            }
+            let outcome =
+                outcome.unwrap_or_else(|_| Err(anyhow::anyhow!("lifecycle hook worker panicked")));
+            // Publish the existing bounded refusal before retained cleanup;
+            // the same native worker and immutable HookLease remain owned.
+            let _ = reply.send(outcome);
+            if retaining && let (Ok(runtime), Some(mut owner)) = (runtime, owner) {
+                runtime.block_on(async {
+                    while cleanup_owned(&mut owner, Instant::now() + CLEANUP)
+                        .await
+                        .is_err()
+                    {
+                        tokio::time::sleep(POLL).await;
+                    }
+                });
             }
             drop(lease);
             drop(slot);
-            let _ = reply.send(outcome);
         })
         .context("lifecycle hook worker failed")?;
     result.await.context("lifecycle hook worker stopped")?
@@ -874,12 +911,14 @@ async fn run_owned(
     request: Vec<u8>,
     reply: &oneshot::Sender<Result<HookResponse>>,
     aggregate_deadline: Instant,
+    retained: &mut Option<HookOwner>,
 ) -> Result<HookResponse> {
     ensure!(
         Instant::now() < aggregate_deadline,
         "hook execution time budget exhausted"
     );
-    let (mut owner, mut input, output, error) = spawn(&root, &hook).await?;
+    let (mut input, output, error) = spawn(&root, &hook, retained).await?;
+    let owner = retained.as_mut().context("hook owner was not retained")?;
     let mut stdout = tokio::spawn(read_bounded(output, hook.max_output_bytes));
     let mut stderr = tokio::spawn(read_bounded(error, MAX_STDERR_BYTES));
     let deadline =
@@ -892,11 +931,13 @@ async fn run_owned(
     tokio::pin!(write);
     loop {
         if reply.is_closed() {
-            stop(&mut owner, stdout, stderr).await?;
+            stop(owner, stdout, stderr).await?;
+            retained.take();
             bail!("lifecycle hook caller cancelled");
         }
         if Instant::now() >= deadline {
-            stop(&mut owner, stdout, stderr).await?;
+            stop(owner, stdout, stderr).await?;
+            retained.take();
             bail!("lifecycle hook timed out");
         }
         tokio::select! {
@@ -904,7 +945,8 @@ async fn run_owned(
                 match result {
                     Ok(()) => break,
                     Err(_) => {
-                        stop(&mut owner, stdout, stderr).await?;
+                        stop(owner, stdout, stderr).await?;
+                        retained.take();
                         bail!("write lifecycle hook request failed");
                     }
                 }
@@ -913,7 +955,12 @@ async fn run_owned(
         }
     }
     drop(input);
-    let (status, tail) = wait_for_exit(&mut owner, deadline, reply).await?;
+    let mut cleanup_confirmed = false;
+    let exit = wait_for_exit(owner, deadline, reply, &mut cleanup_confirmed).await;
+    if cleanup_confirmed {
+        retained.take();
+    }
+    let (status, tail) = exit?;
     // The owned tree is gone, but a descendant that left it can still hold a
     // pipe. Drain only within the remaining deadline and the post-exit cleanup
     // bound already shared with reaping, stop at caller loss, and never parse
@@ -1002,7 +1049,8 @@ async fn finish_reader(mut task: Reader, limit: Instant) {
 async fn spawn(
     root: &Arc<Directory>,
     hook: &HookCommand,
-) -> Result<(HookOwner, HookInput, HookOutput, HookError)> {
+    retained: &mut Option<HookOwner>,
+) -> Result<(HookInput, HookOutput, HookError)> {
     use kuru_platform::unix::{StdioPlan, StdioSlot};
     use std::process::Command;
 
@@ -1016,8 +1064,9 @@ async fn spawn(
     root.revalidate()
         .context("workspace changed before lifecycle hook launch")?;
     let piped = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Pipe);
-    let mut owner =
-        OwnedProcessGroup::spawn(command, piped).context("cannot start lifecycle hook")?;
+    *retained =
+        Some(OwnedProcessGroup::spawn(command, piped).context("cannot start lifecycle hook")?);
+    let owner = retained.as_mut().context("hook owner was not retained")?;
     let pipes = (|| -> Result<_> {
         let input = HookInput::from_std(owner.take_stdin()?)?;
         let output = HookOutput::from_std(owner.take_stdout()?)?;
@@ -1025,11 +1074,12 @@ async fn spawn(
         Ok((input, output, error))
     })();
     match pipes {
-        Ok((input, output, error)) => Ok((owner, input, output, error)),
+        Ok(pipes) => Ok(pipes),
         Err(error) => {
-            cleanup(&mut owner, Instant::now() + CLEANUP)
+            cleanup(owner, Instant::now() + CLEANUP)
                 .await
                 .context("clean up lifecycle hook after pipe setup failure")?;
+            retained.take();
             Err(error).context("prepare lifecycle hook pipes")
         }
     }
@@ -1039,7 +1089,8 @@ async fn spawn(
 async fn spawn(
     root: &Arc<Directory>,
     hook: &HookCommand,
-) -> Result<(HookOwner, HookInput, HookOutput, HookError)> {
+    retained: &mut Option<HookOwner>,
+) -> Result<(HookInput, HookOutput, HookError)> {
     let system = kuru_platform::windows::process::system_directory()?;
     let mut environment = crate::tools::windows_shell_environment(std::env::vars_os(), &system)?;
     environment.push((HOOK_ORIGIN_ENV.into(), "1".into()));
@@ -1056,7 +1107,8 @@ async fn spawn(
     spec.stderr = NativeStdio::Pipe;
     root.revalidate()
         .context("workspace changed before lifecycle hook launch")?;
-    let mut owner = spec.spawn().await.context("cannot start lifecycle hook")?;
+    *retained = Some(spec.spawn().await.context("cannot start lifecycle hook")?);
+    let owner = retained.as_mut().context("hook owner was not retained")?;
     let pipes = (|| -> Result<_> {
         let input = owner.take_stdin().context("missing lifecycle hook stdin")?;
         let output = owner
@@ -1068,11 +1120,12 @@ async fn spawn(
         Ok((input, output, error))
     })();
     match pipes {
-        Ok((input, output, error)) => Ok((owner, input, output, error)),
+        Ok(pipes) => Ok(pipes),
         Err(error) => {
-            cleanup(&mut owner, Instant::now() + CLEANUP)
+            cleanup(owner, Instant::now() + CLEANUP)
                 .await
                 .context("clean up lifecycle hook after pipe setup failure")?;
+            retained.take();
             Err(error).context("prepare lifecycle hook pipes")
         }
     }
@@ -1119,14 +1172,17 @@ async fn wait_for_exit(
     owner: &mut HookOwner,
     deadline: Instant,
     reply: &oneshot::Sender<Result<HookResponse>>,
+    cleanup_confirmed: &mut bool,
 ) -> Result<(bool, Instant)> {
     loop {
         if reply.is_closed() {
             cleanup(owner, Instant::now() + CLEANUP).await?;
+            *cleanup_confirmed = true;
             bail!("lifecycle hook caller cancelled");
         }
         if Instant::now() >= deadline {
             cleanup(owner, Instant::now() + CLEANUP).await?;
+            *cleanup_confirmed = true;
             bail!("lifecycle hook timed out");
         }
         match owner.root_state() {
@@ -1140,10 +1196,11 @@ async fn wait_for_exit(
         tokio::time::sleep(POLL).await;
     }
     let tail = Instant::now() + CLEANUP;
-    reap_after_exit(owner, tail)
+    let status = reap_after_exit(owner, tail)
         .await
-        .map(|status| (status, tail))
-        .map_err(|error| error.context(CleanupUnconfirmed))
+        .map_err(|error| error.context(CleanupUnconfirmed))?;
+    *cleanup_confirmed = true;
+    Ok((status, tail))
 }
 
 /// The root exited: signal the remaining group before reaping the root, then
@@ -1177,17 +1234,21 @@ async fn wait_for_exit(
     owner: &mut HookOwner,
     deadline: Instant,
     reply: &oneshot::Sender<Result<HookResponse>>,
+    cleanup_confirmed: &mut bool,
 ) -> Result<(bool, Instant)> {
     loop {
         if reply.is_closed() {
             cleanup(owner, Instant::now() + CLEANUP).await?;
+            *cleanup_confirmed = true;
             bail!("lifecycle hook caller cancelled");
         }
         if let Some(status) = owner.try_wait()? {
+            *cleanup_confirmed = true;
             return Ok((status.success(), Instant::now() + CLEANUP));
         }
         if Instant::now() >= deadline {
             cleanup(owner, Instant::now() + CLEANUP).await?;
+            *cleanup_confirmed = true;
             bail!("lifecycle hook timed out");
         }
         tokio::time::sleep(POLL).await;

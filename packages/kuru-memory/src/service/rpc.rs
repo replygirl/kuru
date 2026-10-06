@@ -45,11 +45,27 @@ pub struct ServiceRequest {
     pub id: Uuid,
     pub generation: String,
     pub call: ServiceCall,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<crate::SessionDriverProof>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServiceCall {
+    SelectSessionDriver {
+        selection: crate::SessionDriverSelection,
+    },
+    SessionDriverOutcome {
+        original_id: Uuid,
+        original_generation: String,
+        selection: crate::SessionDriverSelection,
+    },
+    ReattachSessionDriver {
+        original_id: Uuid,
+        original_generation: String,
+        selection: crate::SessionDriverSelection,
+    },
+    LiveSessionDrivers,
     RetireIfIdle,
     TryAcquireDreamLease,
     AppendMessage {
@@ -193,8 +209,10 @@ pub(crate) enum Mutation {
 /// The durable proof a request leaves for its lost-reply outcome query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Receipt {
-    /// Nothing durable to prove. Only `RetireIfIdle` pairs this with a write:
-    /// its only effect is retiring an idle owner; no stored data changes.
+    /// No durable data receipt. Idle retirement and connection-bound driver
+    /// selection/reattachment use this for writes: they change owned resources,
+    /// not stored data. Driver recovery requires completed handler evidence
+    /// for the exact selection tuple and the retained current claim.
     None,
     /// A logical unit receipt stored with the write, named by this method.
     Unit(&'static str),
@@ -254,6 +272,10 @@ impl ServiceCall {
     pub(crate) fn contract(&self) -> OperationContract {
         use OperationContract as C;
         match self {
+            Self::SelectSessionDriver { .. } | Self::ReattachSessionDriver { .. } => {
+                C::write(Receipt::None)
+            }
+            Self::SessionDriverOutcome { .. } | Self::LiveSessionDrivers => C::READ,
             Self::RetireIfIdle => C::write(Receipt::None),
             // Attachment-local lease state; nothing durable changes.
             Self::TryAcquireDreamLease => C::READ,
@@ -638,6 +660,9 @@ pub enum ServiceResponse {
     deny_unknown_fields
 )]
 pub enum ServiceValue {
+    SessionDriver(crate::SessionDriverProof),
+    SessionDriverOutcome(crate::SessionDriverOutcome),
+    LiveSessionDrivers(Vec<crate::LiveSessionDriver>),
     Unit,
     DreamLease {
         acquired: bool,
@@ -757,6 +782,7 @@ pub enum CandidateTransitionResult {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceFault {
+    SessionDriverRejected(crate::SessionDriverRefusal),
     GenerationChanged,
     StorageFailed,
     CandidateConflict,
@@ -771,6 +797,10 @@ pub enum ServiceFault {
 
 #[derive(Default)]
 struct AttachmentState {
+    client: Option<Uuid>,
+    connection: Uuid,
+    generation: String,
+    driver: Option<crate::store::SessionClaimHandle>,
     candidates: HashMap<Uuid, Candidate>,
     exports: HashMap<Uuid, ActiveExportSnapshot>,
     state_cuts: HashMap<Uuid, crate::store::StateReadCut>,
@@ -786,7 +816,7 @@ impl AttachmentState {
     /// Every attachment-held resource. An attachment holding any of them
     /// never accepts idle retirement.
     fn holds_resources(&self) -> bool {
-        self.holds_handles() || self.dream_lease.is_some()
+        self.holds_handles() || self.dream_lease.is_some() || self.driver.is_some()
     }
 }
 
@@ -1361,6 +1391,7 @@ impl ServiceRequest {
             id,
             generation: generation.to_owned(),
             call,
+            driver: None,
         }
     }
 }
@@ -1531,12 +1562,17 @@ pub(super) async fn serve_attached<S: AsyncRead + AsyncWrite + Unpin>(
     retirement: Arc<Retirement>,
     progress: Arc<ReceiptProgress>,
 ) -> Result<()> {
-    let Ok(presented) = super::accept_handshake_presenting(stream, authority).await? else {
+    let Ok(hello) = super::accept_handshake_identified(stream, authority).await? else {
         bail!("memory service handshake rejected");
     };
-    retirement.admit(presented.as_deref());
+    retirement.admit(hello.starter_token.as_deref());
     let store = store.independent_public_reader();
-    let mut state = AttachmentState::default();
+    let mut state = AttachmentState {
+        client: Some(hello.client_id.unwrap_or_else(Uuid::new_v4)),
+        connection: Uuid::new_v4(),
+        generation: authority.service_generation.clone(),
+        ..AttachmentState::default()
+    };
     let result = async {
         while let Some((request, _bytes)) = read_next(stream, budget.clone()).await? {
             #[cfg(test)]
@@ -1603,6 +1639,10 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
     progress: &Arc<ReceiptProgress>,
     request: ServiceRequest,
 ) -> Result<()> {
+    let attached_store = state
+        .client
+        .map(|client| store.with_session_caller(client, request.driver.clone()));
+    let store = attached_store.as_ref().unwrap_or(store);
     let response = if request.generation == authority.service_generation {
         // The receipt outlives the handler's value so that it settles only
         // after the handler returned; a dropped handler never settles.
@@ -1645,7 +1685,11 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(value) => ServiceResponse::Success(Box::new(value)),
             Err(error) => {
                 tracing::warn!(error = %error, "memory service operation failed");
-                let fault = if error
+                let fault = if let Some(rejected) =
+                    error.downcast_ref::<crate::SessionDriverRejected>()
+                {
+                    ServiceFault::SessionDriverRejected(rejected.0.clone())
+                } else if error
                     .downcast_ref::<crate::store::CandidateConflict>()
                     .is_some()
                 {
@@ -1681,6 +1725,7 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
                 #[cfg(any(test, feature = "test-support"))]
                 if let Some(record) = crate::store::candidate_failure_record(&error) {
                     let kind = match fault {
+                        ServiceFault::SessionDriverRejected(_) => "session_driver_rejected",
                         ServiceFault::CandidateRefRejected(_) => "ref_rejected",
                         ServiceFault::CandidateConflict => "candidate_conflict",
                         ServiceFault::ContextSummaryStale => "context_summary_stale",
@@ -1732,6 +1777,92 @@ async fn process<S: AsyncRead + Unpin>(
         progress.pause_after_registration().await?;
     }
     match call {
+        ServiceCall::ReattachSessionDriver {
+            original_id,
+            original_generation,
+            selection,
+        } => {
+            let identity = state
+                .client
+                .context("presence reattachment requires an authenticated client")?;
+            let key = ReceiptKey {
+                view: driver_progress_view(identity, &selection)?,
+                id: original_id,
+            };
+            if original_generation != authority.service_generation {
+                return Ok(ServiceValue::SessionDriverOutcome(
+                    crate::SessionDriverOutcome::StillUncertain,
+                ));
+            }
+            match gate_outcome(progress, &key, OutcomeProbe::None, client).await? {
+                OutcomeGate::Read {
+                    sample: ReceiptProgressState::Completed,
+                    deadline,
+                } => tokio::time::timeout_at(
+                    deadline,
+                    dispatch(
+                        store,
+                        state,
+                        retirement,
+                        id,
+                        ServiceCall::ReattachSessionDriver {
+                            original_id,
+                            original_generation,
+                            selection,
+                        },
+                    ),
+                )
+                .await
+                .context("session presence reattachment deadline exceeded")?,
+                OutcomeGate::InFlight => Ok(ServiceValue::SessionDriverOutcome(
+                    crate::SessionDriverOutcome::InFlight,
+                )),
+                _ => Ok(ServiceValue::SessionDriverOutcome(
+                    crate::SessionDriverOutcome::StillUncertain,
+                )),
+            }
+        }
+        ServiceCall::SessionDriverOutcome {
+            original_id,
+            original_generation,
+            selection,
+        } => {
+            let identity = state
+                .client
+                .context("driver outcome requires an authenticated client")?;
+            let key = ReceiptKey {
+                view: driver_progress_view(identity, &selection)?,
+                id: original_id,
+            };
+            let outcome = if original_generation != authority.service_generation {
+                crate::SessionDriverOutcome::StillUncertain
+            } else {
+                match gate_outcome(progress, &key, OutcomeProbe::None, client).await? {
+                    OutcomeGate::InFlight => crate::SessionDriverOutcome::InFlight,
+                    OutcomeGate::Read {
+                        sample: ReceiptProgressState::Completed,
+                        deadline,
+                    } => {
+                        match tokio::time::timeout_at(
+                            deadline,
+                            store.session_driver_outcome(
+                                identity,
+                                &original_generation,
+                                original_id,
+                                &selection,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(outcome) => outcome?,
+                            Err(_) => crate::SessionDriverOutcome::StillUncertain,
+                        }
+                    }
+                    _ => crate::SessionDriverOutcome::StillUncertain,
+                }
+            };
+            Ok(ServiceValue::SessionDriverOutcome(outcome))
+        }
         ServiceCall::Outcome {
             original_id,
             original_generation,
@@ -1866,6 +1997,16 @@ fn receipt_progress_key(
     state: &AttachmentState,
     store: &MemoryStore,
 ) -> Result<Option<ReceiptKey>> {
+    if let ServiceCall::SelectSessionDriver { selection } = call {
+        let client = state
+            .client
+            .context("session selection requires an authenticated client")?;
+        crate::store::validate_session_driver_selection(selection)?;
+        return Ok(Some(ReceiptKey {
+            view: driver_progress_view(client, selection)?,
+            id,
+        }));
+    }
     let view = match call.contract().receipt {
         Receipt::None => return Ok(None),
         Receipt::Unit(_) => unit_receipt_view(call, state)?,
@@ -1950,6 +2091,10 @@ fn unit_receipt_view(call: &ServiceCall, state: &AttachmentState) -> Result<Stri
             candidate: None, ..
         }
         | ServiceCall::RetireIfIdle
+        | ServiceCall::SelectSessionDriver { .. }
+        | ServiceCall::SessionDriverOutcome { .. }
+        | ServiceCall::ReattachSessionDriver { .. }
+        | ServiceCall::LiveSessionDrivers
         | ServiceCall::TryAcquireDreamLease
         | ServiceCall::AppendMessage { .. }
         | ServiceCall::HistoryWindow { .. }
@@ -2025,6 +2170,19 @@ fn reconciliation_progress_view(branch: &str, from: &str, live: &str) -> String 
         .map(|byte| format!("{byte:02x}"))
         .collect();
     format!("candidate-reconciliation:{digest}")
+}
+
+fn driver_progress_view(client: Uuid, selection: &crate::SessionDriverSelection) -> Result<String> {
+    let mut hash = Sha256::new();
+    hash.update(b"kuru.session-driver.selection.v1\0");
+    hash.update(client.as_bytes());
+    hash.update(serde_json::to_vec(selection)?);
+    let digest: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(format!("session-driver:{digest}"))
 }
 
 struct ReconciliationQuery<'a> {
@@ -2504,14 +2662,26 @@ pub(super) async fn exchange_attached<S: AsyncRead + AsyncWrite + Unpin>(
     exchange_attached_with_id(stream, authority, Uuid::new_v4(), call).await
 }
 
+#[cfg(test)]
 pub(super) async fn exchange_attached_with_id<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     authority: &EndpointAuthority,
     id: Uuid,
     call: ServiceCall,
 ) -> Result<ServiceResponse> {
+    exchange_attached_for_driver(stream, authority, id, call, None).await
+}
+
+pub(super) async fn exchange_attached_for_driver<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    authority: &EndpointAuthority,
+    id: Uuid,
+    call: ServiceCall,
+    driver: Option<crate::SessionDriverProof>,
+) -> Result<ServiceResponse> {
     let reply_deadline = call.contract().reply.deadline();
-    let request = ServiceRequest::with_id(&authority.service_generation, id, call);
+    let mut request = ServiceRequest::with_id(&authority.service_generation, id, call);
+    request.driver = driver;
     write_frame(stream, &request, OPERATION_FRAME_LIMIT, OPERATION_TIMEOUT).await?;
     let reply: ServiceReply = read_frame(stream, OPERATION_FRAME_LIMIT, reply_deadline).await?;
     ensure!(reply.id == request.id, "memory service reply ID changed");
@@ -2552,13 +2722,15 @@ pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite +
     id: Uuid,
     call: ServiceCall,
     pause: &ReplyPause,
+    driver: Option<crate::SessionDriverProof>,
 ) -> Result<ServiceResponse> {
     pause.promotion_sent.store(
         matches!(&call, ServiceCall::PromoteCandidate { .. }),
         Ordering::Release,
     );
     let reply_deadline = call.contract().reply.deadline();
-    let request = ServiceRequest::with_id(&authority.service_generation, id, call);
+    let mut request = ServiceRequest::with_id(&authority.service_generation, id, call);
+    request.driver = driver;
     write_frame(stream, &request, OPERATION_FRAME_LIMIT, OPERATION_TIMEOUT).await?;
     pause.sent.notify_one();
     // One reply deadline bounds the whole pause, including the frame read. A
@@ -2584,6 +2756,9 @@ pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite +
 
 pub(super) fn resolve_response(response: ServiceResponse) -> Result<ServiceValue> {
     match response {
+        ServiceResponse::Rejected(ServiceFault::SessionDriverRejected(reason)) => {
+            Err(crate::SessionDriverRejected(reason).into())
+        }
         ServiceResponse::Success(value) => Ok(*value),
         ServiceResponse::Rejected(ServiceFault::GenerationChanged) => {
             bail!("memory service generation changed during the operation")
@@ -2630,6 +2805,60 @@ async fn dispatch(
     };
     let unit_receipt = call.unit_receipt_bytes(&unit_receipt_view)?;
     let value = match call {
+        ServiceCall::SelectSessionDriver { selection } => {
+            ensure!(
+                !state.holds_handles() && state.dream_lease.is_none(),
+                "session selection requires a dedicated presence attachment"
+            );
+            let handle = store
+                .select_session_driver(
+                    state
+                        .client
+                        .context("session selection requires an authenticated client")?,
+                    state.connection,
+                    &state.generation,
+                    request_id,
+                    &selection,
+                )
+                .await?;
+            let proof = handle.proof().clone();
+            state.driver = Some(handle);
+            ServiceValue::SessionDriver(proof)
+        }
+        ServiceCall::ReattachSessionDriver {
+            original_id,
+            original_generation,
+            selection,
+        } => {
+            ensure!(
+                !state.holds_resources(),
+                "presence reattachment requires an empty dedicated attachment"
+            );
+            ensure!(
+                original_generation == state.generation,
+                "session presence generation changed"
+            );
+            let handle = store
+                .reattach_session_driver(
+                    state
+                        .client
+                        .context("session presence requires an authenticated client")?,
+                    state.connection,
+                    &original_generation,
+                    original_id,
+                    &selection,
+                )
+                .await?;
+            let proof = handle.proof().clone();
+            state.driver = Some(handle);
+            ServiceValue::SessionDriver(proof)
+        }
+        ServiceCall::LiveSessionDrivers => {
+            ServiceValue::LiveSessionDrivers(store.live_session_drivers()?)
+        }
+        ServiceCall::SessionDriverOutcome { .. } => {
+            unreachable!("driver outcomes are handled before dispatch")
+        }
         ServiceCall::RetireIfIdle => ServiceValue::Retirement {
             accepted: !state.holds_resources()
                 && retirement.is_some_and(Retirement::request_if_idle),
@@ -2730,6 +2959,7 @@ async fn dispatch(
                     .view(),
                 None => store.clone(),
             };
+            let view = view.with_request_caller(store);
             let view = if let Some((method, encoded)) = &unit_receipt {
                 view.with_logical_receipt(request_id, method, encoded)
             } else {

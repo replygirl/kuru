@@ -685,6 +685,7 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
     // The contender is now the lifecycle owner but is paused before its first
     // migration mutation. Inspect through the actual read-only attach path.
     let inspection = Server::open(ServerOptions {
+        expected_instance: None,
         binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?,
         directory: project_directory(&options.data_dir, &options.project_scope)?,
         project_scope: options.project_scope.clone(),
@@ -984,6 +985,7 @@ async fn observe_stopped_stage(
     let binary =
         provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?;
     let server = Server::open(ServerOptions {
+        expected_instance: None,
         binary,
         directory: directory.to_owned(),
         project_scope: options.project_scope.clone(),
@@ -1672,6 +1674,7 @@ fn usage_branch_store(store: &MemoryStore) -> Result<MemoryStore> {
         pool,
         branch: usage_ledger::BRANCH.into(),
         logical_receipt: None,
+        session_caller: None,
         public_transcript_proof: Default::default(),
     })
 }
@@ -1977,6 +1980,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
     super::tests::released_v1(&options).await.unwrap();
     let directory = project_directory(&options.data_dir, &options.project_scope).unwrap();
     let server = Server::open(ServerOptions {
+        expected_instance: None,
         binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt"))
             .await
             .unwrap(),
@@ -2001,6 +2005,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             read_only: false,
             write: Arc::new(Mutex::new(())),
             dream: Arc::new(Mutex::new(())),
+            claims: Arc::new(session_claims::SessionClaims::default()),
             uncertain: StdMutex::new(None),
             usage_pool: StdMutex::new(None),
             usage_validated: StdMutex::new(None),
@@ -2014,6 +2019,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
         pool,
         branch: "main".into(),
         logical_receipt: None,
+        session_caller: None,
         public_transcript_proof: Default::default(),
     }
 }
@@ -2110,6 +2116,7 @@ async fn exact_base_schema_branch(store: &MemoryStore) -> SchemaBranch {
             pool,
             branch,
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         },
         base,
@@ -3425,6 +3432,7 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
         shared,
         branch: "main".into(),
         logical_receipt: None,
+        session_caller: None,
         public_transcript_proof: Default::default(),
     };
     assert_schema_commit(&current, &base, &source_history, &receipt).await;
@@ -3588,6 +3596,7 @@ impl AckDropProxy {
             pool: Arc::new(MemoryPool::fixture(pool, &store.branch)),
             branch: store.branch.clone(),
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         }
     }

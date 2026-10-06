@@ -60,6 +60,23 @@ fn spawn_lock() -> MutexGuard<'static, ()> {
     }
 }
 
+/// Start an independently owned child under the same descriptor-copy lock as
+/// owned groups. The caller retains and reaps the returned child; this does not
+/// give a parent group owner authority to terminate the independent service.
+/// Standard input/output are null, and stderr is null or a caller-owned file.
+/// No child waiting or caller callback runs under the spawn lock.
+pub fn spawn_independent(mut command: Command, stderr: Option<std::fs::File>) -> io::Result<Child> {
+    let spawning = spawn_lock();
+    command.process_group(0);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(stderr.map_or_else(Stdio::null, Stdio::from));
+    let child = command.spawn();
+    drop(command);
+    drop(spawning);
+    child
+}
+
 const MAX_EINTR_ATTEMPTS: usize = 8;
 
 /// Why this owner can no longer safely signal its remembered group or root.
@@ -2496,6 +2513,65 @@ mod tests {
         Blocked,
         Spawned,
         Failed,
+    }
+
+    #[test]
+    fn independent_spawn_waits_for_owned_pipe_creation() {
+        let bound = Duration::from_secs(5);
+        let (entered, in_window) = std::sync::mpsc::channel();
+        let (event, events) = std::sync::mpsc::channel();
+        let (seen, first_seen) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            WINDOW.with(|window| {
+                *window.borrow_mut() = Some(Box::new(move || {
+                    let _ = entered.send(());
+                    let _ = seen.send(events.recv_timeout(bound));
+                }));
+            });
+            let mut command = Command::new("/bin/cat");
+            command.env_clear();
+            OwnedProcessGroup::spawn(
+                command,
+                StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Null),
+            )
+        });
+        let second = std::thread::spawn(move || -> io::Result<ExitStatus> {
+            in_window
+                .recv_timeout(bound)
+                .map_err(|error| io::Error::other(format!("owned pipe window absent: {error}")))?;
+            let blocked = event.clone();
+            BLOCKED.with(|seam| {
+                *seam.borrow_mut() = Some(Box::new(move || {
+                    let _ = blocked.send(Second::Blocked);
+                }));
+            });
+            // The same stock cat used by the owned sibling exits on the
+            // independent child's null stdin; /bin/true is absent on macOS.
+            let mut command = Command::new("/bin/cat");
+            command.env_clear();
+            let child = spawn_independent(command, None);
+            BLOCKED.with(|seam| seam.borrow_mut().take());
+            let _ = event.send(if child.is_ok() {
+                Second::Spawned
+            } else {
+                Second::Failed
+            });
+            // An independent child is observed/reaped by its actual caller,
+            // outside the platform lock and without group termination.
+            child?.wait()
+        });
+        let (first, second) = (first.join().unwrap(), second.join().unwrap());
+        let mut first = first.unwrap();
+        let first_event = first_seen.try_recv();
+        drop(first.take_stdin().unwrap());
+        let mut output = first.take_stdout().unwrap();
+        let settled = settle_without_sleep(&mut first, bound);
+        let mut bytes = Vec::new();
+        let eof = output.read_to_end(&mut bytes);
+        settled.unwrap();
+        assert!(second.unwrap().success());
+        assert_eq!(first_event, Ok(Ok(Second::Blocked)));
+        assert_eq!(eof.unwrap(), 0);
     }
 
     #[test]

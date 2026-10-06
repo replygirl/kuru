@@ -65,6 +65,7 @@ pub(crate) async fn partial_readiness(
     prepare_directory(&options.directory, false)?;
     let directory = fs::canonicalize(&options.directory)?;
     let request = Request {
+        expected_instance: None,
         binary: options.binary,
         directory: directory.clone(),
         project_scope: options.project_scope,

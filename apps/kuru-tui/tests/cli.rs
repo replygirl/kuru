@@ -1927,6 +1927,242 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     assert!(env.success(&["run", "plain answer"]).contains("demo"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_resume_and_continue_refuse_before_cli_provider_catalog() -> anyhow::Result<()> {
+    kuru_memory::test_support::closing(async {
+        use axum::{Json, Router, http::{HeaderMap, header::CONTENT_TYPE}, routing::{get, post}};
+        use kuru_memory::{MemoryStore, SessionDriverTarget};
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize}};
+
+        let env = Sandbox::warmed().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let catalog_routes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let inference_routes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::new(AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}/v1", listener.local_addr()?);
+        let catalog_capture = catalog_routes.clone();
+        let inference_capture = inference_routes.clone();
+        let provider_arrived = arrived.clone();
+        let provider_release = release.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/models",
+                    get(move |headers: HeaderMap| {
+                        let counter = counter.clone();
+                        let capture = catalog_capture.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            capture.lock().unwrap().push(headers.get("authorization").unwrap().to_str().unwrap().to_owned());
+                            Json(serde_json::json!({"data":[{"id":"fixture"}]}))
+                        }
+                    }),
+                ).route("/v1/responses", post(move |headers: HeaderMap, Json(_request): Json<Value>| {
+                    let capture = inference_capture.clone();
+                    let arrived = provider_arrived.clone();
+                    let release = provider_release.clone();
+                    let held = held.clone();
+                    async move {
+                        capture.lock().unwrap().push(headers.get("authorization").unwrap().to_str().unwrap().to_owned());
+                        if !held.swap(true, Ordering::SeqCst) {
+                            arrived.notify_one();
+                            release.notified().await;
+                        }
+                        ([(CONTENT_TYPE, "text/event-stream")], format!("data: {}\n\n", serde_json::json!({
+                            "type":"response.completed", "response": {
+                                "id":"resume-race", "status":"completed",
+                                "output":[{"type":"message","content":[{"type":"output_text","text":"COUNTED_RACE_ANSWER"}]}],
+                                "usage":{"input_tokens":3,"output_tokens":2}
+                            }
+                        })))
+                    }
+                })),
+            )
+            .await
+        });
+        // A completed positive control proves that this actual CLI route
+        // contacts the counting catalog, rather than relying on a sleep.
+        let override_base = format!("api_base={}", toml::Value::String(base));
+        let models = tokio::task::block_in_place(|| {
+            env.command_for("responses")
+                .env("OPENAI_API_KEY", "fake-fixture-key")
+                .args(["-c", &override_base, "models"])
+                .output()
+        })?;
+        anyhow::ensure!(
+            models.status.success(),
+            "{}",
+            String::from_utf8_lossy(&models.stderr)
+        );
+        anyhow::ensure!(calls.load(Ordering::SeqCst) == 1);
+        let scope = kuru_runtime::project_scope(&env.project)?;
+        let options =
+            kuru_memory::test_support::warmed_open_options(env.data.clone(), scope).await?;
+        let memory = MemoryStore::open_managed_observed(
+            options,
+            env.project.canonicalize()?,
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        )
+        .1
+        .await?;
+        memory
+            .create_session("held-session", kuru_core::Mode::Ifs, "held")
+            .await?;
+        let (owned, driver) = memory.bind_project_driver(&env.project).await?;
+        let catalog = memory
+            .session_catalog_record("held-session")
+            .await?
+            .unwrap();
+        driver
+            .select(SessionDriverTarget::Catalog(Box::new(catalog)))
+            .await?;
+        let revision = memory.revision().await?;
+        for selection in [&["--resume", "held-session"][..], &["--continue"][..]] {
+            let refused = tokio::task::block_in_place(|| {
+                env.command_for("responses")
+                    .env("OPENAI_API_KEY", "fake-fixture-key")
+                    .args(["-c", &override_base, "--model", "fixture"])
+                    .args(selection)
+                    .args(["run", "must not contact provider", "--json"])
+                    .output()
+            })?;
+            anyhow::ensure!(!refused.status.success());
+            anyhow::ensure!(refused.stdout.is_empty());
+            anyhow::ensure!(
+                String::from_utf8_lossy(&refused.stderr).contains("draining"),
+                "{}",
+                String::from_utf8_lossy(&refused.stderr)
+            );
+            anyhow::ensure!(
+                calls.load(Ordering::SeqCst) == 1,
+                "busy CLI contacted the provider catalog"
+            );
+            anyhow::ensure!(memory.revision().await? == revision);
+            driver.ensure_ready()?;
+        }
+        driver.close().await?;
+        owned.close().await?;
+        anyhow::ensure!(memory.live_session_drivers().await?.is_empty());
+        let make_racer = |label: &str| {
+            #[cfg(unix)]
+            let mut command = env.command_for("responses");
+            #[cfg(windows)]
+            let mut command = {
+                let mut command = kuru_delivery::command::Command::new(env!("CARGO_BIN_EXE_kuru"));
+                command.fixture_allow_independent_service();
+                command.arg("-C").arg(&env.project).arg("--data-dir").arg(&env.data)
+                    .args(["--provider", "responses", "--no-dream"])
+                    .env("XDG_CONFIG_HOME", env.root.path().join("config"))
+                    .env(kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV, env.root.owner_diagnostic_path());
+                command
+            };
+            command.env("OPENAI_API_KEY", format!("fake-race-{label}"))
+                .args(["-c", &override_base, "-c", "max_parallel=1", "--model", "fixture", "--resume", "held-session", "run", label, "--turn-id", label, "--json"]);
+            command
+        };
+        #[cfg(unix)]
+        let (mut first, mut second, first_started, second_started) = {
+            // Both actual native children start while this session is
+            // inactive, before any winning provider arrival is observed.
+            let first = make_racer("a");
+            let second = make_racer("b");
+            let (first_start, first_started) = tokio::sync::oneshot::channel();
+            let (second_start, second_started) = tokio::sync::oneshot::channel();
+            let wait = |command, columns, started: tokio::sync::oneshot::Sender<()>| -> anyhow::Result<(bool, String)> {
+                let mut child = terminal::Terminal::spawn(command, 40, columns)?;
+                // The worker retains the non-Send terminal and confirms real
+                // native creation before the main fixture observes inference.
+                let _ = started.send(());
+                let result: anyhow::Result<(bool, String)> = (|| {
+                    child.wait("competing resume result", kuru_memory::test_budgets::OPERATION_TIMEOUT.saturating_mul(2), |child| {
+                        let output = String::from_utf8_lossy(&child.output);
+                        Ok(output.contains("COUNTED_RACE_ANSWER") || output.contains("draining"))
+                    })?;
+                    child.wait_exited(kuru_memory::test_budgets::OPERATION_TIMEOUT)?;
+                    let text = String::from_utf8_lossy(&child.output).into_owned();
+                    Ok((text.contains("COUNTED_RACE_ANSWER"), text))
+                })();
+                let cleanup = child.close(kuru_memory::test_budgets::OPERATION_TIMEOUT);
+                match result {
+                    Ok(value) => cleanup.map(|()| value),
+                    Err(error) => Err(error.context(format!("owned race cleanup: {cleanup:?}"))),
+                }
+            };
+            (Some(tokio::task::spawn_blocking(move || wait(first, 120, first_start))),
+             Some(tokio::task::spawn_blocking(move || wait(second, 80, second_start))),
+             first_started, second_started)
+        };
+        #[cfg(windows)]
+        let (mut first, mut second) = {
+            let first = make_racer("a");
+            let second = make_racer("b");
+            let wait = |mut command: kuru_delivery::command::Command| async move {
+                let output = command.output().await?;
+                Ok::<_, anyhow::Error>((output.status.success(), format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))))
+            };
+            (Some(tokio::spawn(wait(first))), Some(tokio::spawn(wait(second))))
+        };
+        use futures::FutureExt as _;
+        let race = std::panic::AssertUnwindSafe(async {
+            #[cfg(unix)]
+            tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+                first_started.await?;
+                second_started.await?;
+                Ok::<(), anyhow::Error>(())
+            }).await??;
+            tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, arrived.notified()).await?;
+            let winner_route = inference_routes.lock().unwrap()[0].clone();
+            anyhow::ensure!(inference_routes.lock().unwrap().len() == 1);
+            let first_won = winner_route == "Bearer fake-race-a";
+            anyhow::ensure!(first_won || winner_route == "Bearer fake-race-b");
+            let loser = if first_won { second.take().unwrap() } else { first.take().unwrap() };
+            let (succeeded, text) = loser.await??;
+            anyhow::ensure!(!succeeded && text.contains("draining"), "losing resume did not refuse: {text}");
+            let losing_route = if first_won { "Bearer fake-race-b" } else { "Bearer fake-race-a" };
+            anyhow::ensure!(!catalog_routes.lock().unwrap().iter().any(|route| route == losing_route),
+                "losing resume contacted provider catalog");
+            anyhow::ensure!(inference_routes.lock().unwrap().as_slice() == [winner_route]);
+            let live = memory.live_session_drivers().await?;
+            anyhow::ensure!(live.len() == 1 && live[0].proof.session_id == "held-session");
+            release.notify_one();
+            let winner = if first_won { first.take().unwrap() } else { second.take().unwrap() };
+            let (succeeded, text) = winner.await??;
+            anyhow::ensure!(succeeded && text.contains("COUNTED_RACE_ANSWER"), "winner did not complete: {text}");
+            let public = memory.public_transcript_page("held-session", None, 16).await?;
+            anyhow::ensure!(public.pending.is_none() && public.records.len() == 1);
+            Ok::<(), anyhow::Error>(())
+        }).catch_unwind().await;
+        // Always release a held response and await both actual command owners
+        // before dropping the fixture, even if an assertion or query failed.
+        release.notify_one();
+        let mut cleanup = Vec::new();
+        for pending in [first, second].into_iter().flatten() {
+            match pending.await {
+                Ok(Ok(_)) => {},
+                Ok(Err(error)) => cleanup.push(format!("race child: {error:#}")),
+                Err(error) => cleanup.push(format!("race worker: {error}")),
+            }
+        }
+        if let Err(error) = memory.close().await {
+            cleanup.push(format!("race memory: {error:#}"));
+        }
+        server.abort();
+        let _ = server.await;
+        match race {
+            Ok(result) => result?,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        anyhow::ensure!(cleanup.is_empty(), "{}", cleanup.join("; "));
+        Ok(())
+    })
+    .await
+}
+
 #[test]
 fn discovered_local_config_requires_untracked_git_provenance_and_preserves_repo_claims() {
     let env = Sandbox::new();

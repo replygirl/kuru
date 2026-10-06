@@ -19,6 +19,7 @@ async fn prepared_snapshot_runs_real_supervisor_after_cargo_alias_disappears_and
     fs::remove_file(&source)?;
     let binary = test_support::warm_runtime_cache().await?;
     let options = ServerOptions {
+        expected_instance: None,
         binary,
         directory: root.path().join("actual store"),
         project_scope: "snapshot-lifetime-fixture".into(),

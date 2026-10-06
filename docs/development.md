@@ -310,8 +310,11 @@ Owned Unix children (`kuru_platform::unix::OwnedProcessGroup`) declare their
 standard streams as a `StdioPlan`; the platform creates each pipe close-on-exec
 and starts the child under one platform spawn lock, so a concurrent owned child
 cannot inherit another's pipe ends (std's macOS pipes set close-on-exec in a
-second step). The bounded `ps` snapshot spawns under the same lock. Unrelated
-legacy spawns (the memory supervisor, Dolt engine and service, delivery
+second step). The bounded `ps` snapshot spawns under the same lock. Independent
+memory-service launches also use that lock through `spawn_independent`, with
+null stdin/stdout and null or private-file stderr; their existing caller still
+retains and reaps the child without group kill-on-drop authority. Unrelated
+legacy spawns (the memory supervisor and Dolt engine, delivery
 runners, the TUI's git, updater and browser opener) and other non-atomic
 descriptor creation can still inherit, or leak into owned children; concurrent
 callers requiring isolation must use the platform consistently. On std's fork
@@ -581,8 +584,11 @@ and shuts down as soon as its last client and accepted work have drained; it is
 not an installed system daemon. The command that exits does not wait for that
 close, so CLI and PTY fixtures that use a temporary project await the owner's
 exit (`test_support::await_owner_release`, below) or its quiescence before
-removing their fixture directory. The application still holds the project conversation-driver lease,
-so this service boundary does not make simultaneous conversation tests valid.
+removing their fixture directory. Ordinary drivers hold distinct native session
+leases and owner-checked claims, so simultaneous different-session fixtures are
+valid. A held cleanup lease still excludes another driver of the same session,
+including after memory-owner restart; maintenance requires exclusive project
+ownership after every such lease has been released.
 
 Dolt panics at close when its data directory disappears before it exits, so a
 fixture root from `kuru_memory::test_support::tempdir()` requires, when it
@@ -2318,6 +2324,32 @@ at its bound rather than after 2 s.
 
 ## Memory service protocol
 
+`bind_project_driver` gives each runtime its own authenticated client identity
+and dedicated presence connection. `SessionDriver::select` checks the exact old
+claim and captured target catalog under the owner's mutation guard. Refusal
+changes neither claim; an accepted selection transfers ownership before local
+session/context publication. A lost reply retains the complete pending tuple and
+fences further driver work. Same-generation recovery requires the matching
+completed handler proof before checked reattachment; unknown progress and a
+missing successor claim map cannot prove a selection outcome.
+
+Driver proof is checked at session-bound mutation boundaries, including raw
+history, journal and compaction checkpoints. Own catalog updates do not invalidate
+that retained claim, but later selection still checks a newly captured full
+catalog. Other clients cannot mutate a driven session's lifecycle. Live inventory
+exposes safe session/generation metadata; standalone inspection reports unknown
+presence. Dedicated presence EOF releases its exact claim, and last-client
+retirement remains immediate.
+
+Native session leases retain shared maintenance exclusion and an exclusive
+session barrier through locally owned cleanup. They prevent a surviving old
+driver and a new memory-owner generation from driving the same session together.
+They do not prove remote effects were rolled back. Recovery carries the expected
+existing StoreInstance into coordinated startup before any creation, so an old
+client cannot recreate purged storage. After actual local drain, explicit
+`/resume CURRENT_ID` checks the existing store and fresh catalog/claim before
+reloading private context or allowing another dispatch.
+
 Project `MemoryStore::get_versioned` returns a value and its row version, or
 `None` for absence. `put_many_conditional` compares `StateExpectation::Absent`
 or `Version(version)` before publishing every value atomically. Every expected
@@ -2370,8 +2402,10 @@ assumption as the uncertain-write fence: Dolt removes a session's process-list
 entry only after the session's running command returns. The store test
 `receipt_is_hidden_before_dolt_commit_and_durable_without_sql_commit` measures
 the receipt visibility that the lock-free probe depends on.
-A new variant does not compile until it has an entry. A write must also carry a
-receipt; idle retirement is the only exception. Add the variant's sample and
+A new variant does not compile until it has an entry. A durable write must carry
+a receipt. Connection-bound driver selection and reattachment are volatile
+resource transitions proved by exact handler completion and current claim
+identity; they do not invent durable registration receipts. Add the variant's sample and
 classification row to `service/rpc/contract_tests.rs`.
 
 `service/rpc/protocol-surface.txt` pins the wire surface to `PROTOCOL_MAJOR`

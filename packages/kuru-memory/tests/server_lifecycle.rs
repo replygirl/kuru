@@ -34,6 +34,7 @@ async fn engine() -> Result<PathBuf> {
 
 fn options(root: &Path, binary: PathBuf) -> ServerOptions {
     ServerOptions {
+        expected_instance: None,
         binary,
         directory: root.join("project café"),
         project_scope: "project/server-fixture".into(),

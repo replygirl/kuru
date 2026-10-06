@@ -30,7 +30,7 @@ pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, Servic
 pub const PROTOCOL_MAJOR: u16 = 1;
 // Exact-ref recovery and session-provenance calls require this owner version.
 // Older owners reject the new client before a mutating frame.
-pub const PROTOCOL_MINOR: u16 = 11;
+pub const PROTOCOL_MINOR: u16 = 12;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest single accept wait before the serve loop re-verifies its owner
@@ -205,10 +205,28 @@ fn parse_service_arguments(
     let starter_token = arguments
         .next()
         .map(|token| {
+            if token == "-" {
+                return Ok(None);
+            }
             token
                 .to_str()
                 .and_then(|token| uuid::Uuid::parse_str(token).ok())
                 .context("invalid service starter token")
+                .map(Some)
+        })
+        .transpose()?
+        .flatten();
+    let expected_instance = arguments
+        .next()
+        .map(|instance| {
+            let instance = instance
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("expected memory instance is not UTF-8"))?;
+            ensure!(
+                uuid::Uuid::parse_str(&instance)?.to_string() == instance,
+                "invalid expected memory instance"
+            );
+            Ok::<_, anyhow::Error>(instance)
         })
         .transpose()?;
     ensure!(arguments.next().is_none(), "unexpected service argument");
@@ -225,6 +243,7 @@ fn parse_service_arguments(
     options.config.startup_timeout_secs = startup_timeout_secs;
     options.supervisor = supervisor;
     options.starter_token = starter_token;
+    options.expected_instance = expected_instance;
     Ok((project, options))
 }
 
@@ -361,6 +380,7 @@ pub struct ServiceAttachment {
     /// connection has been installed. Only with `retain_after_abandon`.
     held: Option<LocalStream>,
     retain_after_abandon: bool,
+    identity: AttachmentIdentity,
     authority: EndpointAuthority,
     locator: Option<AttachmentLocator>,
     last_fault: Option<rpc::ServiceFault>,
@@ -408,9 +428,59 @@ struct AttachmentLocator {
 pub(crate) struct AttachmentFactory {
     authority: EndpointAuthority,
     locator: AttachmentLocator,
+    identity: AttachmentIdentity,
+}
+
+#[derive(Clone)]
+struct AttachmentIdentity {
+    client: uuid::Uuid,
+    proof: Arc<std::sync::Mutex<Option<crate::SessionDriverProof>>>,
+}
+
+impl AttachmentIdentity {
+    fn new() -> Self {
+        Self {
+            client: uuid::Uuid::new_v4(),
+            proof: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
 }
 
 impl AttachmentFactory {
+    /// Keep one logical driver's identity across an independently checked
+    /// successor endpoint. This adopts no old generation as new authority.
+    pub(crate) fn for_checked_successor_of(&self, previous: &Self) -> Result<Self> {
+        ensure!(
+            self.authority.project_path == previous.authority.project_path
+                && self.authority.project_scope == previous.authority.project_scope
+                && self.authority.store_instance == previous.authority.store_instance,
+            "memory identity changed before logical client reattachment"
+        );
+        Ok(Self {
+            identity: previous.identity.clone(),
+            ..self.clone()
+        })
+    }
+
+    /// A Harness cloned from an existing view still has its own driver.
+    pub(crate) fn for_new_driver(&self) -> Self {
+        Self {
+            identity: AttachmentIdentity::new(),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn publish_driver_proof(
+        &self,
+        proof: Option<crate::SessionDriverProof>,
+    ) -> Result<()> {
+        *self
+            .identity
+            .proof
+            .lock()
+            .map_err(|_| anyhow::anyhow!("driver proof state is unavailable"))? = proof;
+        Ok(())
+    }
     pub(crate) fn store_instance(&self) -> &str {
         &self.authority.store_instance
     }
@@ -423,11 +493,18 @@ impl AttachmentFactory {
             HANDSHAKE_TIMEOUT,
         )
         .await?;
-        connect_handshake(&mut stream, &self.authority).await?;
+        connect_handshake_identified(
+            &mut stream,
+            &self.authority,
+            None,
+            Some(self.identity.client),
+        )
+        .await?;
         Ok(ServiceAttachment {
             stream: Some(stream),
             held: None,
             retain_after_abandon: false,
+            identity: self.identity.clone(),
             authority: self.authority.clone(),
             locator: Some(self.locator.clone()),
             last_fault: None,
@@ -450,6 +527,19 @@ impl ServiceAttachment {
         self.stream.is_some()
     }
 
+    /// A dedicated idle presence connection receives no unsolicited frames.
+    /// Only an actual read outcome, never a polling deadline, signals loss.
+    pub(crate) async fn wait_for_presence_loss(&mut self) -> Result<()> {
+        let stream = self
+            .stream
+            .as_mut()
+            .context("presence attachment is closed")?;
+        let mut byte = [0_u8; 1];
+        let count = stream.read(&mut byte).await?;
+        ensure!(count == 0, "unexpected frame on idle presence attachment");
+        Ok(())
+    }
+
     /// A generic storage failure can conceal a committed but unresolved
     /// operation; a complete wire reply alone is not mutation proof.
     pub(crate) fn has_definite_mutation_reply(&self) -> bool {
@@ -466,6 +556,20 @@ impl ServiceAttachment {
         id: uuid::Uuid,
         call: ServiceCall,
     ) -> Result<ServiceValue> {
+        let proof = self
+            .identity
+            .proof
+            .lock()
+            .map_err(|_| anyhow::anyhow!("driver proof state is unavailable"))?
+            .clone();
+        let mut envelope = rpc::ServiceRequest::with_id(self.generation(), id, call);
+        envelope.driver = proof.clone();
+        self.last_fault = None;
+        ensure!(
+            rpc::encoded_bytes(&envelope)? <= rpc::OPERATION_FRAME_LIMIT,
+            "managed operation request exceeds its exact frame envelope"
+        );
+        let call = envelope.call;
         let stream = self
             .stream
             .take()
@@ -486,14 +590,17 @@ impl ServiceAttachment {
                 id,
                 call,
                 &pause,
+                proof,
             )
             .await?
         } else {
-            rpc::exchange_attached_with_id(in_flight.stream(), &self.authority, id, call).await?
+            rpc::exchange_attached_for_driver(in_flight.stream(), &self.authority, id, call, proof)
+                .await?
         };
         #[cfg(not(any(test, feature = "test-support")))]
         let response =
-            rpc::exchange_attached_with_id(in_flight.stream(), &self.authority, id, call).await?;
+            rpc::exchange_attached_for_driver(in_flight.stream(), &self.authority, id, call, proof)
+                .await?;
         let stream = in_flight.complete();
         self.last_fault = match &response {
             rpc::ServiceResponse::Rejected(fault) => Some(fault.clone()),
@@ -517,6 +624,7 @@ impl ServiceAttachment {
         Ok(AttachmentFactory {
             authority: self.authority.clone(),
             locator: locator.clone(),
+            identity: self.identity.clone(),
         })
     }
 
@@ -1216,7 +1324,15 @@ async fn try_attach_observed(
             None => return Err(error),
         },
     };
-    match connect_handshake_presenting(&mut stream, &record.authority, starter_token).await {
+    let identity = AttachmentIdentity::new();
+    match connect_handshake_identified(
+        &mut stream,
+        &record.authority,
+        starter_token,
+        Some(identity.client),
+    )
+    .await
+    {
         Ok(()) => {}
         // Endpoint retirement and final transport close are distinct steps.
         // A client can connect to the retiring endpoint just before the owner
@@ -1230,6 +1346,7 @@ async fn try_attach_observed(
         stream: Some(stream),
         held: None,
         retain_after_abandon: false,
+        identity,
         authority: record.authority,
         locator: Some(AttachmentLocator {
             data: data.to_owned(),
@@ -1294,23 +1411,27 @@ fn is_no_free_instance(_error: &io::Error) -> bool {
 }
 
 fn ensure_project_scope(project: &Path, scope: &str) -> Result<()> {
-    ensure!(
-        project.is_absolute() && std::fs::canonicalize(project)? == project && project.is_dir(),
-        "memory service project path must be a canonical directory"
-    );
-    let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
-    let expected = format!(
-        "project/{}",
-        digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
+    let expected = canonical_project_scope(project)?;
     ensure!(
         scope == expected,
         "memory service project scope does not match its canonical path"
     );
     Ok(())
+}
+
+pub(crate) fn canonical_project_scope(project: &Path) -> Result<String> {
+    ensure!(
+        project.is_absolute() && std::fs::canonicalize(project)? == project && project.is_dir(),
+        "memory service project path must be a canonical directory"
+    );
+    let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+    Ok(format!(
+        "project/{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 /// [`attach_or_start_observed`] with nobody observing.
@@ -1326,6 +1447,24 @@ pub async fn attach_or_start(
         &mut ProgressReporter::silent(),
     )
     .await
+}
+
+/// Reattach only to this client's original store. The elected owner carries
+/// the expectation into its locked storage open; an absent store is not made.
+pub(crate) async fn attach_or_start_existing(
+    options: &crate::store::OpenOptions,
+    project: &Path,
+    executable: &Path,
+    expected_instance: &str,
+) -> Result<ServiceAttachment> {
+    let mut options = options.clone();
+    options.expected_instance = Some(expected_instance.to_owned());
+    let attachment = attach_or_start(&options, project, executable).await?;
+    ensure!(
+        attachment.store_instance() == expected_instance,
+        "memory store identity changed before existing-client attachment"
+    );
+    Ok(attachment)
 }
 
 /// [`attach_existing_observed`] with nobody observing; only tests inspect
@@ -1362,6 +1501,11 @@ fn service_arguments(
     ];
     if let Some(token) = starter_token {
         arguments.push(token.to_string().into());
+    } else if options.expected_instance.is_some() {
+        arguments.push("-".into());
+    }
+    if let Some(instance) = &options.expected_instance {
+        arguments.push(instance.into());
     }
     arguments
 }
@@ -1374,14 +1518,9 @@ async fn spawn_service(
     stderr: Option<File>,
     starter_token: Option<uuid::Uuid>,
 ) -> Result<std::process::Child> {
-    use std::os::unix::process::CommandExt;
     let mut command = std::process::Command::new(executable);
     command.args(service_arguments(options, project, starter_token));
     command.current_dir(project);
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::null());
-    command.stderr(stderr.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
-    command.process_group(0);
     // Test-support measurement only: name the originating test in the trace.
     #[cfg(any(test, feature = "test-support"))]
     for (name, value) in crate::test_support::lifecycle_trace::forwarded() {
@@ -1400,7 +1539,8 @@ async fn spawn_service(
     // `crate::spawn_gate`.
     #[cfg(test)]
     let _creation = crate::spawn_gate::child_creation().await;
-    let child = command.spawn().context("start project memory service")?;
+    let child = kuru_platform::unix::spawn_independent(command, stderr)
+        .context("start project memory service")?;
     // Test-support only: the owner leaves this process group, so a coverage
     // partition names the test behind it if it outlives that test.
     #[cfg(any(test, feature = "test-support"))]
@@ -2475,6 +2615,7 @@ impl Drop for ServiceLock {
 pub(crate) struct MaintenancePermit {
     _owner: ServiceLock,
     _start: ServiceLock,
+    _native: crate::session_driver::NativeMaintenanceLease,
 }
 
 /// Where a maintenance permit acquisition is, for a caller whose own bound
@@ -2726,6 +2867,13 @@ pub(crate) async fn acquire_maintenance_permit_traced(
         !options.read_only,
         "memory maintenance requires writable options"
     );
+    // A vanished service is not proof that a surviving conversation's native
+    // work drained. Acquire the exact existing project barrier first and keep
+    // it through owner/start ownership and all maintenance directory moves.
+    let native = crate::session_driver::NativeMaintenanceLease::acquire(
+        &options.data_dir,
+        &options.project_scope,
+    )?;
     let deadline = tokio::time::Instant::now() + maintenance_deadline(options);
     trace.wait_for(MaintenancePhase::StartLock);
     let start = loop {
@@ -2790,6 +2938,7 @@ pub(crate) async fn acquire_maintenance_permit_traced(
     Ok(MaintenancePermit {
         _owner: owner,
         _start: start,
+        _native: native,
     })
 }
 
@@ -2836,6 +2985,7 @@ async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<
         stream: Some(stream),
         held: None,
         retain_after_abandon: false,
+        identity: AttachmentIdentity::new(),
         authority: record.authority,
         locator: None,
         last_fault: None,
@@ -3183,6 +3333,10 @@ pub struct ClientHello {
     /// serializes as before. Not a secret, but left out of `Debug`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starter_token: Option<String>,
+    /// Authenticated connection identity shared by one driver's attachments.
+    /// It is not permission without the owner's exact selected claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<uuid::Uuid>,
 }
 
 impl std::fmt::Debug for ClientHello {
@@ -3221,11 +3375,15 @@ impl EndpointAuthority {
             connection_secret: self.connection_secret.clone(),
             schema_version: self.schema_version,
             starter_token: None,
+            client_id: None,
         }
     }
 
     pub fn verify(&self, hello: &ClientHello) -> std::result::Result<(), HandshakeRejection> {
-        if hello.version.major != self.version.major || hello.version.minor > self.version.minor {
+        if hello.version.major != self.version.major
+            || hello.version.minor > self.version.minor
+            || hello.version.minor < PROTOCOL_MINOR
+        {
             return Err(HandshakeRejection::Protocol);
         }
         if hello.project_path != self.project_path || hello.project_scope != self.project_scope {
@@ -3291,6 +3449,15 @@ pub(crate) async fn accept_handshake_presenting<S: AsyncRead + AsyncWrite + Unpi
     stream: &mut S,
     authority: &EndpointAuthority,
 ) -> Result<std::result::Result<Option<String>, HandshakeRejection>> {
+    Ok(accept_handshake_identified(stream, authority)
+        .await?
+        .map(|hello| hello.starter_token))
+}
+
+pub(crate) async fn accept_handshake_identified<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    authority: &EndpointAuthority,
+) -> Result<std::result::Result<ClientHello, HandshakeRejection>> {
     let hello: ClientHello = read_frame(stream, HANDSHAKE_LIMIT, HANDSHAKE_TIMEOUT).await?;
     let decision = authority.verify(&hello);
     let reply = match decision {
@@ -3301,7 +3468,7 @@ pub(crate) async fn accept_handshake_presenting<S: AsyncRead + AsyncWrite + Unpi
         Err(reason) => HandshakeReply::Rejected { reason },
     };
     write_frame(stream, &reply, HANDSHAKE_LIMIT, HANDSHAKE_TIMEOUT).await?;
-    Ok(decision.map(|()| hello.starter_token))
+    Ok(decision.map(|()| hello))
 }
 
 /// Verify that the peer accepted exactly the generation requested. The
@@ -3320,12 +3487,22 @@ async fn connect_handshake_presenting<S: AsyncRead + AsyncWrite + Unpin>(
     authority: &EndpointAuthority,
     starter_token: Option<uuid::Uuid>,
 ) -> Result<()> {
+    connect_handshake_identified(stream, authority, starter_token, None).await
+}
+
+async fn connect_handshake_identified<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    authority: &EndpointAuthority,
+    starter_token: Option<uuid::Uuid>,
+    client_id: Option<uuid::Uuid>,
+) -> Result<()> {
     ensure!(
         authority.version.major == PROTOCOL_MAJOR && authority.version.minor >= PROTOCOL_MINOR,
         "memory service protocol is incompatible; close the active Kuru session or use its matching version"
     );
     let mut hello = authority.hello();
     hello.starter_token = starter_token.map(|token| token.to_string());
+    hello.client_id = client_id;
     write_frame(stream, &hello, HANDSHAKE_LIMIT, HANDSHAKE_TIMEOUT).await?;
     let reply: HandshakeReply = read_frame(stream, HANDSHAKE_LIMIT, HANDSHAKE_TIMEOUT).await?;
     match reply {
@@ -6570,6 +6747,7 @@ mod tests {
                 stream: Some(stream),
                 held: None,
                 retain_after_abandon: false,
+                identity: AttachmentIdentity::new(),
                 authority: expected,
                 locator: None,
                 last_fault: None,
@@ -10725,6 +10903,7 @@ mod tests {
                 stream: Some(stream),
                 held: None,
                 retain_after_abandon: false,
+                identity: AttachmentIdentity::new(),
                 authority: expected,
                 locator: None,
                 last_fault: None,

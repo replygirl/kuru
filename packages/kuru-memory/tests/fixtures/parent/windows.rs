@@ -71,6 +71,7 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
     let options = ServerOptions {
+        expected_instance: None,
         binary: PathBuf::from(&arguments[2]),
         directory: root.join("store café 東京"),
         project_scope: "native-owner-fixture".into(),

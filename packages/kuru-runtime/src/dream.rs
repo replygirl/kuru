@@ -73,6 +73,7 @@ impl Harness {
         cancellation: &CancellationToken,
         reset_context: bool,
     ) -> Result<DreamReport> {
+        let _driver_work = self.driver_work(cancellation)?;
         if reset_context {
             self.reset_context_snapshot();
         }
@@ -459,6 +460,15 @@ impl Harness {
                     .fixture_pause_next_service_reply(&barrier)
                     .await?;
             }
+            if let Some(PendingPublication {
+                proof: PublicationProof::CandidatePromotion { status, .. },
+                ..
+            }) = &mut self.pending_publication
+            {
+                // From this exact send boundary a lost reply must use typed
+                // transition recovery, never replay the checked promotion.
+                *status = CandidatePromotionStatus::Pending;
+            }
             match candidate.promote_exact(&target).await {
                 Ok(promoted) => {
                     ensure!(
@@ -504,7 +514,7 @@ impl Harness {
         };
         *base = candidate.base().to_owned();
         *target = head;
-        *status = CandidatePromotionStatus::Pending;
+        *status = CandidatePromotionStatus::Reconciled;
         self.pending_candidate = Some(candidate);
         Ok(())
     }
@@ -649,9 +659,14 @@ impl Harness {
                 .map(|pending| &pending.proof),
             Some(PublicationProof::CandidatePromotion {
                 status: CandidatePromotionStatus::OpenUnchanged
-                    | CandidatePromotionStatus::OpenConflict,
+                    | CandidatePromotionStatus::OpenConflict
+                    | CandidatePromotionStatus::Reconciled,
                 ..
             })
+        );
+        ensure!(
+            self.pending_candidate_resolution != PendingCandidateResolution::AbandonSent,
+            "previous dream abandonment must resolve before another request"
         );
         ensure!(
             open_promotion
@@ -1206,12 +1221,15 @@ mod cancellation_tests {
             drop(lease);
             ensure!(matches!(harness.pending_publication.as_ref().map(|pending| &pending.proof),
                 Some(PublicationProof::CandidatePromotion { status: CandidatePromotionStatus::Reconciling { from: retained_from, live: retained_live }, reconciliation_attempts: 1, .. }) if retained_from == &from && retained_live == &live));
-            ensure!(memory.put("fenced", &json!(true)).await.is_err());
+            ensure!(harness.memory.put("fenced", &json!(true)).await.is_err());
             if restart_owner {
+                harness.disconnect_driver_presence_for_test().await?;
                 candidate.view().close_transport_for_test().await?;
+                harness.memory.close_transport_for_test().await?;
                 memory.close_transport_for_test().await?;
                 sibling.close_transport_for_test().await?;
-                kuru_memory::test_support::retire_idle_service(&options).await?;
+                kuru_memory::test_support::await_owner_release(&options).await?;
+                harness.reopen_session_after_owner_loss().await?;
             }
             harness.reconcile().await?;
             ensure!(harness.topology.parts.len() == original_count + 1 && harness.pending_candidate.is_none());
@@ -1547,6 +1565,62 @@ mod cancellation_tests {
                     .await?;
                 ensure!(harness.pending_candidate.is_none());
                 ensure!(memory.revision().await? == live);
+
+                // A proved merge is still private until promotion. Selecting
+                // discard must not run generic recovery that promotes it.
+                let candidate = stage_reconciliation_dream(&mut harness).await?;
+                let branch = candidate.branch().to_owned();
+                let base = candidate.base().to_owned();
+                let from = candidate.view().revision().await?;
+                memory
+                    .append("sibling/notes", "user", "retain before explicit discard")
+                    .await?;
+                let live = memory.revision().await?;
+                let membership_key = checked_state_keys(&harness.scope, &harness.profile)?.membership;
+                let membership = memory.get(&membership_key).await?;
+                let Some(PendingPublication {
+                    proof: PublicationProof::CandidatePromotion { status, .. },
+                    ..
+                }) = &mut harness.pending_publication else {
+                    anyhow::bail!("staged dream proof absent");
+                };
+                *status = CandidatePromotionStatus::Reconciling {
+                    from: from.clone(),
+                    live: live.clone(),
+                };
+                let refusal = harness
+                    .abandon_candidate_ref_exact(&branch, &base, &from)
+                    .await
+                    .unwrap_err();
+                ensure!(refusal.is::<CandidateResolutionRequired>());
+                ensure!(memory.revision().await? == live);
+                ensure!(memory.get(&membership_key).await? == membership);
+                ensure!(memory.candidate_ref_status(&branch).await?.head.as_deref() == Some(from.as_str()));
+
+                let lease = memory.acquire_dream_lease().await?;
+                let reconciled = candidate.reconcile_with_live(&from, &live).await?;
+                let CandidateReconciliationResult::Reconciled { head, .. } = reconciled.result else {
+                    anyhow::bail!("explicit discard fixture did not reconcile");
+                };
+                let fresh = reconciled.candidate.context("fresh reconciled handle absent")?;
+                let base = fresh.base().to_owned();
+                harness.adopt_reconciled_dream(fresh, head.clone())?;
+                drop(lease);
+
+                // A previously sent abandonment is a separate unresolved
+                // request even when the publication proof remains Reconciled.
+                harness.pending_candidate_resolution = PendingCandidateResolution::AbandonSent;
+                ensure!(harness.abandon_pending_dream_exact(&branch, &base, &head).await.is_err());
+                ensure!(memory.revision().await? == live);
+                ensure!(memory.candidate_ref_status(&branch).await?.head.as_deref() == Some(head.as_str()));
+                harness.pending_candidate_resolution = PendingCandidateResolution::Explicit;
+                harness.abandon_candidate_ref_exact(&branch, &base, &head).await?;
+                ensure!(harness.pending_candidate.is_none() && harness.pending_publication.is_none());
+                ensure!(memory.revision().await? == live);
+                ensure!(memory.get(&membership_key).await? == membership);
+                let abandoned = memory.candidate_ref_status(&branch).await?;
+                ensure!(abandoned.branch == branch && abandoned.state == kuru_memory::CandidateRefState::Missing);
+                ensure!(memory.history("sibling/notes", 10).await?[0].plain_text() == Some("retain before explicit discard"));
                 harness.shutdown(false).await?;
                 memory.close().await
             })
@@ -1733,6 +1807,7 @@ mod cancellation_tests {
                     // The accepted reply is still lost and the old logical
                     // receipt remains. Release only generation-local transports,
                     // then reap the exact owner before querying its successor.
+                    harness.disconnect_driver_presence_for_test().await?;
                     harness
                         .pending_candidate
                         .as_ref()
@@ -1740,9 +1815,11 @@ mod cancellation_tests {
                         .view()
                         .close_transport_for_test()
                         .await?;
+                    harness.memory.close_transport_for_test().await?;
                     memory.close_transport_for_test().await?;
                     sibling.close_transport_for_test().await?;
-                    kuru_memory::test_support::retire_idle_service(&options).await?;
+                    kuru_memory::test_support::await_owner_release(&options).await?;
+                    harness.reopen_session_after_owner_loss().await?;
                 }
                 harness
                     .reconcile()

@@ -3519,6 +3519,7 @@ mod tests {
                 pool: old_pool.clone(),
                 branch: "historical_schema8".into(),
                 logical_receipt: None,
+                session_caller: None,
                 public_transcript_proof: Default::default(),
             };
             let before = durable_snapshot(&old_pool).await?;
@@ -3617,6 +3618,7 @@ mod tests {
             pool: old_pool.clone(),
             branch: old_head.clone(),
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         };
         assert_eq!(
@@ -3644,6 +3646,7 @@ mod tests {
             pool: candidate_pool.clone(),
             branch: candidate_name,
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         };
         candidate.append("private/notes", "note", legacy).await?;

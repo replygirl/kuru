@@ -1212,7 +1212,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         Err(error) => return Err(error).context("cannot inspect legacy memory"),
     };
     let migrate = legacy && !exists;
-    let _lease = if writer || migrate {
+    let mut project_maintenance = if !purge && ((writer && !runtime_owner) || migrate) {
         if let Err(error) = Directory::ensure_private(&data) {
             return Err(data_directory_error(&data, error));
         }
@@ -1222,6 +1222,10 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         None
     };
     if purge {
+        if let Err(error) = Directory::ensure_private(&data) {
+            return Err(data_directory_error(&data, error));
+        }
+        ensure_outside_workspace(&data, &cwd)?;
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config;
         let outcome = MemoryStore::purge(options).await?;
@@ -1526,6 +1530,9 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
             }
         };
         memory_to_close = Some(memory.clone());
+        // Legacy activation is complete. Conversation admission owns a native
+        // session barrier instead of excluding every driver in this project.
+        if runtime_owner { project_maintenance.take(); }
         let resume = if cli.continue_session {
             Some(Harness::continuation_session(&memory, &cwd).await?)
         } else if let Some(session_id) = cli.resume.as_deref() {
@@ -1533,8 +1540,16 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         } else {
             None
         };
-        let provider = provider(&config, &cwd, &data).await?;
-        let models = select_model(&mut config, &provider).await?;
+        let admission = Harness::admit_session(memory.clone(), &cwd, resume.as_deref()).await?;
+        let setup = async {
+            let provider = provider(&config, &cwd, &data).await?;
+            let models = select_model(&mut config, &provider).await?;
+            Ok::<_, anyhow::Error>((provider, models))
+        }.await;
+        let (provider, models) = match setup {
+            Ok(setup) => setup,
+            Err(error) => return finish(Err(error), admission.close().await, "session admission"),
+        };
         let notice = crate::memory_notice::MemoryNotice::pending(memory.clone()).await?;
         if matches!(
             cli.command,
@@ -1553,13 +1568,12 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         let tools = permission_host(&data, root.clone(), &config, &snapshot, true)?
             .with_instruction_gate(prompt_gate.clone())
             .with_skill_gate(prompt_gate, has_skills);
-        let mut harness = Harness::with_tool_host_and_instructions(
+        let mut harness = Harness::with_admission_and_instructions(
             config,
             &cwd,
             snapshot.instructions().to_owned(),
-            memory,
+            admission,
             provider,
-            resume.as_deref(),
             tools,
         )
         .await?;
@@ -1723,7 +1737,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         (Err(error), Ok(())) => Err(error),
     };
     // The stdout-only worker cannot extend the project writer lifetime.
-    drop(_lease);
+    drop(project_maintenance);
     if let Some(delivery) = run_delivery {
         delivery.finish(settled).await
     } else {

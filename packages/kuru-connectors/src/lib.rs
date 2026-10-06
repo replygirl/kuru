@@ -27,6 +27,8 @@ mod tools;
 #[cfg(unix)]
 mod unix_shell;
 mod web_fetch;
+#[cfg(windows)]
+mod windows_shell;
 
 #[cfg(test)]
 mod test_support;
@@ -43,6 +45,9 @@ pub use hooks::{
     MAX_PRE_TURN_INPUT_BYTES, PostHookRun, PreHookOutcome, PreHookRun, PreToolValue, PreTurnValue,
     SpeakerHookOutcome, SpeakerHookRun,
 };
+/// Drop-only ownership captured for one invocation's retained native work.
+/// It conveys no tool capability, session identity or completion evidence.
+pub type InvocationHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 pub use instruction_review::{
     InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
     InstructionReviewRequest, InstructionReviewSender, SkillGate,

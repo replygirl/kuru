@@ -1668,6 +1668,7 @@ async fn non_table_objects_fail_the_template_shape() -> Result<()> {
     crate::server::write_template_build_identity(served.path(), key())?;
     let lifecycle_root = cfg!(windows).then(|| fixture.path().join("lifecycles"));
     let options = ServerOptions {
+        expected_instance: None,
         binary: engine.binary.clone(),
         directory: served.path().to_owned(),
         project_scope: TEMPLATE_SCOPE.to_owned(),

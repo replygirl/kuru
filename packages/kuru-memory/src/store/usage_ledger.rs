@@ -4631,6 +4631,7 @@ mod tests {
             pool,
             branch: BRANCH.into(),
             logical_receipt: None,
+            session_caller: None,
             public_transcript_proof: Default::default(),
         };
         let revisions = usage.revisions(1).await?;

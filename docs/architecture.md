@@ -130,6 +130,22 @@ together. An interrupted outcome instead commits one fixed internal-role
 transcript marker; that role is visible as a Kuru marker but excluded from model
 conversation context.
 
+Different sessions can drive the same project memory owner concurrently. Each
+Harness has its own authenticated driver identity and dedicated presence
+connection. The owner checks a session claim under the same guard as private
+history and lifecycle writes. Selection checks the complete captured catalog and
+old claim before transferring ownership; refusal retains the previous session.
+Unknown selection outcomes fence local publication and dispatch until exact
+handler recovery resolves them.
+
+A checked native session lease remains held through admitted work and locally
+owned cleanup, including after presence EOF or memory-owner restart. An old
+driver therefore cannot overlap a replacement while draining. Ownership loss
+cancels further dispatch and requires explicit checked existing-store admission
+before private context resumes. This provides local exclusion, not rollback of
+accepted external effects. Presence and final-client retirement follow actual
+connection lifetime, without an idle timer or durable live-registration schema.
+
 Turn-journal rows are durable no-expiry safety and idempotency history. Their
 storage grows in proportion to admitted turns, and completed `TurnOutput` data is
 retained indefinitely for exact retry. This intentionally duplicates some data

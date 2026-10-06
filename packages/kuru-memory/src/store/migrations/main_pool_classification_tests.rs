@@ -237,6 +237,7 @@ async fn open_reader(store: &MemoryStore) -> Result<(Server, Arc<MemoryPool>)> {
     let server = {
         let _gate = crate::spawn_gate::spawning().await;
         Server::open(ServerOptions {
+            expected_instance: None,
             binary,
             directory,
             project_scope: store.shared.project_scope.clone(),

@@ -14,11 +14,12 @@ use crate::shell_diagnostic::ProjectedShellDiagnostic;
 use crate::shell_diagnostic::{ShellCapture, ShellFailureCategory, failure as shell_failure};
 #[cfg(windows)]
 use crate::shell_diagnostic::{
-    ShellCapture, ShellFailureCategory, failure as shell_failure,
-    failure_with_cleanup as shell_failure_with_cleanup,
+    ShellCapture, ShellFailureCategory, failure_with_cleanup as shell_failure_with_cleanup,
 };
 #[cfg(unix)]
 use crate::unix_shell::ShellRegistry;
+#[cfg(windows)]
+use crate::windows_shell::ShellRegistry;
 use anyhow::{Context, Result, bail, ensure};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
@@ -249,7 +250,6 @@ pub struct ToolHost {
     #[cfg(any(test, feature = "test-support"))]
     web_fetch_test_route: Option<(String, std::net::SocketAddr)>,
     mcp: McpHosts,
-    #[cfg(unix)]
     shells: ShellRegistry,
 }
 
@@ -382,7 +382,6 @@ impl ToolHost {
             parallel_read_test_gate: None,
             #[cfg(any(test, feature = "test-support"))]
             web_fetch_test_route: None,
-            #[cfg(unix)]
             shells: ShellRegistry::new(),
         })
     }
@@ -647,6 +646,15 @@ impl ToolHost {
     }
 
     pub async fn catalog(&self) -> Result<ToolCatalog> {
+        self.catalog_with_lifetime(None).await
+    }
+
+    /// Discovery's native startup and outstanding catalog calls retain this
+    /// exact session barrier; idle reusable transports do not.
+    pub async fn catalog_with_lifetime(
+        &self,
+        hold: Option<crate::InvocationHold>,
+    ) -> Result<ToolCatalog> {
         let mut specs = Vec::new();
         if self.has_skills {
             let mut skill = spec(
@@ -773,7 +781,10 @@ impl ToolHost {
             tools,
             selectors,
             statuses,
-        } = self.mcp.catalog().await?;
+        } = match hold {
+            Some(hold) => self.mcp.catalog_held(Some(hold)).await?,
+            None => self.mcp.catalog().await?,
+        };
         for spec in tools {
             if selectors
                 .get(&spec.name)
@@ -808,6 +819,7 @@ impl ToolHost {
             false,
             ToolInvocationOrigin::DirectUser,
             None,
+            None,
         )
         .await
         .result
@@ -828,6 +840,7 @@ impl ToolHost {
             instruction_approval,
             true,
             ToolInvocationOrigin::ActorUnattributed,
+            None,
             None,
         )
         .await
@@ -863,6 +876,34 @@ impl ToolHost {
         context: &ToolInvocationContext,
         progress: Option<&crate::ShellProgress>,
     ) -> ActorToolOutcome {
+        self.execute_for_actor_with_context_progress_and_lifetime(
+            name,
+            args,
+            permission_approval,
+            instruction_approval,
+            context,
+            progress,
+            None,
+        )
+        .await
+    }
+
+    /// Private presentation and drop-only native ownership remain independent
+    /// of the immutable reviewed invocation identity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reviewed identity, private preview and immutable native lifetime remain explicit"
+    )]
+    pub async fn execute_for_actor_with_context_progress_and_lifetime(
+        &self,
+        name: &str,
+        args: Value,
+        permission_approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
+        context: &ToolInvocationContext,
+        progress: Option<&crate::ShellProgress>,
+        hold: Option<crate::InvocationHold>,
+    ) -> ActorToolOutcome {
         self.execute_dispatch(
             name,
             args,
@@ -871,6 +912,7 @@ impl ToolHost {
             true,
             ToolInvocationOrigin::Actor(context),
             progress,
+            hold,
         )
         .await
     }
@@ -888,6 +930,7 @@ impl ToolHost {
         actor: bool,
         origin: ToolInvocationOrigin<'_>,
         progress: Option<&crate::ShellProgress>,
+        hold: Option<crate::InvocationHold>,
     ) -> ActorToolOutcome {
         let mut instructions = None;
         let mut replan_required = false;
@@ -980,6 +1023,7 @@ impl ToolHost {
                     None,
                     &mut instructions,
                     progress,
+                    hold,
                 )
                 .await
             {
@@ -1092,7 +1136,7 @@ impl ToolHost {
                 _ => unreachable!("permission service returned an invalid outcome"),
             }
             let authorized_target = invocation.target().cloned();
-            self.execute_inner(name, args, approval, instruction_approval, actor, origin, authorized_target.as_ref(), &mut instructions, progress).await
+            self.execute_inner(name, args, approval, instruction_approval, actor, origin, authorized_target.as_ref(), &mut instructions, progress, hold).await
         }
         .await;
         let result = match result {
@@ -1258,6 +1302,7 @@ impl ToolHost {
         authorized_target: Option<&ProjectRelativeTarget>,
         instructions: &mut Option<String>,
         progress: Option<&crate::ShellProgress>,
+        hold: Option<crate::InvocationHold>,
     ) -> std::result::Result<ToolExecution, ToolFailure> {
         if !args.is_object() {
             return Err(ToolFailure::built_in(anyhow::anyhow!(
@@ -1405,17 +1450,21 @@ impl ToolHost {
                         string(&args, "command")?,
                         Duration::from_millis(duration),
                         progress,
+                        hold.clone(),
                     )
                     .await?;
                     #[cfg(windows)]
-                    let result = shell_with_progress(
-                        &self.root_guard,
-                        &self.root,
-                        string(&args, "command")?,
-                        Duration::from_millis(duration),
-                        progress,
-                    )
-                    .await?;
+                    let result = self
+                        .shells
+                        .execute(
+                            self.root_guard.clone(),
+                            self.root.clone(),
+                            string(&args, "command")?.into(),
+                            Duration::from_millis(duration),
+                            progress.cloned(),
+                            hold.clone(),
+                        )
+                        .await?;
                     Ok(ToolExecution::ProjectedJson(
                         serde_json::from_str(&result).context("shell emitted invalid result")?,
                     ))
@@ -1423,7 +1472,10 @@ impl ToolHost {
                 .await;
                 execution.map_err(ToolFailure::built_in)
             }
-            _ => match self.mcp.execute(name, args).await {
+            _ => match match hold {
+                Some(hold) => self.mcp.execute_held(name, args, Some(hold)).await,
+                None => self.mcp.execute(name, args).await,
+            } {
                 Ok(McpExecution::Success(result)) => Ok(ToolExecution::Json(result)),
                 Ok(McpExecution::ApplicationError(content)) => {
                     Ok(ToolExecution::ApplicationError {
@@ -1729,20 +1781,23 @@ impl ToolHost {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown_with_lifetime(None).await
+    }
+
+    /// Closing native transports retain this invocation's exact ownership if
+    /// cleanup outlives the caller's bounded shutdown result.
+    pub async fn shutdown_with_lifetime(&self, hold: Option<crate::InvocationHold>) -> Result<()> {
         // Owned lifecycle-hook trees, including any whose caller was dropped,
         // finish cleanup before this host reports shutdown and before a
         // caller can release the project writer lease.
-        #[cfg(unix)]
-        let (shell, mcp, hooks) = tokio::join!(
-            self.shells.shutdown(),
-            self.mcp.shutdown(),
-            self.hooks.quiesce()
-        );
-        #[cfg(not(unix))]
-        let (shell, mcp, hooks) = {
-            let (mcp, hooks) = tokio::join!(self.mcp.shutdown(), self.hooks.quiesce());
-            (Ok::<(), anyhow::Error>(()), mcp, hooks)
+        let mcp_close = async {
+            match hold {
+                Some(hold) => self.mcp.shutdown_held(Some(hold)).await,
+                None => self.mcp.shutdown().await,
+            }
         };
+        let (shell, mcp, hooks) =
+            tokio::join!(self.shells.shutdown(), mcp_close, self.hooks.quiesce());
         let mut failures = [
             shell.err(),
             mcp.err(),
@@ -2243,36 +2298,43 @@ async fn shell_with_progress(
     command: &str,
     duration: Duration,
     progress: Option<&crate::ShellProgress>,
+    hold: Option<crate::InvocationHold>,
 ) -> Result<String> {
-    let result = registry
-        .execute_with_progress(
-            root_guard,
-            root,
-            command.into(),
-            duration,
-            || unix_shell_environment(std::env::vars_os()),
-            progress.cloned(),
-        )
-        .await;
-    match result {
-        Err(error) if error.downcast_ref::<ProjectedShellDiagnostic>().is_some() => Err(error),
-        Err(_) => Err(shell_failure(
-            ShellFailureCategory::OperationFailed,
-            &ShellCapture::new(),
-        )),
-        Ok(result) => Ok(result),
-    }
-}
-
-#[cfg(windows)]
-async fn shell_with_progress(
-    root_guard: &Directory,
-    root: &Path,
-    command: &str,
-    duration: Duration,
-    progress: Option<&crate::ShellProgress>,
-) -> Result<String> {
-    let result = shell_inner(root_guard, root, command, duration, progress).await;
+    let environment = || unix_shell_environment(std::env::vars_os());
+    let result = match hold {
+        Some(hold) => {
+            registry
+                .execute_with_progress_and_lifetime(
+                    root_guard,
+                    root,
+                    command.into(),
+                    duration,
+                    environment,
+                    progress.cloned(),
+                    Some(hold),
+                )
+                .await
+        }
+        None => match progress {
+            Some(progress) => {
+                registry
+                    .execute_with_progress(
+                        root_guard,
+                        root,
+                        command.into(),
+                        duration,
+                        environment,
+                        Some(progress.clone()),
+                    )
+                    .await
+            }
+            None => {
+                registry
+                    .execute(root_guard, root, command.into(), duration, environment)
+                    .await
+            }
+        },
+    };
     match result {
         Err(error) if error.downcast_ref::<ProjectedShellDiagnostic>().is_some() => Err(error),
         Err(_) => Err(shell_failure(
@@ -2303,12 +2365,14 @@ fn windows_shell_fixture_stage_path() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-async fn shell_inner(
+pub(crate) async fn windows_shell_owned(
     root_guard: &Directory,
     root: &Path,
     command: &str,
     duration: Duration,
     progress: Option<&crate::ShellProgress>,
+    control: &crate::windows_shell::Control,
+    retained: &mut Option<kuru_platform::windows::process::NativeChild>,
 ) -> Result<String> {
     use base64::Engine;
     use kuru_platform::windows::process::{
@@ -2382,10 +2446,14 @@ async fn shell_inner(
     spec.stdout = Stdio::Pipe;
     spec.stderr = Stdio::Pipe;
     root_guard.revalidate()?;
-    let mut child = spec
-        .spawn()
-        .await
-        .context("cannot start Windows PowerShell")?;
+    *retained = Some(
+        spec.spawn()
+            .await
+            .context("cannot start Windows PowerShell")?,
+    );
+    let child = retained
+        .as_mut()
+        .context("Windows shell owner was not retained")?;
     drop(root_pin);
     let mut stdout = child.take_stdout().context("missing shell stdout")?;
     let mut stderr = child.take_stderr().context("missing shell stderr")?;
@@ -2401,10 +2469,14 @@ async fn shell_inner(
         let status = child.wait(duration).await?;
         Ok::<_, anyhow::Error>(status)
     };
-    let result = match timeout(duration, operation).await {
-        Err(_) => Err(ShellFailureCategory::TimedOut),
-        Ok(Ok(status)) => Ok(status),
-        Ok(Err(_)) => Err(ShellFailureCategory::CaptureFailed),
+    let result = tokio::select! {
+        biased;
+        () = control.cancelled() => Err(ShellFailureCategory::Cancelled),
+        result = timeout(duration, operation) => match result {
+            Err(_) => Err(ShellFailureCategory::TimedOut),
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(_)) => Err(ShellFailureCategory::CaptureFailed),
+        },
     };
     let mut cleanup_unconfirmed = false;
     let result = match result {
@@ -2432,7 +2504,7 @@ async fn shell_inner(
             #[cfg(not(test))]
             let _ = root_status;
             let _ = child.try_wait();
-            let stopped_result = crate::process::stop(&mut child).await;
+            let stopped_result = crate::process::stop(child).await;
             cleanup_unconfirmed = stopped_result.is_err();
             Err(category)
         }
