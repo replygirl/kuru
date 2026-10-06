@@ -1394,7 +1394,13 @@ Any count works locally; CI uses the counts in `PARTITIONS`. The instrumented
 build stays in `KURU_COVERAGE_TARGET`, separate from `target/`, so it never
 disturbs ordinary builds or the shared build cache; delete the scratch directory
 afterwards. On failure, `diagnostics-1/failure.txt` and any stall reports explain
-the stop. To exercise the merge, run every index from 1 to the count, each with
+the stop. Failed instrumented exports also retain bounded profile names, sizes,
+timestamps, existing spawn attribution and at most 64 raw bytes per profile in
+`failure.txt`. Windows selections record their actual run PID alongside the
+listing-process identities. These prefixes are partial, best-effort diagnostics;
+unchanged metadata does not prove immutable bytes, and later-section corruption
+still needs targeted evidence. No profiles are repaired, filtered or discarded
+to make the export pass. To exercise the merge, run every index from 1 to the count, each with
 its own fresh target, evidence and diagnostics directory, copy each partition's
 evidence (its `attempt-1` directory) into a directory named like the CI
 artifact, `$scratch/inputs/ci-coverage-local-partition-<k>-attempt-1/`, and run

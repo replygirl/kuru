@@ -6,7 +6,8 @@
 //! executable, so it names a binary, not a test. Test support appends one
 //! spawn row to the runner ledger for each child that leaves the test's
 //! process group (memory supervisors and owners, terminal children), and the
-//! runner appends one for each test executable's own listing process. A
+//! runner appends one for each test executable's own listing process and each
+//! Windows selection's actual test-run PID. A
 //! profile that appears after the partition's tests is then named by its
 //! process ID: the test that started it, its role and its executable; its
 //! signature is named by every other profile of the same executable.
