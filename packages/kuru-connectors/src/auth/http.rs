@@ -6,6 +6,8 @@ use reqwest::{Client, Request, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::compatibility::{CompatibilityCode, ConnectorIncompatibility};
+
 #[derive(Default, Deserialize)]
 pub(super) struct Tokens {
     pub access_token: Option<String>,
@@ -15,17 +17,27 @@ pub(super) struct Tokens {
 }
 impl Tokens {
     pub fn session(self, previous: Option<&Session>) -> Result<Session> {
-        let access_token = self
-            .access_token
-            .context("token response lacks an access token")?;
+        let access_token = self.access_token.ok_or_else(|| {
+            anyhow::Error::new(ConnectorIncompatibility::new(
+                CompatibilityCode::MissingTokenField,
+            ))
+        })?;
         let refresh_token = self
             .refresh_token
             .or_else(|| previous.map(|session| session.refresh_token.clone()))
-            .context("token response lacks a refresh token")?;
+            .ok_or_else(|| {
+                anyhow::Error::new(ConnectorIncompatibility::new(
+                    CompatibilityCode::MissingTokenField,
+                ))
+            })?;
         let id_token = self
             .id_token
             .or_else(|| previous.map(|session| session.id_token.clone()))
-            .context("token response lacks an identity token")?;
+            .ok_or_else(|| {
+                anyhow::Error::new(ConnectorIncompatibility::new(
+                    CompatibilityCode::MissingTokenField,
+                ))
+            })?;
         for token in [&access_token, &refresh_token, &id_token] {
             validate_secret(token)?;
         }
@@ -46,9 +58,11 @@ impl Tokens {
                 "token response account identities disagree"
             );
         }
-        let account_id = access_account
-            .or(id_account)
-            .context("token response lacks a ChatGPT account identity")?;
+        let account_id = access_account.or(id_account).ok_or_else(|| {
+            anyhow::Error::new(ConnectorIncompatibility::new(
+                CompatibilityCode::MissingTokenField,
+            ))
+        })?;
         ensure!(
             !account_id.is_empty()
                 && account_id.len() <= 1024
@@ -60,7 +74,11 @@ impl Tokens {
             .get("exp")
             .and_then(Value::as_u64)
             .or_else(|| self.expires_in.and_then(|seconds| now.checked_add(seconds)))
-            .context("token response lacks a valid expiry")?;
+            .ok_or_else(|| {
+                anyhow::Error::new(ConnectorIncompatibility::new(
+                    CompatibilityCode::MissingTokenField,
+                ))
+            })?;
         ensure!(expires_at > now, "token response is already expired");
         Ok(Session {
             access_token,
@@ -245,4 +263,18 @@ fn transport(subject: &'static str, error: &reqwest::Error) -> anyhow::Error {
 
 pub(super) fn pending(status: StatusCode) -> bool {
     matches!(status.as_u16(), 403 | 404)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CompatibilityCode, incompatibility};
+
+    #[test]
+    fn missing_required_token_fields_have_fixed_typed_evidence() {
+        let error = Tokens::default().session(None).err().unwrap();
+        let evidence = incompatibility(&error).unwrap();
+        assert_eq!(evidence.code(), CompatibilityCode::MissingTokenField);
+        assert!(!format!("{evidence} {}", evidence.action()).contains("token-sentinel"));
+    }
 }

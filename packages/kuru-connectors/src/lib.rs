@@ -3,6 +3,7 @@
 
 mod a2a;
 mod auth;
+mod compatibility;
 mod file_edits;
 mod hooks;
 mod http;
@@ -32,6 +33,7 @@ mod test_support;
 
 pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
+pub use compatibility::{CompatibilityCode, ConnectorIncompatibility, incompatibility};
 pub use file_edits::{
     CheckpointDiff, CheckpointDiffReader, CheckpointState, CheckpointStore, CheckpointSummary,
     FileEffect,
@@ -56,10 +58,13 @@ pub use permissions::{
     PermissionBinding, PermissionDisplay, PermissionGrantStore, PermissionInvocation,
     PermissionOutcome, PermissionService, PersistentGrant,
 };
+#[cfg(feature = "test-support")]
+pub use providers::subscription_canary_test_endpoint;
 pub use providers::{
-    COMPLETION_TIMEOUT, ContextPrefixEstimate, DemoProvider, Provider, ProviderEvent,
-    ProviderFailureKind, ProviderReasoningSummary, ProviderSink, ResponsesProvider,
-    TextDeltaSource, collect_completion, largest_fitting_context_prefix, provider,
+    COMPLETION_TIMEOUT, CanaryReport, CanaryStage, CanaryState, ContextPrefixEstimate,
+    DemoProvider, Provider, ProviderEvent, ProviderFailureKind, ProviderReasoningSummary,
+    ProviderSink, ResponsesProvider, TextDeltaSource, collect_completion,
+    largest_fitting_context_prefix, provider, subscription_canary,
 };
 pub use redaction::{
     ProjectionError, json as project_json, text as project_text, truncate_tool_output,

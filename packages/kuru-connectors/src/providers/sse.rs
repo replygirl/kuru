@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
-use crate::MAX_BYTES;
+use crate::{MAX_BYTES, compatibility::CompatibilityCode};
 
 use super::{
     ProviderEvent, ProviderFailureKind, ProviderReasoningSummary, ProviderSink, TextDeltaSource,
@@ -496,10 +496,12 @@ impl Decoder {
                     .filter(|value| value.is_object())
                     .context("completed event lacks response")?
                     .clone();
-                ensure!(
+                diagnostics::require_semantic(
                     response["id"].as_str().is_some_and(|id| !id.is_empty()),
-                    "completed response lacks ID"
-                );
+                    self.operation,
+                    CompatibilityCode::MissingCompletionField,
+                    "completed response lacks ID",
+                )?;
                 ensure!(
                     response["status"].is_null() || response["status"] == "completed",
                     "response did not complete successfully"
@@ -521,26 +523,32 @@ impl Decoder {
                 // stays authoritative.
                 let authoritative = match response.get("output") {
                     Some(output) => {
-                        let output = output
-                            .as_array()
-                            .context("completed response has invalid output")?;
+                        let output = output.as_array().ok_or_else(|| {
+                            diagnostics::semantic_contradiction(
+                                self.operation,
+                                CompatibilityCode::MissingCompletionField,
+                                "completed response has invalid output",
+                            )
+                        })?;
                         for (position, item) in output.iter().enumerate() {
                             trace_item("final", position, item);
                         }
                         if output.is_empty() && !items.is_empty() {
                             false
                         } else {
-                            reconcile_items(output, &items)?;
+                            reconcile_items(self.operation, output, &items)?;
                             true
                         }
                     }
                     None => false,
                 };
                 if !authoritative {
-                    ensure!(
+                    diagnostics::require_semantic(
                         !items.is_empty(),
-                        "completed response lacks authoritative output"
-                    );
+                        self.operation,
+                        CompatibilityCode::MissingCompletionField,
+                        "completed response lacks authoritative output",
+                    )?;
                     ensure!(
                         items.keys().copied().eq(0..items.len()),
                         "streamed output indexes are incomplete"
@@ -663,23 +671,40 @@ impl Decoder {
             for (field, announced) in [("name", announced.0), ("call_id", announced.1)] {
                 let present = item[field].as_str().filter(|value| !value.is_empty());
                 match (present, announced.as_deref()) {
-                    (Some(present), Some(announced)) => ensure!(
+                    (Some(present), Some(announced)) => diagnostics::require_semantic(
                         present == announced,
-                        "completed function call identity disagrees with streamed output"
-                    ),
+                        self.operation,
+                        CompatibilityCode::TerminalIdentityContradiction,
+                        "completed function call identity disagrees with streamed output",
+                    )?,
                     (None, Some(announced)) => item[field] = json!(announced),
                     (Some(_), None) => {}
-                    (None, None) => bail!("completed function call lacks {field}"),
+                    (None, None) => {
+                        return Err(diagnostics::semantic_contradiction(
+                            self.operation,
+                            CompatibilityCode::TerminalIdentityContradiction,
+                            "completed function call lacks required identity",
+                        ));
+                    }
                 }
             }
             if item["arguments"].as_str().is_none() {
-                let arguments =
-                    streamed_arguments.context("completed function call lacks arguments")?;
+                let arguments = streamed_arguments.ok_or_else(|| {
+                    diagnostics::semantic_contradiction(
+                        self.operation,
+                        CompatibilityCode::MissingCompletionField,
+                        "completed function call lacks arguments",
+                    )
+                })?;
                 item["arguments"] = json!(arguments);
             }
-            let arguments = item["arguments"]
-                .as_str()
-                .context("completed function call lacks arguments")?;
+            let arguments = item["arguments"].as_str().ok_or_else(|| {
+                diagnostics::semantic_contradiction(
+                    self.operation,
+                    CompatibilityCode::MissingCompletionField,
+                    "completed function call lacks arguments",
+                )
+            })?;
             let _: Value = serde_json::from_str(arguments)
                 .map_err(|_| diagnostics::stream_protocol(self.operation))?;
         }
@@ -695,33 +720,56 @@ impl Decoder {
         // must still be found and still agree; a reasoning summary or tool-call
         // scaffold the terminal output no longer carries has nothing to check.
         for ((_, item_id, content_index, source), fragment) in &self.text_fragments {
-            let item =
-                final_item(output, item_id).context("stream text fragment lacks final item")?;
+            let item = final_item(output, item_id).ok_or_else(|| {
+                diagnostics::semantic_contradiction(
+                    self.operation,
+                    CompatibilityCode::TerminalOutputContradiction,
+                    "stream text fragment lacks final item",
+                )
+            })?;
             let part = item["content"]
                 .as_array()
                 .and_then(|content| content.get(*content_index as usize))
-                .context("stream text fragment lacks final content")?;
+                .ok_or_else(|| {
+                    diagnostics::semantic_contradiction(
+                        self.operation,
+                        CompatibilityCode::TerminalOutputContradiction,
+                        "stream text fragment lacks final content",
+                    )
+                })?;
             let final_text = match source {
                 TextDeltaSource::OutputText => {
-                    ensure!(
+                    diagnostics::require_semantic(
                         part["type"] == "output_text",
-                        "stream text fragment has incompatible final content"
-                    );
+                        self.operation,
+                        CompatibilityCode::TerminalOutputContradiction,
+                        "stream text fragment has incompatible final content",
+                    )?;
                     part["text"].as_str()
                 }
                 TextDeltaSource::Refusal => {
-                    ensure!(
+                    diagnostics::require_semantic(
                         part["type"] == "refusal",
-                        "stream text fragment has incompatible final content"
-                    );
+                        self.operation,
+                        CompatibilityCode::TerminalOutputContradiction,
+                        "stream text fragment has incompatible final content",
+                    )?;
                     part["refusal"].as_str()
                 }
             }
-            .context("stream text fragment has incompatible final content")?;
-            ensure!(
+            .ok_or_else(|| {
+                diagnostics::semantic_contradiction(
+                    self.operation,
+                    CompatibilityCode::TerminalOutputContradiction,
+                    "stream text fragment has incompatible final content",
+                )
+            })?;
+            diagnostics::require_semantic(
                 final_text == fragment,
-                "stream text fragment disagrees with final output"
-            );
+                self.operation,
+                CompatibilityCode::TerminalOutputContradiction,
+                "stream text fragment disagrees with final output",
+            )?;
         }
         for ((_, item_id, summary_index), fragment) in &self.summary_fragments {
             let Some(item) = final_item(output, item_id) else {
@@ -779,10 +827,12 @@ impl Decoder {
             // from the call's own announced item and failed the turn if none
             // was ever announced.
             if let Some(name) = name {
-                ensure!(
+                diagnostics::require_semantic(
                     item["name"].as_str() == Some(name.as_str()),
-                    "completed function name disagrees with final output"
-                );
+                    self.operation,
+                    CompatibilityCode::TerminalIdentityContradiction,
+                    "completed function name disagrees with final output",
+                )?;
             }
             let final_arguments = item["arguments"]
                 .as_str()
@@ -809,11 +859,20 @@ impl Decoder {
 /// already shown is the exception — it must still be present, matched by item
 /// ID, and still say the same thing, or the turn fails rather than quietly
 /// contradicting the terminal.
-fn reconcile_items(output: &[Value], items: &BTreeMap<usize, Value>) -> Result<()> {
+fn reconcile_items(
+    operation: Operation,
+    output: &[Value],
+    items: &BTreeMap<usize, Value>,
+) -> Result<()> {
     let mut final_ids = BTreeSet::new();
     for item in output {
         if let Some(id) = item["id"].as_str() {
-            ensure!(final_ids.insert(id), "duplicate completed output ID");
+            diagnostics::require_semantic(
+                final_ids.insert(id),
+                operation,
+                CompatibilityCode::TerminalIdentityContradiction,
+                "duplicate completed output ID",
+            )?;
         }
     }
     for item in items.values() {
@@ -824,11 +883,19 @@ fn reconcile_items(output: &[Value], items: &BTreeMap<usize, Value>) -> Result<(
         let final_item = item["id"]
             .as_str()
             .and_then(|id| final_item(output, id))
-            .context("completed response omits streamed output")?;
-        ensure!(
+            .ok_or_else(|| {
+                diagnostics::semantic_contradiction(
+                    operation,
+                    CompatibilityCode::TerminalOutputContradiction,
+                    "completed response omits streamed output",
+                )
+            })?;
+        diagnostics::require_semantic(
             visible_text(final_item) == streamed,
-            "completed response disagrees with streamed output"
-        );
+            operation,
+            CompatibilityCode::TerminalOutputContradiction,
+            "completed response disagrees with streamed output",
+        )?;
     }
     Ok(())
 }
@@ -936,6 +1003,7 @@ fn append_fragment<K: Ord>(fragments: &mut BTreeMap<K, String>, key: K, value: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CompatibilityCode, incompatibility};
 
     /// The decoder these fixtures exercise: the ChatGPT subscription route.
     fn chatgpt_decoder() -> Decoder {
@@ -1048,9 +1116,9 @@ mod tests {
         let error = chatgpt_decoder()
             .push(format!("{streamed}data: {without_message}\n\n").as_bytes())
             .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("completed response omits streamed output"),
-            "{error:#}"
+        assert_eq!(
+            incompatibility(&error).map(|error| error.code()),
+            Some(CompatibilityCode::TerminalOutputContradiction)
         );
 
         // So does a counterpart whose visible text disagrees.
@@ -1060,9 +1128,9 @@ mod tests {
         let error = chatgpt_decoder()
             .push(format!("{streamed}data: {rewritten}\n\n").as_bytes())
             .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("completed response disagrees with streamed output"),
-            "{error:#}"
+        assert_eq!(
+            incompatibility(&error).map(|error| error.code()),
+            Some(CompatibilityCode::TerminalOutputContradiction)
         );
     }
 
@@ -1181,9 +1249,9 @@ mod tests {
             }}),
         );
         let error = chatgpt_decoder().push(unnamed.as_bytes()).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("completed function call lacks name"),
-            "{error:#}"
+        assert_eq!(
+            incompatibility(&error).map(|error| error.code()),
+            Some(CompatibilityCode::TerminalIdentityContradiction)
         );
 
         // So does one whose announced name the terminal output contradicts.
@@ -1212,6 +1280,7 @@ mod tests {
             error.to_string(),
             "ChatGPT completion stream contained invalid protocol data"
         );
+        assert!(incompatibility(&error).is_none());
     }
 
     #[test]

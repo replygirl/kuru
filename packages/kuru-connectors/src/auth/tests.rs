@@ -611,17 +611,34 @@ async fn durable_newer_generation_reuse_consumes_the_logical_rotation() {
 
 #[tokio::test]
 async fn native_auth_refresh_rejection_and_account_change_never_retry_or_echo_tokens() {
-    for reply in [
-        Reply {
-            status: StatusCode::UNAUTHORIZED,
-            ..Reply::json(json!({"error":"old-refresh synthetic-secret"}))
-        },
-        Reply::json(tokens("different-account")),
-        Reply::json(json!({"refresh_token":"rotated-without-access"})),
-        Reply {
-            body: "old-refresh synthetic-secret invalid JSON".into(),
-            ..Reply::json(json!({}))
-        },
+    for (reply, expected_code) in [
+        (
+            Reply {
+                status: StatusCode::UNAUTHORIZED,
+                ..Reply::json(json!({"error":"old-refresh synthetic-secret"}))
+            },
+            None,
+        ),
+        (Reply::json(tokens("different-account")), None),
+        (
+            Reply::json(json!({"refresh_token":"rotated-without-access"})),
+            Some(crate::CompatibilityCode::MissingTokenField),
+        ),
+        (
+            Reply::json(json!({
+                "access_token": jwt("account-one", now().unwrap() - 1),
+                "id_token": jwt("account-one", now().unwrap() + 3600),
+                "refresh_token": "rotated-refresh"
+            })),
+            None,
+        ),
+        (
+            Reply {
+                body: "old-refresh synthetic-secret invalid JSON".into(),
+                ..Reply::json(json!({}))
+            },
+            None,
+        ),
     ] {
         let fixture = Fixture::new(vec![reply]).await;
         fixture.seed().await;
@@ -631,6 +648,11 @@ async fn native_auth_refresh_rejection_and_account_change_never_retry_or_echo_to
             .await
             .unwrap();
         let error = fixture.manager.refresh_rejected(&old).await.err().unwrap();
+        assert_eq!(
+            crate::incompatibility(&error).map(|evidence| evidence.code()),
+            expected_code,
+            "only a complete successful token document with a required field omitted is positive compatibility evidence"
+        );
         assert!(!format!("{error:#}").contains("old-refresh"));
         assert!(!format!("{error:#}").contains("synthetic-secret"));
         assert!(fixture.manager.refresh_rejected(&old).await.is_err());
@@ -658,6 +680,7 @@ async fn refresh_preparation_failure_and_connect_refusal_preserve_credentials() 
         .await
         .err()
         .unwrap();
+    assert!(crate::incompatibility(&error).is_none());
     assert!(
         error.to_string().contains("prepare replayable"),
         "{error:#}"
@@ -679,6 +702,7 @@ async fn refresh_preparation_failure_and_connect_refusal_preserve_credentials() 
         .unwrap();
     let observed = manager.credentials_snapshot().await.unwrap();
     let error = manager.refresh_rejected(&observed).await.err().unwrap();
+    assert!(crate::incompatibility(&error).is_none());
     assert!(
         error.to_string().contains("before token dispatch"),
         "{error:#}"
@@ -1170,6 +1194,7 @@ async fn refresh_publication_reply_loss_and_read_failure_reconcile_exact_state()
         .await
         .err()
         .unwrap();
+    assert!(crate::incompatibility(&error).is_none());
     assert_eq!(
         error.to_string(),
         "authentication rotation state is unknown; run kuru login"

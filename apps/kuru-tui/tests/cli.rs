@@ -118,6 +118,234 @@ impl Sandbox {
     }
 }
 
+#[test]
+fn canary_without_kuru_credentials_is_unverified_before_workspace_authority_or_memory() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let data = root.path().join("data");
+    let config = root.path().join("config/kuru");
+    let startup_marker = root.path().join("memory-startup-marker");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "provider='responses'\napi_base='http://127.0.0.1:9/v1'\napi_key_env='OPENAI_API_KEY'\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_kuru"))
+        .args(["-C"])
+        .arg(&project)
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["canary", "--model", "gpt-5.6-luna"])
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("KURU_TEST_MEMORY_STARTUP_STAGES", &startup_marker)
+        .env("OPENAI_API_KEY", "canary-api-key-sentinel")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["state"], "unverified");
+    assert_eq!(report["reason"], "credentials_unavailable");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("canary-api-key-sentinel"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("canary-api-key-sentinel"));
+    assert!(!startup_marker.exists());
+    assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct CanaryPeerState {
+    incompatible: bool,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<(String, Value, String)>>>,
+}
+
+#[cfg(feature = "test-support")]
+async fn canary_peer(
+    axum::extract::State(state): axum::extract::State<CanaryPeerState>,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let parsed = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let authorization = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    state
+        .requests
+        .lock()
+        .unwrap()
+        .push((uri.path().to_owned(), parsed.clone(), authorization));
+    if uri.path().ends_with("/models") {
+        let body = if state.incompatible {
+            serde_json::json!({"catalog": [], "provider_detail": "response-body-secret-sentinel"})
+        } else {
+            serde_json::json!({"models": [{"slug": "gpt-5.6-luna"}]})
+        };
+        return (
+            axum::http::StatusCode::OK,
+            [("content-type", "application/json")],
+            body.to_string(),
+        )
+            .into_response();
+    }
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/event-stream")],
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1},\"output\":[{\"type\":\"message\",\"id\":\"message-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"OK\"}]}]}}\r\n\r\n".to_owned(),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "test-support")]
+async fn canary_cli_fixture(
+    incompatible: bool,
+    transport_failure: bool,
+) -> (Output, Vec<(String, Value, String)>, tempfile::TempDir) {
+    use axum::routing::any;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let data = root.path().join("data");
+    let config = root.path().join("config/kuru");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "provider='responses'\napi_base='http://127.0.0.1:9/v1'\napi_key_env='OPENAI_API_KEY'\n",
+    )
+    .unwrap();
+    kuru_connectors::AuthManager::seed_test_subscription_session(data.clone(), project.clone())
+        .await
+        .unwrap();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = if transport_failure {
+        drop(listener);
+        None
+    } else {
+        let app = axum::Router::new()
+            .fallback(any(canary_peer))
+            .with_state(CanaryPeerState {
+                incompatible,
+                requests: requests.clone(),
+            });
+        Some(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }))
+    };
+    let config_home = root.path().join("config");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_kuru"))
+            .args(["-C"])
+            .arg(project)
+            .arg("--data-dir")
+            .arg(data)
+            .args(["canary", "--model", "gpt-5.6-luna"])
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("KURU_TEST_CHATGPT_BASE", endpoint)
+            .env("OPENAI_API_KEY", "canary-api-key-sentinel")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    if let Some(server) = server {
+        server.abort();
+        let _ = server.await;
+    }
+    let requests = requests.lock().unwrap().clone();
+    (output, requests, root)
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_process_canary_reports_compatible_and_incompatible_fixed_route_results() {
+    kuru_memory::test_support::closing(async {
+        let (verified, requests, _root) = canary_cli_fixture(false, false).await;
+        assert_eq!(verified.status.code(), Some(0));
+        let report: Value = serde_json::from_slice(&verified.stdout).unwrap();
+        assert_eq!(report["state"], "verified");
+        assert_eq!(
+            report["observed"],
+            serde_json::json!(["credentials", "catalog", "completion", "usage"])
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.ends_with("/models"));
+        assert!(requests[1].0.ends_with("/responses"));
+        assert_eq!(requests[0].2, "Bearer synthetic-canary-access-token");
+        assert_eq!(requests[1].2, "Bearer synthetic-canary-access-token");
+        assert_eq!(requests[1].1["tools"], serde_json::json!([]));
+        let (incompatible, requests, _root) = canary_cli_fixture(true, false).await;
+        assert_eq!(incompatible.status.code(), Some(3));
+        let report: Value = serde_json::from_slice(&incompatible.stdout).unwrap();
+        assert_eq!(report["state"], "incompatible");
+        assert_eq!(report["incompatibility"], "missing_catalog_field");
+        assert_eq!(requests.len(), 1);
+        for output in [&verified, &incompatible] {
+            let output_text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output_text.contains("canary-api-key-sentinel"));
+            assert!(!output_text.contains("synthetic-canary-access-token"));
+            assert!(!output_text.contains("response-body-secret-sentinel"));
+        }
+    })
+    .await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_process_canary_transport_failure_is_unverified_without_fallback() {
+    kuru_memory::test_support::closing(async {
+        let (output, requests, _root) = canary_cli_fixture(false, true).await;
+        assert_eq!(output.status.code(), Some(2));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["state"], "unverified");
+        assert_eq!(report["reason"], "provider_operation_unavailable");
+        assert_eq!(report["observed"], serde_json::json!(["credentials"]));
+        assert_eq!(requests.len(), 0);
+        let output_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output_text.contains("canary-api-key-sentinel"));
+        assert!(!output_text.contains("synthetic-canary-access-token"));
+    })
+    .await;
+}
+
+#[test]
+fn canary_requires_an_explicit_model_without_opening_workspace_authority_or_memory() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_kuru"))
+        .args(["-C"])
+        .arg(&project)
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("canary")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires --model MODEL"));
+    assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() -> anyhow::Result<()>

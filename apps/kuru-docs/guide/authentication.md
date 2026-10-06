@@ -49,6 +49,14 @@ Kuru's ChatGPT credentials; an API key supplied through the environment remains
 unchanged. Sessions refresh when needed. If login or refresh fails, follow the
 reported sign-in guidance; Kuru does not switch providers automatically.
 
+`kuru canary --model MODEL_ID` is an optional, bounded check of the fixed
+ChatGPT subscription route. It checks local credentials, the subscription
+catalog, and one no-tool completion for the explicitly selected model. Its JSON
+report distinguishes verified, incompatible, and inconclusive observations;
+each stage it did not reach remains unobserved. It does not use the Responses
+API key route or activate project tools or memory. No live canary is required
+for ordinary use, CI, or release.
+
 ## Subscription compatibility
 
 `codex` is Kuru's native compatibility route for a ChatGPT subscription. It

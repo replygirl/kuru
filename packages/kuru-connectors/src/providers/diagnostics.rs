@@ -4,7 +4,10 @@ use anyhow::{Error, Result, ensure};
 use reqwest::{Response, StatusCode};
 use serde_json::Value;
 
-use crate::MAX_BYTES;
+use crate::{
+    MAX_BYTES,
+    compatibility::{CompatibilityCode, ConnectorIncompatibility},
+};
 
 const DIAGNOSTIC_BYTES: usize = 8 * 1024;
 pub(crate) const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -42,6 +45,31 @@ impl Operation {
     /// route. Quota, billing and usage wording differs between the two.
     pub(super) const fn is_responses(self) -> bool {
         matches!(self, Self::ResponsesCompletion | Self::ResponsesCatalog)
+    }
+}
+
+pub(super) fn semantic_contradiction(
+    operation: Operation,
+    code: CompatibilityCode,
+    fallback: &'static str,
+) -> Error {
+    if operation.is_responses() {
+        Error::msg(fallback)
+    } else {
+        Error::new(ConnectorIncompatibility::new(code))
+    }
+}
+
+pub(super) fn require_semantic(
+    condition: bool,
+    operation: Operation,
+    code: CompatibilityCode,
+    fallback: &'static str,
+) -> Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(semantic_contradiction(operation, code, fallback))
     }
 }
 
