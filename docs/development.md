@@ -111,7 +111,8 @@ scaffolding, already outside cargo-llvm-cov's default measured source scope.
 Real application children still inherit the runner's `LLVM_PROFILE_FILE`, and
 application instrumentation, strict profile export and the 90% gate are unchanged.
 
-The failure also names each changed profile's writer. A raw profile is named
+The failure also reports recorded writer candidates for each changed profile.
+A raw profile is named
 `<prefix>-<pid>-<signature>_<pool>.profraw`, and the signature (`%m`) is
 computed per executable, not per test. The runner sets
 `KURU_COVERAGE_SPAWN_LEDGER` to its ledger on every test process, and test
@@ -120,10 +121,13 @@ executable and originating test) for every instrumented child that leaves the
 test's process group, which the runner's group cleanup never reaches: memory
 Dolt supervisors and service owners (`kuru_memory::test_support::spawn_ledger`,
 forwarded to an owner's own spawns) and pseudo-terminal children. The runner
-adds a row for each test executable's listing profile. The partition then
-reports a new profile as "pid N is the `<role>` `<executable>` started by test
-`<name>`" and names the executables that share its signature. Spawn rows share
-the runner ledger file but never enter a partition plan.
+adds a row for each test executable's listing profile and each Windows
+selection's actual run PID. PID-row matches and executables inferred from
+sibling signature matches are candidates, not proven writer identities. PID
+reuse can invalidate either inference even when only one spawn row matches;
+no matching row means only that no recorded match was found. Spawn rows share
+the runner ledger file but never enter a partition plan or change strict
+profile validation.
 
 A local memory store dropped without `close()` hands its supervisor to a
 detached reaper thread: the supervisor stops Dolt and exits on its own, and
