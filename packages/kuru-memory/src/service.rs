@@ -4,7 +4,6 @@
 //! Transport privacy excludes other OS users; a same-user process able to read
 //! the private endpoint record is within the account's local authority.
 
-#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::{
     ffi::{OsStr, OsString},
