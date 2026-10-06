@@ -1508,8 +1508,20 @@ impl RemoteView {
             self.session.ensure_open()?;
             return self.checked_call(&mut attachment, call, None).await;
         }
-        let mut attachment = self.attachment.lock().await;
+        let mut attachment = self.attachment.clone().lock_owned().await;
         self.session.ensure_open()?;
+        if !call.may_mutate() {
+            // Candidate handles belong to this exact connection. A cancelled
+            // actor must not drop a sent read and strand its cleanup without a
+            // mutation receipt. Own the bounded exchange independently of its
+            // waiter; abandonment and close wait on this same attachment lock.
+            let view = self.clone();
+            return tokio::spawn(
+                async move { view.checked_call(&mut attachment, call, None).await },
+            )
+            .await
+            .context("candidate read response owner failed")?;
+        }
         self.checked_call(&mut attachment, call, None).await
     }
 
@@ -7001,6 +7013,100 @@ mod tests {
             root.release(outcome)?;
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_candidate_read_drains_before_exact_abandonment() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            fixture_deadline(1, 0),
+            "cancelled candidate read fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    served.serve(service::ServiceOwner::open(options.clone(), &project).await?)?;
+                    let memory = MemoryStore::open_managed_observed(
+                        options.clone(),
+                        project.clone(),
+                        std::env::current_exe()?,
+                    )
+                    .1
+                    .await?;
+                    let result = async {
+                        let live = memory.revision().await?;
+                        let candidate = memory.begin_candidate("cancelled private read").await?;
+                        let private = candidate.view();
+                        let branch = candidate.branch().to_owned();
+                        let barrier = crate::test_support::ReplyBarrier::default();
+                        private.fixture_pause_next_service_reply(&barrier).await?;
+                        let reader = tokio::spawn({
+                            let private = private.clone();
+                            async move { private.revision().await }
+                        });
+                        let _reader_cleanup = AbortOnDrop(reader.abort_handle());
+                        tokio::time::timeout(
+                            service::rpc::OPERATION_TIMEOUT,
+                            barrier.wait_replied(),
+                        )
+                        .await
+                        .context("candidate read did not receive its held response")?;
+                        reader.abort();
+                        let stopped = reader.await;
+                        barrier.release();
+                        ensure!(
+                            stopped.is_err_and(|error| error.is_cancelled()),
+                            "candidate read caller did not cancel"
+                        );
+                        ensure!(
+                            private.revision().await? == live,
+                            "candidate read changed its head"
+                        );
+                        candidate.abandon().await?;
+                        ensure!(
+                            memory.revision().await? == live,
+                            "cancelled private read changed main"
+                        );
+                        ensure!(
+                            memory.candidate_ref_status(&branch).await?.state
+                                == store::CandidateRefState::Missing,
+                            "exact cancelled-read candidate was not abandoned"
+                        );
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+                    let close = memory.close().await;
+                    result?;
+                    close
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            owner_reap_within(),
+                            "cancelled-read owner did not reap",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
     }
 
     #[tokio::test]

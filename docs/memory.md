@@ -616,6 +616,10 @@ lost-reply reconciliation. Historical schema-1-through-4 branches keep their
 older receipt shape. Kuru reclaims a dream candidate only after its promotion
 or explicit abandonment is durably resolved. Unresolved candidates,
 conversations, notes and reachable Dolt revisions do not expire automatically.
+Cancelling a candidate read lets its already-sent bounded exchange finish on
+the same connection before abandonment or session close. A lost transport still
+requires exact candidate inspection or typed outcome recovery; cancellation does
+not authorize reconnecting or replaying a private write.
 The bundled engine performs bounded, growth-triggered storage maintenance while
 Kuru owns it, but retained history can continue to grow. This maintenance is not
 secure erasure. If a private install stage cannot be removed after the engine is
