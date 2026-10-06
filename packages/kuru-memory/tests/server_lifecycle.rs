@@ -67,7 +67,10 @@ async fn open(options: ServerOptions) -> Result<Server> {
 
 async fn wait_removed(path: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
-    while path.try_exists()? {
+    while path
+        .try_exists()
+        .with_context(|| format!("observe owned memory fixture removal: {}", path.display()))?
+    {
         ensure!(
             Instant::now() < deadline,
             "owned memory fixture was not cleaned: {}",
@@ -246,14 +249,32 @@ async fn authenticated_readers_branch_pools_and_reopen_share_only_committed_stat
 #[tokio::test]
 async fn retained_fixture_is_deleted_only_after_drop_reaps_the_supervisor() -> Result<()> {
     let _permit = SERVERS.acquire().await?;
-    let root = tempfile::tempdir()?;
-    let path = root.path().to_path_buf();
-    let server = open(options(root.path(), engine().await?)).await?;
-    server.retain_directory(root).await?;
-    let pool = server.pool("main").await?;
-    drop(pool);
-    drop(server);
-    wait_removed(&path).await
+    // Bounded phase attribution on the actual reaper path, not retries after
+    // failure: every iteration owns a fresh root and must complete cleanup.
+    let iterations = if cfg!(windows) { 8 } else { 1 };
+    for iteration in 1..=iterations {
+        let root = tempfile::tempdir()
+            .with_context(|| format!("retained fixture iteration {iteration}: create root"))?;
+        let path = root.path().to_path_buf();
+        let binary = engine()
+            .await
+            .with_context(|| format!("retained fixture iteration {iteration}: warm engine"))?;
+        let server = open(options(root.path(), binary))
+            .await
+            .with_context(|| format!("retained fixture iteration {iteration}: open supervisor"))?;
+        server.retain_directory(root).await.with_context(|| {
+            format!("retained fixture iteration {iteration}: handoff directory to supervisor")
+        })?;
+        let pool = server.pool("main").await.with_context(|| {
+            format!("retained fixture iteration {iteration}: acquire main pool")
+        })?;
+        drop(pool);
+        drop(server);
+        wait_removed(&path).await.with_context(|| {
+            format!("retained fixture iteration {iteration}: observe removal after owner drop")
+        })?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
