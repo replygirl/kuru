@@ -103,6 +103,16 @@ jobs:
             echo 'The runner image has no Ubuntu archive list at /etc/apt/sources.list.d/ubuntu.sources' >&2
             exit 1
           fi
+          # Runner mirror-list entries can route package indexes through a slow
+          # HTTP Azure mirror. Pin only that deb822 URI to the official HTTPS
+          # archive, preserving the signed suites and components.
+          ubuntu_source=/etc/apt/sources.list.d/ubuntu.sources
+          if grep -Fxq 'URIs: mirror+file:/etc/apt/apt-mirrors.txt' "$ubuntu_source"; then
+            sudo sed -i 's#^URIs: mirror+file:/etc/apt/apt-mirrors\.txt$#URIs: https://archive.ubuntu.com/ubuntu#' "$ubuntu_source"
+          elif ! grep -Eq '^URIs: https://archive\.ubuntu\.com/ubuntu/?$' "$ubuntu_source"; then
+            echo 'The Ubuntu archive list has no recognized mirror-list or official HTTPS archive URI' >&2
+            exit 1
+          fi
           # Job 110454097537 stalled 42 minutes inside apt-get update, past apt's
           # own bounds, so coreutils timeout caps each fetch. The cap lets apt's
           # bounds end a failure first, with apt's own error; derivation in the
