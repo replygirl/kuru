@@ -726,6 +726,8 @@ pub fn open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOpti
     let mut options = OpenOptions::new(data_dir, project_scope);
     options.config.cache_dir = Some(crate::store::test_cache());
     options.config.offline = true;
+    // Isolated fixtures own teardown, rather than waiting for product retention.
+    options.config.service_idle_timeout_secs = 0;
     options.supervisor = Some(crate::store::test_supervisor()?);
     options.fixture = Some(crate::store::Fixture::Unwarmed);
     Ok(options)

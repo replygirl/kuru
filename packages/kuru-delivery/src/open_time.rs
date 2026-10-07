@@ -431,6 +431,8 @@ impl Scratch {
         }
         let mut memory = toml::Table::new();
         memory.insert("offline".into(), toml::Value::Boolean(true));
+        // This harness measures deliberately cold owner starts, not retention.
+        memory.insert("service_idle_timeout_secs".into(), toml::Value::Integer(0));
         memory.insert(
             "cache_dir".into(),
             toml::Value::String(scratch.cache.to_string_lossy().into_owned()),

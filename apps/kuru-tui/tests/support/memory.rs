@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 /// Retires managed memory owners created by one application fixture before its
-/// temporary data root is removed. A service retires itself as soon as its last
-/// client detaches but may still be closing when that client exits, so
+/// temporary data root is removed. Fixtures explicitly select immediate idle
+/// retirement, but a service may still be closing when its last client exits, so
 /// subprocess fixtures must own this final step and await the close rather than
 /// leave independent Dolt processes accumulating across the parallel
 /// application suite.
@@ -382,6 +382,7 @@ pub fn configuration_with(root: &Path, cache: &Path) -> anyhow::Result<PathBuf> 
     let memory = kuru_core::MemoryConfig {
         cache_dir: Some(cache.to_owned()),
         offline: true,
+        service_idle_timeout_secs: 0,
         ..Default::default()
     };
     let config = std::collections::BTreeMap::from([("memory", memory)]);

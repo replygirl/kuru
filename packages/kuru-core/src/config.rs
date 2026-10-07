@@ -684,6 +684,8 @@ pub struct MemoryConfig {
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
     pub startup_timeout_secs: u64,
+    /// Retain an unused checked memory owner for sequential standalone calls.
+    pub service_idle_timeout_secs: u64,
 }
 
 impl Default for MemoryConfig {
@@ -693,6 +695,7 @@ impl Default for MemoryConfig {
             cache_dir: None,
             offline: false,
             startup_timeout_secs: 30,
+            service_idle_timeout_secs: 30,
         }
     }
 }
@@ -702,6 +705,10 @@ impl MemoryConfig {
         ensure!(
             (1..=300).contains(&self.startup_timeout_secs),
             "memory.startup_timeout_secs must be between 1 and 300"
+        );
+        ensure!(
+            self.service_idle_timeout_secs <= 300,
+            "memory.service_idle_timeout_secs must be between 0 and 300"
         );
         for (label, path) in [
             ("dolt_binary", &self.dolt_binary),
