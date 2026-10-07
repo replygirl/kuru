@@ -139,7 +139,13 @@ fn theme_configuration_has_schema_parity_layered_leaves_and_no_authority_claim()
         .iter()
         .find(|row| row.path == "ui.palette.secondary")
         .unwrap();
-    assert_eq!(secondary_leaf.source, local.to_string_lossy());
+    let expected_source = local
+        .to_string_lossy()
+        .chars()
+        .flat_map(char::escape_default)
+        .take(160)
+        .collect::<String>();
+    assert_eq!(secondary_leaf.source, expected_source);
     let effective = effective
         .finalize(&kuru_core::ProjectPreferences::default())
         .unwrap();
