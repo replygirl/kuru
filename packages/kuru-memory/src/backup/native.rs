@@ -130,21 +130,10 @@ impl ImageStage {
             "native validation cleanup selected a different directory"
         );
         self.directory.revalidate()?;
-        let directory = kuru_platform::fs::Directory::open(
-            self.directory.path(),
-            kuru_platform::fs::Privacy::OwnerOnly,
-            kuru_platform::fs::NameRetention::Movable,
-        )?;
-        ensure!(
-            directory.identity() == self.directory.identity(),
-            "native validation directory changed before removal"
-        );
         drop(self);
         // The exact seal still excludes a new owner through native removal.
-        directory
-            .remove_tree()
+        seal.remove_tree()
             .context("remove settled private validation stage")?;
-        drop(seal);
         Ok(())
     }
 
