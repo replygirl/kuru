@@ -880,12 +880,14 @@ child that elects an owner finds it busy and shows the waiting sentence until
 The progress-bounded readiness wait is tested against a real child process on
 Linux, macOS and Windows through a stand-in owner. With the `test-support`
 feature, `KURU_TEST_MEMORY_SERVICE_STAND_IN=<file>` (`SERVICE_STAND_IN_ENV`)
-makes `service_entry` skip everything else: the owner takes no lock, opens
-nothing and writes nothing, and once `<file>` holds a decimal status it removes
-the file and exits with that status, polling every 10 ms of real time in its
-own process. The fixture's start releases the stand-in whatever the outcome
-and, once it was spawned, waits in real time until the release file is gone,
-so the stand-in never outlives its test. A paused-clock test can otherwise end
+makes `service_entry` skip everything else: the owner takes no lock and opens no
+database. Once `<file>` holds a decimal status it renames that fully read release
+to a sibling receipt with the `consumed` extension and immediately exits with
+that status, polling every 10 ms of real time in its own process. The fixture's start releases
+the stand-in whatever the outcome and, once it was spawned, waits in real time
+for that positive receipt and validates the first release's status. The receipt
+proves consumption immediately before exit; the existing retained-child reaper
+still observes process completion. A paused-clock test can otherwise end
 and remove the fixture directory before the stand-in's first poll; that
 stand-in then ran to its 120 s backstop and, in a coverage partition, wrote its
 profile while the partition was exporting. Tests pass it
