@@ -1066,7 +1066,9 @@ mod tests {
     #[tokio::test]
     async fn recomputed_inventory_does_not_authorize_a_corrupt_native_image() -> Result<()> {
         kuru_memory::test_support::closing(async {
-            let root = crate::test_support::tempdir()?;
+            // Retained failed stages place stats repositories nine levels down:
+            // state/backup-validation/stage/data/kuru/.dolt/stats/.dolt/noms.
+            let root = crate::test_support::tempdir()?.with_depth_budget(9);
             let mut retained = None;
             let outcome = async {
                 let project = root.path().join("project");
