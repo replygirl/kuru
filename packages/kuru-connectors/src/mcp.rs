@@ -2688,27 +2688,36 @@ mod tests {
         }
         .await;
         let shutdown = hosts.shutdown().await;
+        let mut cleanup_errors = Vec::new();
         for alias in ["left", "right"] {
-            if let Some(record) = credentials
-                .acquire(alias)
-                .await
-                .unwrap()
-                .get()
-                .await
-                .unwrap()
-            {
-                credentials
-                    .acquire(alias)
-                    .await
-                    .unwrap()
-                    .delete(record.generation())
-                    .await
-                    .unwrap();
+            let cleanup: Result<()> = async {
+                let lease = credentials.acquire(alias).await?;
+                let (lease, record) = lease.read_locked().await?;
+                if let Some(record) = record {
+                    lease.delete(record.generation()).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = cleanup {
+                cleanup_errors.push(error.context(format!("clean up fake {alias} credential")));
             }
         }
         task.abort();
-        shutdown.unwrap();
+        if let Err(error) = task.await
+            && !error.is_cancelled()
+        {
+            cleanup_errors
+                .push(anyhow::Error::new(error).context("join shared-issuer fixture server"));
+        }
+        if let Err(error) = shutdown {
+            cleanup_errors.push(error.context("shut down shared-issuer fixture hosts"));
+        }
+        for error in &cleanup_errors {
+            eprintln!("shared-issuer fixture cleanup failed: {error:#}");
+        }
         checked.unwrap();
+        assert!(cleanup_errors.is_empty(), "shared-issuer cleanup failed");
     }
 
     #[tokio::test]

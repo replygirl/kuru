@@ -968,6 +968,16 @@ async fn two_fresh_terminals_share_owner_and_keep_private_sessions_through_eof()
                     let arrivals = arrivals.clone();
                     async move {
                         let text = request.to_string();
+                        let instructions = request["instructions"].as_str().unwrap();
+                        let actor = instructions.split(", ID ").nth(1).unwrap().split(')').next().unwrap();
+                        let session = if text.contains("FIRST_PRIVATE_SENTINEL") { "FIRST" } else { "SECOND" };
+                        let output = if instructions.contains("Phase: deliberate:") {
+                            format!("LIVE_PRIVATE_{session}_{actor}")
+                        } else if text.contains("_FOLLOWUP") {
+                            "COUNTED_FOLLOWUP_ANSWER".into()
+                        } else {
+                            "COUNTED_SESSION_ANSWER".into()
+                        };
                         requests.lock().unwrap().push(request);
                         if text.contains("FIRST_PRIVATE_SENTINEL") && !first_held.swap(true, Ordering::SeqCst) {
                             arrivals.send("first").unwrap();
@@ -979,7 +989,7 @@ async fn two_fresh_terminals_share_owner_and_keep_private_sessions_through_eof()
                         ([(CONTENT_TYPE, "text/event-stream")], format!("data: {}\n\n", json!({
                             "type":"response.completed", "response": {
                                 "id":"session-admission", "status":"completed",
-                                "output":[{"type":"message","content":[{"type":"output_text","text":"COUNTED_SESSION_ANSWER"}]}],
+                                "output":[{"type":"message","content":[{"type":"output_text","text":output}]}],
                                 "usage":{"input_tokens":3,"output_tokens":2}
                             }
                         }))).into_response()
@@ -1056,6 +1066,7 @@ async fn two_fresh_terminals_share_owner_and_keep_private_sessions_through_eof()
             .get(&format!("{scope}/ifs/membership"))
             .await?
             .context("membership absent")?;
+        let parts = membership["parts"].as_array().context("membership parts absent")?;
         let mut seen = BTreeSet::new();
         for id in &ids {
             let transcript = profile.memory.transcript_namespace(&scope, id);
@@ -1106,6 +1117,101 @@ async fn two_fresh_terminals_share_owner_and_keep_private_sessions_through_eof()
             );
         }
         ensure!(seen.len() == 2);
+        // These continuity records come from a synthetic prior session, not
+        // either live driver's history. Both actual first turns have settled.
+        // Keeping their cursors untouched lets the next wire requests prove
+        // raw live history and policy-approved shared summaries together.
+        let summary_base = MemoryStore::open_managed_observed(
+            options.clone(),
+            sandbox.project.canonicalize()?,
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+        ).1.await?;
+        let prior = "N3_SYNTHETIC_PRIOR_SESSION";
+        let (summary_writer, summary_driver) = summary_base.bind_project_driver(&sandbox.project).await?;
+        summary_driver.select(kuru_memory::SessionDriverTarget::Absent(prior.into())).await?;
+        for part in parts {
+            use sha2::{Digest, Sha256};
+            let actor = part["id"].as_str().context("part id")?;
+            let namespace = profile.memory.identity_namespace(&scope, Mode::Ifs, actor);
+            summary_writer.append_session_message(
+                &namespace, prior,
+                &kuru_core::Message::text("user", format!("PRIOR_RAW_{actor}")),
+            ).await?;
+            let snapshot = summary_writer.session_source_snapshot(
+                &namespace, prior, &namespace, 0, 64,
+            ).await?;
+            let mut digest = Sha256::new();
+            digest.update(b"kuru-context-summary-namespace-v1");
+            digest.update((namespace.len() as u64).to_be_bytes());
+            digest.update(namespace.as_bytes());
+            let suffix = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            let summary_namespace = format!("context-summary/{suffix}");
+            summary_writer.checkpoint_context_summary(&kuru_memory::ContextSummaryCheckpoint {
+                record: kuru_memory::ContextSummaryRecord {
+                    actor_namespace: namespace.clone(), session_id: prior.into(),
+                    source_namespace: namespace, summary_namespace,
+                    source_view: snapshot.view, source_revision: snapshot.revision,
+                    after_sequence: 0,
+                    through_sequence: snapshot.through_inclusive.context("prior source boundary")?,
+                    turn_id: None, operation_id: Some(format!("n3-summary-{actor}")),
+                    producer_actor_id: Some(actor.into()), invocation_id: format!("n3-invocation-{actor}"),
+                    summary: format!("APPROVED_CONTINUITY_{actor}"),
+                },
+                private_reasoning: vec![kuru_memory::ReasoningSummaryRecord {
+                    session_id: prior.into(), turn_id: None,
+                    operation_id: Some(format!("n3-summary-{actor}")), actor_id: actor.into(),
+                    invocation_id: format!("n3-invocation-{actor}"), item_id: Some("n3-private".into()),
+                    output_index: Some(0), summary_index: 0, text: format!("PRIOR_REASONING_{actor}"),
+                }],
+            }).await?;
+        }
+        summary_driver.close().await?;
+        summary_writer.close().await?;
+        summary_base.close().await?;
+        ensure!(inspector.live_session_drivers().await?.len() == 2);
+        first.submit("FIRST_FOLLOWUP")?;
+        second.submit("SECOND_FOLLOWUP")?;
+        first.wait_composer_frame(&["COUNTED_FOLLOWUP_ANSWER", "enter send"], READY_TIMEOUT)?;
+        second.wait_composer_frame(&["COUNTED_FOLLOWUP_ANSWER", "enter send"], READY_TIMEOUT)?;
+        ensure!(inspector.live_session_drivers().await?.len() == 2);
+        for id in &ids {
+            let transcript = profile.memory.transcript_namespace(&scope, id);
+            let history = inspector.history(&transcript, 64).await?;
+            let text = serde_json::to_string(&history)?;
+            let session = if text.contains("FIRST_PRIVATE_SENTINEL") { "FIRST" } else { "SECOND" };
+            ensure!(text.contains(&format!("{session}_FOLLOWUP")) && text.contains("COUNTED_FOLLOWUP_ANSWER"),
+                "second actual turn did not persist before context inspection");
+        }
+        {
+            let captured = requests.lock().unwrap();
+            for session in ["FIRST", "SECOND"] {
+                let foreign = if session == "FIRST" { "SECOND" } else { "FIRST" };
+                for part in parts {
+                    let actor = part["id"].as_str().context("part id")?;
+                    let request = captured.iter().find(|request| {
+                        request["instructions"].as_str().is_some_and(|instructions|
+                            instructions.contains(&format!(", ID {actor})")) && instructions.contains("Phase: deliberate:"))
+                            && request["input"].to_string().contains(&format!("{session}_FOLLOWUP"))
+                    }).context("part omitted an actual second-turn HTTP request")?;
+                    let input = request["input"].to_string();
+                    let complete = request.to_string();
+                    for required in [format!("{session}_PRIVATE_SENTINEL"), format!("LIVE_PRIVATE_{session}_{actor}"), format!("APPROVED_CONTINUITY_{actor}")] {
+                        ensure!(input.contains(&required), "actual {session}/{actor} context omitted {required}");
+                    }
+                    ensure!(!complete.contains(&format!("{foreign}_PRIVATE_SENTINEL")), "foreign live user row leaked");
+                    for other in parts {
+                        let other = other["id"].as_str().context("part id")?;
+                        for forbidden in [format!("LIVE_PRIVATE_{foreign}_{other}"), format!("PRIOR_RAW_{other}"), format!("PRIOR_REASONING_{other}")] {
+                            ensure!(!complete.contains(&forbidden), "actual {session}/{actor} context leaked {forbidden}");
+                        }
+                        if other != actor {
+                            ensure!(!complete.contains(&format!("LIVE_PRIVATE_{session}_{other}")), "another part's live private row leaked");
+                            ensure!(!complete.contains(&format!("APPROVED_CONTINUITY_{other}")), "another part's summary leaked");
+                        }
+                    }
+                }
+            }
+        }
         second.command("/sessions", Some("Sessions"))?;
         second.wait_text(&["live"], &[])?;
         second.close_picker(b"\x1b")?;
