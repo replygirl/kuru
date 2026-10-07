@@ -1885,6 +1885,22 @@ impl MemoryStore {
         }
     }
 
+    fn ensure_history_scope(&self, scope: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Local(store) => store.ensure_history_scope(scope),
+            Backend::Remote(remote) => match remote.session.factory.restored_history_scope() {
+                Some(history) => {
+                    ensure!(
+                        scope == history,
+                        "transcript belongs to a different history namespace"
+                    );
+                    Ok(())
+                }
+                None => self.ensure_project_scope(scope),
+            },
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     /// A separate fixture exchange owner for the same authenticated driver.
     /// No claim is minted and no pending mutation is transferred.
@@ -2240,7 +2256,7 @@ impl MemoryStore {
         let scope = namespace
             .strip_suffix(&suffix)
             .context("public turn transcript namespace does not match its session")?;
-        self.ensure_project_scope(scope)?;
+        self.ensure_history_scope(scope)?;
         self.checkpoint_session_inner(
             namespace,
             session_id,
@@ -3308,6 +3324,19 @@ impl MemoryStore {
         }
     }
 
+    /// Return the positively checked restore namespace, or retain the
+    /// caller's checked canonical namespace for an ordinary store. The latter
+    /// also preserves the deliberate unbound-store fixture convention.
+    /// This provenance never grants source-project attachment authority.
+    pub fn history_scope<'a>(&'a self, canonical_scope: &'a str) -> Result<&'a str> {
+        self.ensure_project_scope(canonical_scope)?;
+        let restored = match &self.backend {
+            Backend::Local(store) => store.restored_history_scope(),
+            Backend::Remote(remote) => remote.session.factory.restored_history_scope(),
+        };
+        Ok(restored.unwrap_or(canonical_scope))
+    }
+
     /// The name pinned when this handle selected its view. This is metadata,
     /// not a liveness, revision, ownership or mutation-authority check.
     pub fn selected_view_name(&self) -> &str {
@@ -3356,6 +3385,78 @@ impl MemoryStore {
                 })
             }
         }
+    }
+
+    /// Capture a complete native image through the existing writable owner.
+    /// A failed/lost publication response is never permission to resend; use
+    /// independent verification of the selected destination instead.
+    pub async fn backup(
+        &self,
+        project: &Path,
+        target: &Path,
+        cancellation: &crate::BackupCancellation,
+    ) -> Result<crate::BackupResult> {
+        match &self.backend {
+            Backend::Local(store) => crate::backup::prepare(store, project, target, cancellation)
+                .await?
+                .publish(cancellation),
+            Backend::Remote(remote) => {
+                remote.session.ensure_open()?;
+                ensure!(
+                    remote.candidate.is_none() && remote.pinned_view == "main" && !remote.read_only,
+                    "backup requires an existing writable main attachment"
+                );
+                ensure!(
+                    project == remote.session.project,
+                    "backup project differs from the authenticated owner"
+                );
+                ensure!(
+                    !cancellation.is_cancelled(),
+                    "backup cancelled before dispatch"
+                );
+                // Do not hold the client's shared mutation lock or inherit its
+                // candidate/presence/lease handles during bulk capture.
+                let dedicated = Arc::new(AsyncMutex::new(remote.session.factory.connect().await?));
+                remote.session.register(&dedicated)?;
+                let mut attachment = dedicated.lock().await;
+                let reply = {
+                    let operation = attachment.call(ServiceCall::Backup {
+                        target: target.to_owned(),
+                    });
+                    tokio::pin!(operation);
+                    tokio::select! {
+                        biased;
+                        result = &mut operation => result,
+                        () = cancellation.cancelled() => Err(anyhow::anyhow!("backup cancelled; selected destination outcome remains unconfirmed until verified")),
+                    }
+                };
+                // Dropping an incomplete dedicated exchange reaches owner EOF
+                // and withdraws publication authority without closing peers.
+                attachment.close();
+                let ServiceValue::Backup(result) = reply? else {
+                    bail!("memory service returned the wrong backup response")
+                };
+                Ok(result)
+            }
+        }
+    }
+
+    pub async fn verify_backup(
+        options: OpenOptions,
+        path: &Path,
+        cancellation: &crate::BackupCancellation,
+    ) -> Result<crate::BackupResult> {
+        crate::backup::verify(&options, path, cancellation).await
+    }
+
+    pub async fn restore_backup(
+        options: OpenOptions,
+        project: &Path,
+        path: &Path,
+        remap: bool,
+        cancellation: &crate::BackupCancellation,
+    ) -> Result<crate::RestoreResult> {
+        crate::backup::restore(options, project, path, remap, cancellation).await
     }
 
     pub async fn purge(options: OpenOptions) -> Result<crate::PurgeOutcome> {

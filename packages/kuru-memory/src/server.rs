@@ -199,11 +199,98 @@ pub struct ServerOptions {
 #[derive(Clone)]
 pub struct Server(Arc<ServerInner>);
 
+/// Only the native backup worker receives this description. It opens its own
+/// connection on its independent reactor, rather than borrowing a pooled
+/// socket whose reactor may be blocked by the awaiting caller's Drop/join.
+/// Credentials remain private; this type is neither Debug nor serialized.
+pub(crate) struct BackupConnection {
+    server: Server,
+    #[cfg(test)]
+    completed_cut: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    pub(crate) discard_reply: bool,
+}
+
+impl BackupConnection {
+    /// A causal test boundary after terminal response and positive Sleep;
+    /// this is deliberately not a claim that native byte copying is active.
+    #[cfg(test)]
+    pub(crate) async fn hold_completed_cut(
+        &self,
+        cancellation: &crate::BackupCancellation,
+    ) -> Result<()> {
+        let pause = self
+            .completed_cut
+            .lock()
+            .expect("backup completion pause")
+            .take();
+        if let Some((completed, release)) = pause {
+            let _ = completed.send(());
+            tokio::select! {
+                _ = release => {},
+                _ = cancellation.cancelled() => anyhow::bail!("settled SQL cut cancelled before image validation"),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn connect(&self) -> Result<sqlx::MySqlConnection> {
+        use sqlx::Connection;
+        let server = &self.server.0;
+        ensure!(
+            !server.closed.load(Ordering::Acquire) && !server.read_only,
+            "native backup requires the existing writable memory owner"
+        );
+        let identity = &server.identity;
+        let endpoint = &server.endpoint;
+        ensure!(
+            endpoint.instance == identity.instance && endpoint.port >= 1024,
+            "memory endpoint identity mismatch"
+        );
+        let options = MySqlConnectOptions::new()
+            .host("127.0.0.1")
+            .port(endpoint.port)
+            .username("root")
+            .password(&identity.password)
+            .database("kuru/main")
+            .ssl_mode(MySqlSslMode::Disabled);
+        crate::pool::within(crate::store::QUERY_TIMEOUT, async {
+            let mut connection = sqlx::MySqlConnection::connect_with(&options).await?;
+            let datadir: String = sqlx::query_scalar("SELECT @@datadir")
+                .fetch_one(&mut connection)
+                .await?;
+            ensure!(
+                same_directory(Path::new(&datadir), &server.directory.join("data"))?,
+                DATA_DIRECTORY_MISMATCH
+            );
+            let row = sqlx::query(
+                "SELECT instance_id, project_scope FROM kuru_instance WHERE singleton = 1",
+            )
+            .fetch_one(&mut connection)
+            .await?;
+            let (instance, scope) = identity.sql_identity();
+            ensure!(
+                row.try_get::<String, _>("instance_id")? == instance
+                    && row.try_get::<String, _>("project_scope")? == scope,
+                IDENTITY_MISMATCH
+            );
+            Ok::<_, anyhow::Error>(connection)
+        })
+        .await
+        .context("authenticate dedicated native backup connection deadline exceeded")?
+    }
+}
+
 struct ServerInner {
     directory: PathBuf,
     identity: Identity,
     endpoint: Endpoint,
     read_only: bool,
+    image_runtime: crate::backup::ImageRuntime,
+    #[cfg(test)]
+    next_backup_completed_cut: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    next_backup_discard_reply: AtomicBool,
     pools: Mutex<BTreeMap<String, Weak<MemoryPool>>>,
     pool_admission: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     /// The deadline that bounded this owned start's readiness and first
@@ -413,6 +500,27 @@ struct Identity {
     /// on a record carrying it (`deny_unknown_fields`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     template: Option<String>,
+    /// Restored SQL history retains its original identity row. This tuple is
+    /// data provenance; the fresh external instance alone owns the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<SourceIdentity>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceIdentity {
+    instance: String,
+    project_scope: String,
+}
+
+impl Identity {
+    fn sql_identity(&self) -> (&str, &str) {
+        self.source
+            .as_ref()
+            .map_or((&self.instance, &self.project_scope), |source| {
+                (&source.instance, &source.project_scope)
+            })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -508,6 +616,65 @@ impl Server {
 
     pub(crate) fn instance(&self) -> &str {
         &self.0.identity.instance
+    }
+
+    pub(crate) fn sql_origin(&self) -> (&str, &str) {
+        self.0.identity.sql_identity()
+    }
+
+    pub(crate) fn backup_connection(&self) -> Result<BackupConnection> {
+        ensure!(
+            !self.0.closed.load(Ordering::Acquire) && !self.0.read_only,
+            "native backup requires the existing writable memory owner"
+        );
+        Ok(BackupConnection {
+            server: self.clone(),
+            #[cfg(test)]
+            completed_cut: StdMutex::new(
+                self.0
+                    .next_backup_completed_cut
+                    .lock()
+                    .expect("backup completion pause")
+                    .take(),
+            ),
+            #[cfg(test)]
+            discard_reply: self
+                .0
+                .next_backup_discard_reply
+                .swap(false, Ordering::AcqRel),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_backup_completed_cut(
+        &self,
+    ) -> Result<(oneshot::Receiver<()>, oneshot::Sender<()>)> {
+        let mut slot = self
+            .0
+            .next_backup_completed_cut
+            .lock()
+            .expect("backup completion pause");
+        ensure!(
+            slot.is_none(),
+            "backup completion pause is already installed"
+        );
+        let (completed, observed) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        *slot = Some((completed, released));
+        Ok((observed, release))
+    }
+
+    /// Discard one actual native CALL result before its required Sleep proof.
+    /// This models missing evidence, not a real network-failure observation.
+    #[cfg(test)]
+    pub(crate) fn discard_next_backup_reply(&self) {
+        self.0
+            .next_backup_discard_reply
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn image_runtime(&self) -> crate::backup::ImageRuntime {
+        self.0.image_runtime.clone()
     }
 
     /// Hold the same stable lease as the supervisor until the caller completes
@@ -634,6 +801,7 @@ impl Server {
                     None,
                     reap_guard,
                     None,
+                    crate::backup::ImageRuntime::from_server(&options),
                     options.ticks,
                 ));
             }
@@ -658,7 +826,7 @@ impl Server {
         let startup_deadline = Instant::now() + options.timeout + SUPERVISOR_TRANSPORT_ALLOWANCE;
         #[cfg(unix)]
         let (mut owner, response) = {
-            let mut command = Command::new(options.supervisor);
+            let mut command = Command::new(&options.supervisor);
             command
                 .arg("--internal-dolt-supervisor")
                 .env_clear()
@@ -952,6 +1120,7 @@ impl Server {
             owner,
             reap_guard,
             Some(startup_deadline),
+            crate::backup::ImageRuntime::from_server(&options),
             options.ticks,
         ))
     }
@@ -968,6 +1137,7 @@ impl Server {
         owner: Option<Owner>,
         reap_guard: Arc<StdMutex<Option<File>>>,
         opening_deadline: Option<Instant>,
+        image_runtime: crate::backup::ImageRuntime,
         ticks: Option<crate::progress::OpenTicks>,
     ) -> Self {
         Self(Arc::new(ServerInner {
@@ -975,6 +1145,11 @@ impl Server {
             identity,
             endpoint,
             read_only,
+            image_runtime,
+            #[cfg(test)]
+            next_backup_completed_cut: StdMutex::new(None),
+            #[cfg(test)]
+            next_backup_discard_reply: AtomicBool::new(false),
             pools: Mutex::new(BTreeMap::new()),
             pool_admission: Mutex::new(BTreeMap::new()),
             opening_deadline: StdMutex::new(opening_deadline),
@@ -1840,7 +2015,7 @@ fn load_identity(directory: &Path, project_scope: &str) -> Result<Option<Identit
     let identity: Option<Identity> = read_record(&directory.join("identity.json"))?;
     if let Some(identity) = &identity {
         ensure!(
-            identity.version == 1 && identity.project_scope == project_scope,
+            identity.project_scope == project_scope,
             "memory project identity mismatch"
         );
         validate_identity(identity)?;
@@ -1869,7 +2044,13 @@ pub(crate) fn require_existing_instance(
 }
 
 fn validate_identity(identity: &Identity) -> Result<()> {
-    ensure!(identity.version == 1, "memory project identity mismatch");
+    ensure!(
+        matches!(
+            (identity.version, &identity.source),
+            (1, None) | (2, Some(_))
+        ),
+        "memory project identity format mismatch"
+    );
     Uuid::parse_str(&identity.instance).context("invalid memory instance identity")?;
     for secret in [&identity.password, &identity.reader_password] {
         ensure!(
@@ -1881,7 +2062,99 @@ fn validate_identity(identity: &Identity) -> Result<()> {
         identity.template.as_deref().is_none_or(valid_template_key),
         "invalid memory template identity"
     );
+    if let Some(source) = &identity.source {
+        ensure!(
+            identity.template.is_none(),
+            "restored identity cannot adopt a store template"
+        );
+        Uuid::parse_str(&source.instance).context("invalid restored SQL origin instance")?;
+        crate::store::project_directory(Path::new("."), &source.project_scope)?;
+        ensure!(
+            source.instance != identity.instance,
+            "restored store reused SQL origin authority"
+        );
+    }
     Ok(())
+}
+
+/// A published format-2 activation must match the separately stored live
+/// identity before any supervisor can open the copied SQL history. The SQL
+/// origin and immediate source are distinct after backup-of-restore chains.
+pub(crate) fn verify_restored_identity(
+    directory: &Path,
+    target_scope: &str,
+    immediate_source_instance: &str,
+    sql_origin_instance: &str,
+    sql_origin_scope: &str,
+) -> Result<()> {
+    let identity = load_identity(directory, target_scope)?
+        .context("restored project lacks its fresh live identity")?;
+    ensure!(
+        identity.version == 2 && identity.initialized,
+        "restored project identity is incomplete"
+    );
+    let origin = identity
+        .source
+        .as_ref()
+        .context("restored project lacks its SQL origin")?;
+    ensure!(
+        origin.instance == sql_origin_instance && origin.project_scope == sql_origin_scope,
+        "restored project SQL origin differs from its remap receipt"
+    );
+    ensure!(
+        identity.instance != immediate_source_instance,
+        "restored project reused the immediate source's live authority"
+    );
+    Ok(())
+}
+
+pub(crate) fn verify_unrestored_identity(directory: &Path, scope: &str) -> Result<()> {
+    if let Some(identity) = load_identity(directory, scope)? {
+        ensure!(
+            identity.version == 1 && identity.source.is_none(),
+            "ordinary activation cannot open a restored live identity"
+        );
+    }
+    Ok(())
+}
+
+/// A checked native restore creates fresh external authority without changing
+/// any copied SQL identity row or receipt. Only an unpublished private stage
+/// may receive this record; its first start verifies the origin before writes.
+pub(crate) fn stage_restored_identity(
+    directory: &Path,
+    target_scope: &str,
+    origin_instance: &str,
+    origin_scope: &str,
+) -> Result<()> {
+    prepare_directory(directory, false)?;
+    crate::store::project_directory(Path::new("."), target_scope)?;
+    crate::store::project_directory(Path::new("."), origin_scope)?;
+    ensure!(
+        load_identity(directory, target_scope)?.is_none(),
+        "restore stage already has an identity"
+    );
+    let data = files::open_directory(
+        &directory.join("data/kuru/.dolt"),
+        Privacy::Inherited,
+        NameRetention::Movable,
+    )?;
+    data.revalidate()?;
+    let identity = Identity {
+        version: 2,
+        instance: Uuid::new_v4().to_string(),
+        project_scope: target_scope.to_owned(),
+        password: secret(),
+        reader_password: secret(),
+        initialized: false,
+        template: None,
+        source: Some(SourceIdentity {
+            instance: origin_instance.to_owned(),
+            project_scope: origin_scope.to_owned(),
+        }),
+    };
+    validate_identity(&identity)?;
+    write_record(&directory.join("identity.json"), &identity)
 }
 
 /// A template key is one portable, case-distinct path component: `[a-z0-9_-]`,
@@ -1925,6 +2198,7 @@ pub(crate) fn write_template_stage_identity(
         reader_password: secret(),
         initialized: false,
         template: Some(template.to_owned()),
+        source: None,
     };
     validate_identity(&identity)?;
     ensure!(
@@ -1947,6 +2221,7 @@ pub(crate) fn write_template_build_identity(directory: &Path, template: &str) ->
         reader_password: secret(),
         initialized: false,
         template: Some(template.to_owned()),
+        source: None,
     };
     validate_identity(&identity)?;
     ensure!(
@@ -2041,6 +2316,7 @@ pub(crate) fn write_initialized_identity(
         reader_password: secret(),
         initialized: true,
         template: None,
+        source: None,
     };
     validate_identity(&identity)?;
     write_record(&directory.join("identity.json"), &identity)
@@ -2607,8 +2883,9 @@ async fn connect_pool_attempt(
         })
         .database(&format!("kuru/{branch}"))
         .ssl_mode(MySqlSslMode::Disabled);
-    let instance = identity.instance.clone();
-    let project_scope = identity.project_scope.clone();
+    let (sql_instance, sql_scope) = identity.sql_identity();
+    let instance = sql_instance.to_owned();
+    let project_scope = sql_scope.to_owned();
     let expected_directory = directory.join("data");
     let observation = ConnectionObservation::new();
     #[cfg(test)]
@@ -2800,9 +3077,10 @@ where
             sqlx::query("SELECT instance_id, project_scope FROM kuru_instance WHERE singleton = 1")
                 .fetch_one(pool)
                 .await?;
+        let (instance, scope) = identity.sql_identity();
         ensure!(
-            row.try_get::<String, _>("instance_id")? == identity.instance
-                && row.try_get::<String, _>("project_scope")? == identity.project_scope,
+            row.try_get::<String, _>("instance_id")? == instance
+                && row.try_get::<String, _>("project_scope")? == scope,
             "memory SQL project/instance identity mismatch"
         );
         Ok(())
@@ -3037,6 +3315,7 @@ async fn supervise_with_port_hook<
                 reader_password: secret(),
                 initialized: false,
                 template: None,
+                source: None,
             };
             write_record(&request.directory.join("identity.json"), &identity)?;
             identity
@@ -3507,7 +3786,21 @@ async fn initialize_database(
         }
         _ => false,
     };
-    if adopting {
+    if identity.source.is_some() {
+        // Verify the retained row before reader-account setup or ordinary
+        // initializer DDL. Restored history must never be silently repaired.
+        *phase = "verifying the restored SQL origin";
+        let rows = sqlx::query(
+            "SELECT instance_id, project_scope FROM kuru.kuru_instance WHERE singleton = 1",
+        )
+        .fetch_all(pool)
+        .await?;
+        let (instance, scope) = identity.sql_identity();
+        ensure!(
+            identity_rows_are(&rows, instance, scope)?,
+            "restored SQL origin differs from its checked identity"
+        );
+    } else if adopting {
         adopt_template(pool, identity, phase).await?;
     } else if !identity.initialized {
         *phase = "creating the project database";
@@ -3575,9 +3868,10 @@ async fn initialize_database(
     )
     .fetch_one(pool)
     .await?;
+    let (instance, scope) = identity.sql_identity();
     ensure!(
-        row.try_get::<String, _>("instance_id")? == identity.instance
-            && row.try_get::<String, _>("project_scope")? == identity.project_scope,
+        row.try_get::<String, _>("instance_id")? == instance
+            && row.try_get::<String, _>("project_scope")? == scope,
         "Dolt bootstrap project identity mismatch"
     );
     if !identity.initialized {
@@ -3899,6 +4193,7 @@ mod stale_endpoint_tests {
             reader_password: secret(),
             initialized: true,
             template: None,
+            source: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

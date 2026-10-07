@@ -36,6 +36,8 @@ fn project_structure_inspection_is_bounded_and_does_not_create_state() -> Result
             project_scope: scope.clone(),
             initial_revision: "0".repeat(32),
             migration: None,
+            history_scope: None,
+            restore: None,
         })?,
     )?;
     assert_eq!(

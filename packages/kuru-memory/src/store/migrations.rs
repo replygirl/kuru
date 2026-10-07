@@ -769,6 +769,44 @@ pub(super) async fn validate_historical(pool: &MemoryPool) -> Result<i32> {
     Ok(version)
 }
 
+/// Validate copied main authority at its captured version, including retained
+/// attempts. A backup reader neither upgrades nor normalizes this image.
+pub(super) async fn validate_backup_main(pool: &MemoryPool) -> Result<i32> {
+    let found = validate_historical(pool).await?;
+    inventory_with(REGISTRY, pool).await?;
+    classify_historical_attempts(REGISTRY, pool, found).await?;
+    Ok(found)
+}
+
+pub(super) async fn validate_backup_usage(pool: &MemoryPool) -> Result<()> {
+    let found = validate_supported_with(USAGE_REGISTRY, pool).await?;
+    authority_working_set(pool).await?;
+    inventory_in(USAGE_REGISTRY, pool, USAGE_RESERVED_PREFIX).await?;
+    classify_historical_attempts_in(USAGE_REGISTRY, pool, found, USAGE_RESERVED_PREFIX).await?;
+    Ok(())
+}
+
+/// Reuse the immutable schema dispatcher on a detached read session. The
+/// backup inspector alone selects its exact captured branch or commit.
+pub(super) async fn validate_backup_revision(connection: &mut MySqlConnection) -> Result<i32> {
+    let found = version_on(connection).await?;
+    // Tags and remote names do not identify a root's owning registry. The
+    // released main and usage registries share their v1..v4 definitions;
+    // either positive authority validation covers such an aliased root.
+    match validate_version_on(REGISTRY, connection, found).await {
+        Ok(()) => Ok(found),
+        Err(main) => match validate_version_on(USAGE_REGISTRY, connection, found).await {
+            Ok(()) => Ok(found),
+            Err(_) => Err(main
+                .context("copied root matches neither released main nor usage schema authority")),
+        },
+    }
+}
+
+pub(super) fn backup_reserved_branch(name: &str) -> bool {
+    name.starts_with(RESERVED_PREFIX) || name.starts_with(USAGE_RESERVED_PREFIX)
+}
+
 async fn validate_supported_with(registry: Registry, pool: &MemoryPool) -> Result<i32> {
     registry.validate()?;
     let mut connection = acquire(pool).await?;

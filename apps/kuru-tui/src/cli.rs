@@ -543,6 +543,17 @@ pub enum MemoryCommand {
     },
     /// Show the active project, engine version and revision.
     Status,
+    /// Preserve one native dataset image, including history and retained refs.
+    Backup { target: PathBuf },
+    /// Verify an immutable backup through an independent native restore.
+    Verify { backup: PathBuf },
+    /// Restore an immutable backup into this project's absent memory target.
+    Restore {
+        backup: PathBuf,
+        /// Explicitly accept a different canonical project root for the target.
+        #[arg(long)]
+        remap_project: bool,
+    },
     /// List recent committed memory revisions.
     History {
         #[arg(long, default_value_t = 20)]
@@ -1249,6 +1260,58 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&outcome)?);
         return Ok(());
     }
+    // Image verification/restoration needs only reviewed memory authority.
+    // Return before legacy import, project preferences or a runtime admission.
+    if let Some(Command::Memory { command }) = &cli.command {
+        let cancellation = kuru_memory::BackupCancellation::default();
+        match command {
+            MemoryCommand::Verify { backup } => {
+                let mut options = MemoryOptions::new(data.clone(), scope.clone());
+                options.config = memory_config.clone();
+                let result = finish_memory_operation(
+                    async {
+                        let _retained_data = Directory::ensure_private(&data)
+                            .map_err(|error| data_directory_error(&data, error))?;
+                        ensure_outside_workspace(&data, &cwd)?;
+                        MemoryStore::verify_backup(options, backup, &cancellation).await
+                    },
+                    || cancellation.cancel(),
+                    &mut invocation_signal,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
+            MemoryCommand::Restore {
+                backup,
+                remap_project,
+            } => {
+                let mut options = MemoryOptions::new(data.clone(), scope.clone());
+                options.config = memory_config.clone();
+                let result = finish_memory_operation(
+                    async {
+                        let _retained_data = Directory::ensure_private(&data)
+                            .map_err(|error| data_directory_error(&data, error))?;
+                        ensure_outside_workspace(&data, &cwd)?;
+                        MemoryStore::restore_backup(
+                            options,
+                            &cwd,
+                            backup,
+                            *remap_project,
+                            &cancellation,
+                        )
+                        .await
+                    },
+                    || cancellation.cancel(),
+                    &mut invocation_signal,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     let session_writer = matches!(
         &cli.command,
         Some(Command::Sessions {
@@ -1287,6 +1350,14 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
             command: MemoryCommand::Purge { .. }
         })
     );
+    // Native backup needs the existing owner's writable SQL capability, but
+    // does not take a conversation claim or project maintenance exclusion.
+    let backup = matches!(
+        cli.command,
+        Some(Command::Memory {
+            command: MemoryCommand::Backup { .. }
+        })
+    );
     if let Some(Command::Memory {
         command: MemoryCommand::Purge { yes: false },
     }) = &cli.command
@@ -1303,7 +1374,8 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
     let memory_control = matches!(
         cli.command,
         Some(Command::Memory {
-            command: MemoryCommand::Notes { .. }
+            command: MemoryCommand::Backup { .. }
+                | MemoryCommand::Notes { .. }
                 | MemoryCommand::Forget { .. }
                 | MemoryCommand::Export { .. }
                 | MemoryCommand::Candidates { .. }
@@ -1379,7 +1451,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         ensure_outside_workspace(&data, &cwd)?;
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config.clone();
-        options.read_only = !writer && !migrate;
+        options.read_only = !writer && !migrate && !backup;
         Ok(Some(open_memory(options, &cwd, interactive).await?))
     }
     .await
@@ -1502,6 +1574,19 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                 match command {
                     MemoryCommand::Inventory | MemoryCommand::Import { .. } => {
                         unreachable!("legacy inventory/import returned before ordinary memory open")
+                    }
+                    MemoryCommand::Backup { target } => {
+                        let cancellation = kuru_memory::BackupCancellation::default();
+                        let result = finish_memory_operation(
+                            memory.backup(&cwd, target, &cancellation),
+                            || cancellation.cancel(),
+                            &mut invocation_signal,
+                        )
+                        .await?;
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    }
+                    MemoryCommand::Verify { .. } | MemoryCommand::Restore { .. } => {
+                        unreachable!("verify and restore returned before opening project memory")
                     }
                     MemoryCommand::Status => {
                         println!("{}", serde_json::to_string_pretty(&memory.status().await?)?)

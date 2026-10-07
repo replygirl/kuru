@@ -252,7 +252,7 @@ impl MemoryStore {
     }
 
     fn check_state_claims(&self, values: &[(String, String)]) -> Result<()> {
-        let prefix = format!("{}/session/", self.shared.project_scope);
+        let prefix = format!("{}/session/", self.history_scope());
         for (key, _) in values {
             if let Some(tail) = key.strip_prefix(&prefix) {
                 self.check_session_claim(tail.split('/').next().unwrap_or(tail))?;
@@ -323,7 +323,7 @@ impl MemoryStore {
 
     fn check_transcript_claim(&self, namespace: &str) -> Result<()> {
         if let Some(session) =
-            namespace.strip_prefix(&format!("{}/transcript/", self.shared.project_scope))
+            namespace.strip_prefix(&format!("{}/transcript/", self.history_scope()))
         {
             self.check_session_claim(session)?;
         }

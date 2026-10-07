@@ -52,6 +52,11 @@ pub struct ServiceRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServiceCall {
+    /// Filesystem publication through a dedicated main attachment; no SQL
+    /// receipt or ordinary session mutation is created by this operation.
+    Backup {
+        target: PathBuf,
+    },
     SelectSessionDriver {
         selection: crate::SessionDriverSelection,
     },
@@ -232,12 +237,14 @@ pub(crate) enum Receipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplyBudget {
     Operation,
+    Backup,
 }
 
 impl ReplyBudget {
     pub(crate) const fn deadline(self) -> std::time::Duration {
         match self {
             Self::Operation => OPERATION_TIMEOUT,
+            Self::Backup => crate::backup::SQL_TIMEOUT,
         }
     }
 }
@@ -272,6 +279,11 @@ impl ServiceCall {
     pub(crate) fn contract(&self) -> OperationContract {
         use OperationContract as C;
         match self {
+            Self::Backup { .. } => C {
+                mutation: Mutation::Write,
+                receipt: Receipt::None,
+                reply: ReplyBudget::Backup,
+            },
             Self::SelectSessionDriver { .. } | Self::ReattachSessionDriver { .. } => {
                 C::write(Receipt::None)
             }
@@ -660,6 +672,7 @@ pub enum ServiceResponse {
     deny_unknown_fields
 )]
 pub enum ServiceValue {
+    Backup(crate::BackupResult),
     SessionDriver(crate::SessionDriverProof),
     SessionDriverOutcome(crate::SessionDriverOutcome),
     LiveSessionDrivers(Vec<crate::LiveSessionDriver>),
@@ -1777,6 +1790,47 @@ async fn process<S: AsyncRead + Unpin>(
         progress.pause_after_registration().await?;
     }
     match call {
+        ServiceCall::Backup { target } => {
+            ensure!(
+                !state.holds_resources(),
+                "backup requires a dedicated main attachment"
+            );
+            let source = store.backup_source_identity(authority.project_path.clone())?;
+            let cancellation = crate::BackupCancellation::default();
+            let preparing =
+                crate::backup::prepare_from_owner(store, source, &target, &cancellation);
+            tokio::pin!(preparing);
+            let mut byte = [0u8; 1];
+            let prepared = tokio::select! {
+                biased;
+                read = client.read(&mut byte) => {
+                    cancellation.cancel();
+                    // Await the same accepted work. An uncertain SQL unwind
+                    // retains its named image and existing source supervisor;
+                    // a native validation worker returns only after owned reap.
+                    let _settled = (&mut preparing).await;
+                    return Err(match read {
+                        Ok(0) | Err(_) => OutcomeClientLeft::Gone,
+                        Ok(_) => OutcomeClientLeft::ProtocolViolation,
+                    }.into());
+                }
+                prepared = &mut preparing => prepared?,
+            };
+            // Observe ready EOF once more at the publication boundary. No
+            // async step separates this observation from the absent move.
+            tokio::select! {
+                biased;
+                read = client.read(&mut byte) => {
+                    cancellation.cancel();
+                    return Err(match read {
+                        Ok(0) | Err(_) => OutcomeClientLeft::Gone,
+                        Ok(_) => OutcomeClientLeft::ProtocolViolation,
+                    }.into());
+                }
+                () = std::future::ready(()) => {}
+            }
+            Ok(ServiceValue::Backup(prepared.publish(&cancellation)?))
+        }
         ServiceCall::ReattachSessionDriver {
             original_id,
             original_generation,
@@ -2076,6 +2130,7 @@ fn receipt_progress_key(
 /// its attachment-local handle, or the main view.
 fn unit_receipt_view(call: &ServiceCall, state: &AttachmentState) -> Result<String> {
     Ok(match call {
+        ServiceCall::Backup { .. } => "main".to_owned(),
         ServiceCall::View {
             candidate: Some(handle),
             ..
@@ -2805,6 +2860,7 @@ async fn dispatch(
     };
     let unit_receipt = call.unit_receipt_bytes(&unit_receipt_view)?;
     let value = match call {
+        ServiceCall::Backup { .. } => unreachable!("backup observes peer EOF before dispatch"),
         ServiceCall::SelectSessionDriver { selection } => {
             ensure!(
                 !state.holds_handles() && state.dream_lease.is_none(),

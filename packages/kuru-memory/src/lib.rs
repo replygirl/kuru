@@ -1,4 +1,5 @@
 //! Private, versioned memory with an owned full-Dolt runtime.
+mod backup;
 mod catalog;
 mod engine;
 mod facade;
@@ -14,6 +15,8 @@ mod session_driver;
 #[cfg(test)]
 mod spawn_gate;
 mod store;
+
+pub use backup::{BackupCancellation, BackupResult, RestoreResult};
 
 pub use facade::{
     ActiveExportSnapshot, Candidate, CandidateReconciliation, CandidateReconciliationRecovery,

@@ -140,6 +140,9 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru memory forget ID --note SEQUENCE`                        | Remove one selected current note and retain prior revision history                                                          |
 | `kuru memory purge --yes`                                      | Remove one project's managed current memory and Dolt history after explicit confirmation                                    |
 | `kuru memory export`                                           | Export every application record from one committed active-memory snapshot                                                   |
+| `kuru memory backup PATH`                                      | Publish a new private native image, including retained history, refs, working sets and usage                                |
+| `kuru memory verify PATH`                                      | Independently restore and validate a selected immutable backup                                                              |
+| `kuru memory restore PATH [--remap-project]`                   | Restore into an absent memory target; explicitly select remapping for a different canonical project                         |
 | `kuru dream`                                                   | Run explicit consolidation                                                                                                  |
 | `kuru undo-dream`                                              | Restore the previous topology change                                                                                        |
 | `kuru tools`                                                   | Inspect filtered tools and disabled/live/stale/degraded MCP aliases                                                         |
@@ -300,3 +303,17 @@ unattributed legacy rows. It excludes previous revisions, candidate branches, un
 working rows, operations and schema tables. A supplied output path is published
 only as a new file after private staging; it never overwrites an existing path.
 It does not create memory or import legacy SQLite data for a fresh project.
+
+`kuru memory backup PATH` captures the complete native dataset through the
+existing memory owner while other sessions remain admitted. The destination must
+be absent. `kuru memory verify PATH` checks the image through an independent
+private native restore, including graph, refs and supported schemas. These
+provider-free commands print bounded completion metadata, not private records.
+
+`kuru --data-dir NEW_DIRECTORY memory restore PATH` requires an absent target.
+Use `--remap-project` when the current canonical workspace differs from the
+backup's source. The target receives fresh service credentials and claim
+authority, and retains its checked historical session and memory namespace.
+Dirty main and usage values are preserved through appended native snapshots
+before released migrations. The original image remains unchanged. See
+[restorable backups](../concepts/memory.md) for privacy and recovery limits.

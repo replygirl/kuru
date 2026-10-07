@@ -530,6 +530,9 @@ pub(super) fn service_call_samples() -> Result<Vec<ServiceCall>> {
             }))?),
         },
         ServiceCall::CloseStateReadCut { handle: HANDLE },
+        ServiceCall::Backup {
+            target: "private-backup".into(),
+        },
     ])
 }
 
@@ -613,6 +616,7 @@ const CLASSIFICATION: &[(&str, bool, Option<&str>)] = &[
     ("state_read_cut_get", false, None),
     ("state_read_cut_page", false, None),
     ("close_state_read_cut", false, None),
+    ("backup", true, None),
     ("view.append", true, Some("view.append")),
     ("view.append_message", true, Some("view.append_message")),
     (
@@ -697,6 +701,7 @@ const TYPED_PROOFS: &[(&str, Receipt)] = &[
     ("select_session_driver", Receipt::None),
     ("reattach_session_driver", Receipt::None),
     ("retire_if_idle", Receipt::None),
+    ("backup", Receipt::None),
     ("begin_candidate", Receipt::CandidateCreation),
     ("promote_candidate", Receipt::CandidateTransition),
     ("abandon_candidate", Receipt::CandidateTransition),
@@ -726,11 +731,16 @@ fn every_operation_contract_decides_receipt_and_reply_budget() -> Result<()> {
         assert_eq!(contract.receipt, expected, "{label} receipt class changed");
         assert_eq!(
             contract.reply,
-            ReplyBudget::Operation,
+            if label == "backup" {
+                ReplyBudget::Backup
+            } else {
+                ReplyBudget::Operation
+            },
             "{label} reply budget changed"
         );
     }
     assert_eq!(ReplyBudget::Operation.deadline(), OPERATION_TIMEOUT);
+    assert_eq!(ReplyBudget::Backup.deadline(), crate::backup::SQL_TIMEOUT);
     for (typed, _) in TYPED_PROOFS {
         ensure!(
             calls.iter().any(|(label, _)| label == typed),
@@ -741,14 +751,17 @@ fn every_operation_contract_decides_receipt_and_reply_budget() -> Result<()> {
 }
 
 #[test]
-fn only_connection_resources_mutate_without_a_durable_receipt() -> Result<()> {
+fn only_connection_resources_and_external_backup_mutate_without_a_durable_receipt() -> Result<()> {
     for (label, call) in labelled_calls()? {
         let contract = call.contract();
         match (contract.mutation, contract.receipt) {
             (Mutation::Write, Receipt::None) => assert!(
                 matches!(
                     label.as_str(),
-                    "retire_if_idle" | "select_session_driver" | "reattach_session_driver"
+                    "retire_if_idle"
+                        | "select_session_driver"
+                        | "reattach_session_driver"
+                        | "backup"
                 ),
                 "{label} changes persistent data without a durable receipt"
             ),
@@ -1360,6 +1373,7 @@ fn wire_surface() -> Result<String> {
         },
         project_path: vec![1, 2],
         project_scope: "project".into(),
+        history_scope: Some("project".into()),
         store_instance: "store".into(),
         service_generation: GENERATION.into(),
         connection_secret: "fixture-secret".into(),
@@ -1404,6 +1418,14 @@ fn wire_surface() -> Result<String> {
     lines.push(format!(
         "projection context_summary_confirmation {}",
         shape(&serde_json::to_value(confirmation)?)
+    ));
+    lines.push(format!(
+        "projection backup_result {}",
+        shape(&serde_json::to_value(crate::BackupResult {
+            dataset_root: "a".repeat(32),
+            schema_version: 10,
+            refs: 1,
+        })?)
     ));
     let rejected = ServiceResponse::Rejected(ServiceFault::StorageFailed);
     lines.push(format!(

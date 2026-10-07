@@ -801,6 +801,8 @@ pub async fn undo_dream(
     memory: &MemoryStore,
     resume: Option<&str>,
 ) -> Result<()> {
+    memory.ensure_project_scope(scope)?;
+    let scope = memory.history_scope(scope)?;
     let _dream_lease = memory.acquire_dream_lease().await?;
     let undo = prepare_undo_dream(config, scope, memory, resume, None).await?;
     memory
