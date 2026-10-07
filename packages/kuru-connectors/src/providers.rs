@@ -919,6 +919,9 @@ fn prepare_responses_request(
     let mut body = json!({"model":request.model,"instructions":request.instructions,"input":input,"store":false,"include":["reasoning.encrypted_content"],"tools":tools});
     if let Some(effort) = &request.effort {
         body["reasoning"] = json!({"effort":effort});
+        if effort != "none" {
+            body["reasoning"]["summary"] = json!("auto");
+        }
     }
     body["stream"] = json!(true);
     if subscription {
@@ -1588,6 +1591,82 @@ mod tests {
                     + native_structural_allowance(&body),
             "this opaque fixture should recover usable context over whole-body fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_reasoning_summary_opt_in_preserves_effort_and_default() {
+        let efforts = [Some("low"), Some("future-effort"), Some("none"), None];
+        let peer = HttpFixture::new(
+            efforts
+                .iter()
+                .map(|_| Reply::json(json!({"status":"completed","output":[{"type":"reasoning","id":"private-item","summary":[{"type":"summary_text","text":"provider summary"}]},{"type":"message","content":[{"type":"output_text","text":"public answer"}]}]})))
+                .collect(),
+        )
+        .await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        let mut measured = Vec::new();
+        for (index, effort) in efforts.iter().enumerate() {
+            let mut input = request();
+            input.actor = format!("isolated/part-{index}");
+            input.effort = effort.map(str::to_owned);
+            let estimate = provider.estimate_context(&input).await.unwrap();
+            let mut events = Events::default();
+            provider.stream(input, &mut events).await.unwrap();
+            assert!(events.0.iter().any(|event| matches!(
+                event,
+                ProviderEvent::SettledReasoningSummaries(summaries)
+                    if summaries.len() == 1 && summaries[0].text == "provider summary"
+            )));
+            let completed = events
+                .0
+                .iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Completed(completion) => Some(completion),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(completed.text_projection(), "public answer");
+            assert!(
+                !serde_json::to_string(completed)
+                    .unwrap()
+                    .contains("provider summary")
+            );
+            measured.push(estimate);
+        }
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), efforts.len());
+        for ((recorded, effort), estimate) in sent.iter().zip(efforts).zip(measured) {
+            let expected = match effort {
+                Some("none") => json!({"effort":"none"}),
+                Some(value) => json!({"effort":value,"summary":"auto"}),
+                None => Value::Null,
+            };
+            assert_eq!(recorded.body["reasoning"], expected);
+            assert_eq!(recorded.body.get("reasoning").is_some(), effort.is_some());
+            assert_eq!(
+                estimate.final_body_bytes,
+                serde_json::to_vec(&recorded.body).unwrap().len() as u64
+            );
+            assert_eq!(
+                recorded.body["include"],
+                json!(["reasoning.encrypted_content"])
+            );
+            assert_eq!(recorded.body["store"], false);
+
+            let mut native = request();
+            native.effort = effort.map(str::to_owned);
+            let prepared =
+                prepare_responses_request(ModelRoute::CodexSubscription, true, &native, None)
+                    .unwrap();
+            assert_eq!(prepared.body["reasoning"], expected);
+            assert_eq!(prepared.body.get("reasoning").is_some(), effort.is_some());
+            assert_eq!(prepared.body["tool_choice"], "auto");
+            assert_eq!(prepared.body["parallel_tool_calls"], true);
+            assert_eq!(
+                prepared.context.final_body_bytes,
+                prepared.payload.len() as u64
+            );
+        }
     }
 
     #[tokio::test]

@@ -177,6 +177,15 @@ provider; consult `kuru models` instead of relying on a hardcoded list.
 `model = "auto"` uses provider selection. Kuru preserves newly advertised effort
 strings. The API key itself never belongs in configuration.
 
+For Responses requests, an explicit effort other than `none` also requests
+provider-authored reasoning summaries with `summary = "auto"`. Automatic native
+model selection uses the advertised default effort when available. Explicit
+models without an effort keep the provider default without requesting summaries;
+`none` remains effort-only. Summaries are optional provider output, not raw
+reasoning or a guarantee from positive reasoning-token usage. Selected-facing
+summary previews clear at settlement; stored summaries remain producer-private
+and are excluded from public replay and new-session prompts.
+
 ## Context budget
 
 Kuru estimates each provider request after its native continuation and tool
