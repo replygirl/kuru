@@ -56,6 +56,59 @@ const fn default_hook_annotation_bytes() -> usize {
     256 * 1024
 }
 
+/// Presentation choices contain no terminal implementation or workspace authority.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UiThemeName {
+    #[default]
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    pub theme: UiThemeName,
+    /// Hexadecimal RGB values for named semantic presentation roles.
+    pub palette: BTreeMap<String, String>,
+}
+
+const UI_ROLES: [&str; 13] = [
+    "background",
+    "surface",
+    "raised",
+    "border",
+    "text",
+    "muted",
+    "accent",
+    "secondary",
+    "warning",
+    "info",
+    "error",
+    "scene_ghost",
+    "scene_trace",
+];
+
+impl UiConfig {
+    fn validate(&self) -> Result<()> {
+        for (role, value) in &self.palette {
+            ensure!(
+                UI_ROLES.contains(&role.as_str()),
+                "ui.palette has an unknown role"
+            );
+            ensure!(
+                value.len() == 7
+                    && value.starts_with('#')
+                    && value.as_bytes()[1..]
+                        .iter()
+                        .all(|byte| byte.is_ascii_hexdigit()),
+                "ui.palette.{role} must be a #RRGGBB colour"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct HookCommand {
@@ -713,6 +766,7 @@ pub struct Config {
     pub external_agents: BTreeMap<String, String>,
     pub memory: MemoryConfig,
     pub update: UpdateConfig,
+    pub ui: UiConfig,
 }
 
 impl Default for Config {
@@ -742,6 +796,7 @@ impl Default for Config {
             external_agents: BTreeMap::new(),
             memory: MemoryConfig::default(),
             update: UpdateConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -1853,6 +1908,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         self.memory.validate()?;
+        self.ui.validate()?;
         permissions::validate_rules(&self.permissions)?;
         self.hooks.validate()?;
         for rule in &self.permissions {

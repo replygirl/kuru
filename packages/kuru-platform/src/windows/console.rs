@@ -41,6 +41,23 @@ fn mode(handle: &OwnedHandle) -> io::Result<u32> {
     Ok(value)
 }
 
+/// A human CLI stream may emit ANSI only if that exact inherited console
+/// output stream already has VT processing enabled. This does not change modes.
+pub fn virtual_terminal_output_enabled(channel: StandardStream) -> bool {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    };
+    let channel = match channel {
+        StandardStream::Input => return false,
+        output => output,
+    };
+    let Ok(handle) = stream(channel) else {
+        return false;
+    };
+    let required = ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    mode(&handle).is_ok_and(|bits| bits & required == required)
+}
+
 fn set(handle: &OwnedHandle, value: u32) -> io::Result<()> {
     // SAFETY: retained console handle; the OS validates supported mode bits.
     if unsafe { SetConsoleMode(handle.as_raw_handle(), value) } == 0 {

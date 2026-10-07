@@ -43,6 +43,7 @@ pub(super) struct Signals {
     pub(super) titles: bool,
     pub(super) completion: bool,
     title: String,
+    pub(super) color_depth: super::theme::Depth,
 }
 
 impl Signals {
@@ -52,6 +53,11 @@ impl Signals {
             completion,
             ..Self::default()
         }
+    }
+
+    pub(super) fn with_color_depth(mut self, depth: super::theme::Depth) -> Self {
+        self.color_depth = depth;
+        self
     }
 
     pub(super) fn present(

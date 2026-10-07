@@ -8,7 +8,10 @@ fn main() {}
 async fn main() -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
     use kuru_platform::windows::{
-        console::{ConsoleModeGuard, configure_test_baseline, inject_focus},
+        console::{
+            ConsoleModeGuard, configure_test_baseline, inject_focus,
+            virtual_terminal_output_enabled,
+        },
         process::{NativeSpawnSpec, StandardStream, inherited_stdio},
     };
     use serde::Deserialize;
@@ -40,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
     );
     let plan: Plan = serde_json::from_slice(&std::fs::read(directory.join("plan.json"))?)?;
     let before = configure_test_baseline()?;
+    ensure!(
+        !virtual_terminal_output_enabled(StandardStream::Output),
+        "test baseline unexpectedly permits ANSI on stdout"
+    );
     let observer = ConsoleModeGuard::capture()?;
     publish(
         &directory.join("before.json"),
@@ -68,9 +75,18 @@ async fn main() -> anyhow::Result<()> {
         if plan.mode == "error-unwind" {
             let result = (|| -> anyhow::Result<()> {
                 let _session = kuru::ui::TerminalSession::enter(&mut std::io::stdout())?;
+                ensure!(
+                    virtual_terminal_output_enabled(StandardStream::Output),
+                    "owned TUI session did not enable the queried stdout VT mode"
+                );
                 anyhow::bail!("injected post-initialization terminal error")
             })();
-            ensure!(result.is_err(), "error fixture did not fail");
+            ensure!(
+                result.as_ref().is_err_and(|error| error
+                    .to_string()
+                    .contains("injected post-initialization terminal error")),
+                "error fixture failed before its intended post-initialization boundary: {result:?}"
+            );
             return Ok(1);
         }
         ensure!(plan.mode == "app", "unknown terminal fixture mode");

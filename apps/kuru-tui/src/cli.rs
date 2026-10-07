@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::ui::theme::{self, Role};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use kuru_connectors::permissions::{PermissionBinding, PermissionService};
@@ -14,6 +15,28 @@ use kuru_connectors::{
     CheckpointStore, McpAvailability, McpCatalogStore, McpCredentialStore, McpStatus, Provider,
     ToolHost, provider,
 };
+use kuru_core::UiConfig;
+
+fn human_stdout(ui: &UiConfig, role: Role, line: &str) {
+    let terminal = io::stdout().is_terminal();
+    #[cfg(windows)]
+    let terminal = terminal
+        && kuru_platform::windows::console::virtual_terminal_output_enabled(
+            kuru_platform::windows::process::StandardStream::Output,
+        );
+    println!("{}", theme::human_status(line, ui, role, terminal));
+}
+
+fn human_stderr(ui: &UiConfig, role: Role, line: &str) {
+    let terminal = io::stderr().is_terminal();
+    #[cfg(windows)]
+    let terminal = terminal
+        && kuru_platform::windows::console::virtual_terminal_output_enabled(
+            kuru_platform::windows::process::StandardStream::Error,
+        );
+    eprintln!("{}", theme::human_status(line, ui, role, terminal));
+}
+
 use kuru_core::{
     AuthorityClaimCategory, Config, ConfigDisplayBounds, ConfigSnapshot, InvocationOverrides, Mode,
     ModelInfo, ProjectPreferences, SafeManifest,
@@ -1177,7 +1200,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         let catalog = host.catalog().await;
         let cleanup = host.shutdown().await;
         let printed = catalog.and_then(|catalog| {
-            report_mcp_statuses(catalog.mcp());
+            report_mcp_statuses(catalog.mcp(), &config.ui);
             println!("{}", serde_json::to_string_pretty(&catalog)?);
             Ok(())
         });
@@ -1187,7 +1210,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
     if let Some(Command::Mcp { command }) = &cli.command {
         let config = snapshot.finalize(&ProjectPreferences::default())?;
         let host = permission_host(&data, root.clone(), &config, &snapshot, false)?;
-        let result = run_mcp_command(&host, command).await;
+        let result = run_mcp_command(&host, command, &config.ui).await;
         let cleanup = host.shutdown().await;
         return finish(result, cleanup, "tool host");
     }
@@ -1571,7 +1594,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                 let result = async {
                     let arguments = serde_json::from_str(args)?;
                     let catalog = host.catalog().await?;
-                    report_mcp_statuses(catalog.mcp());
+                    report_mcp_statuses(catalog.mcp(), &config.ui);
                     host.execute(name, arguments).await
                 }
                 .await;
@@ -1607,7 +1630,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                 notice.announce().await?;
             }
             kuru_runtime::undo_dream(&config, &scope, memory, cli.resume.as_deref()).await?;
-            println!("Previous membership restored.");
+            human_stdout(&config.ui, Role::Accent, "Previous membership restored.");
             return Ok(());
         }
         if matches!(cli.command, Some(Command::Models)) {
@@ -1675,6 +1698,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
             .with_instruction_gate(prompt_gate.clone())
             .with_skill_gate(prompt_gate, has_skills);
         let update_notice_enabled = config.update.notice;
+        let presentation_ui = config.ui.clone();
         let mut harness = Harness::with_admission_and_instructions(
             config,
             &cwd,
@@ -1790,7 +1814,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                 let actual = listener.local_addr()?;
                 let app =
                     kuru_runtime::server::router(harness.clone(), &format!("http://{actual}"), &token)?;
-                eprintln!("Kuru A2A listening on {actual}");
+                human_stderr(&presentation_ui, Role::Info, &format!("Kuru A2A listening on {actual}"));
                 kuru_runtime::server::serve(listener, app).await?;
                 harness.lock().await.shutdown(false).await?;
             }
@@ -1926,7 +1950,7 @@ pub(crate) fn finish<T>(primary: Result<T>, cleanup: Result<()>, what: &str) -> 
     }
 }
 
-async fn run_mcp_command(host: &ToolHost, command: &McpCommand) -> Result<()> {
+async fn run_mcp_command(host: &ToolHost, command: &McpCommand, ui: &UiConfig) -> Result<()> {
     match command {
         McpCommand::Status { alias } => {
             println!(
@@ -1951,7 +1975,7 @@ async fn run_mcp_command(host: &ToolHost, command: &McpCommand) -> Result<()> {
             login
                 .finish_with_cancellation(ctrl_c_cancellation())
                 .await?;
-            println!("Signed in to MCP {alias}.");
+            human_stdout(ui, Role::Accent, &format!("Signed in to MCP {alias}."));
         }
         McpCommand::Login {
             alias, no_browser, ..
@@ -1969,7 +1993,7 @@ async fn run_mcp_command(host: &ToolHost, command: &McpCommand) -> Result<()> {
             login
                 .finish_with_cancellation(ctrl_c_cancellation())
                 .await?;
-            println!("Signed in to MCP {alias}.");
+            human_stdout(ui, Role::Accent, &format!("Signed in to MCP {alias}."));
         }
     }
     Ok(())
@@ -1988,7 +2012,7 @@ pub fn headless_exit_code(error: &anyhow::Error) -> Option<i32> {
         .map(|exit| exit.0)
 }
 
-fn report_mcp_statuses(statuses: &[McpStatus]) {
+fn report_mcp_statuses(statuses: &[McpStatus], ui: &UiConfig) {
     for status in statuses {
         if status.available() && status.diagnostic().is_none() {
             continue;
@@ -1999,7 +2023,11 @@ fn report_mcp_statuses(statuses: &[McpStatus]) {
             McpAvailability::Stale => "stale cached metadata; server unavailable",
             McpAvailability::Degraded => "configured server unavailable",
         };
-        eprintln!("MCP {}: {state}", status.alias());
+        human_stderr(
+            ui,
+            Role::Warning,
+            &format!("MCP {}: {state}", status.alias()),
+        );
         if let Some(diagnostic) = status.diagnostic() {
             eprintln!("{diagnostic}");
         }
