@@ -701,6 +701,7 @@ cache. These optional settings control the extracted runtime:
 [memory]
 offline = false
 startup_timeout_secs = 30
+service_idle_timeout_secs = 30
 # cache_dir = "/absolute/path/to/dolt-cache"
 # dolt_binary = "/absolute/path/to/dolt"
 ```
@@ -718,6 +719,15 @@ directories that share a `cache_dir` share it. With `dolt_binary` set, new
 projects are built without the template. Corrupt existing caches fail without
 automatic repair. If activating a verified engine fails, the error reports the retained private
 staging directory for inspection; Kuru does not automatically retry that move.
+The idle timeout is 0–300 seconds (default 30). After the last checked attachment
+has closed and all its operations have settled, the project memory service keeps
+its engine available for that interval. Successive standalone `kuru run` calls
+can reuse it without restarting Dolt. An active attachment prevents idle
+retirement; its final detach starts a fresh interval. Zero selects immediate
+retirement. Explicit maintenance can retire an unused service immediately,
+without waiting for the interval. Retention owns memory only, not a provider or
+conversation driver.
+
 The startup timeout is 1–300 seconds (default 30). When a command starts its
 project's memory service, the timeout means "no progress for this long", not a
 limit on the whole start: the command keeps waiting while the service it started

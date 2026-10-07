@@ -269,6 +269,9 @@ fn schema_and_parser_reject_unknown_keys_and_shared_bounds() {
         "context_compaction_output_reserve_tokens=0",
         "context_compaction_output_reserve_tokens=2000001",
         "[memory]\nstartup_timeout_secs=0",
+        "[memory]\nservice_idle_timeout_secs=301",
+        "[memory]\nservice_idle_timeout_secs=-1",
+        "[memory]\nservice_idle_timeout_secs=1.5",
     ] {
         assert!(!validator.is_valid(&json_from_toml(text)), "schema: {text}");
         assert!(parse_config(text).is_err(), "parser: {text}");
@@ -291,6 +294,23 @@ fn schema_and_parser_reject_unknown_keys_and_shared_bounds() {
             "schema: {text}"
         );
         assert!(parse_config(&text).is_err(), "parser: {text}");
+    }
+}
+
+#[test]
+fn memory_service_idle_retention_has_schema_parser_parity() {
+    let validator = schema();
+    assert_eq!(Config::default().memory.service_idle_timeout_secs, 30);
+    for seconds in [0, 30, 300] {
+        let text = format!("[memory]\nservice_idle_timeout_secs={seconds}");
+        assert!(validator.is_valid(&json_from_toml(&text)), "schema: {text}");
+        assert_eq!(
+            parse_config(&text)
+                .unwrap()
+                .memory
+                .service_idle_timeout_secs,
+            seconds
+        );
     }
 }
 

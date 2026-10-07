@@ -218,6 +218,9 @@ fn parse_service_arguments(
     let expected_instance = arguments
         .next()
         .map(|instance| {
+            if instance == "-" {
+                return Ok(None);
+            }
             let instance = instance
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("expected memory instance is not UTF-8"))?;
@@ -225,9 +228,20 @@ fn parse_service_arguments(
                 uuid::Uuid::parse_str(&instance)?.to_string() == instance,
                 "invalid expected memory instance"
             );
-            Ok::<_, anyhow::Error>(instance)
+            Ok::<_, anyhow::Error>(Some(instance))
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
+    let service_idle_timeout_secs = arguments
+        .next()
+        .map(|idle| {
+            idle.to_str()
+                .context("service idle timeout is not UTF-8")?
+                .parse::<u64>()
+                .context("invalid service idle timeout")
+        })
+        .transpose()?
+        .unwrap_or_else(|| kuru_core::MemoryConfig::default().service_idle_timeout_secs);
     ensure!(arguments.next().is_none(), "unexpected service argument");
     if let Some(path) = &supervisor {
         ensure!(
@@ -240,6 +254,8 @@ fn parse_service_arguments(
     options.config.cache_dir = cache_dir;
     options.config.offline = offline;
     options.config.startup_timeout_secs = startup_timeout_secs;
+    options.config.service_idle_timeout_secs = service_idle_timeout_secs;
+    options.config.validate()?;
     options.supervisor = supervisor;
     options.starter_token = starter_token;
     options.expected_instance = expected_instance;
@@ -1483,7 +1499,8 @@ pub(crate) async fn attach_existing(
 
 /// The owner's arguments. A starter token, when given, is the optional
 /// tenth argument; the owner then retires on its own only after an
-/// attachment presents it.
+/// attachment presents it. Absent expected-instance and starter values use
+/// explicit dashes so the final optional idle interval is unambiguous.
 fn service_arguments(
     options: &crate::store::OpenOptions,
     project: &Path,
@@ -1503,14 +1520,14 @@ fn service_arguments(
         if options.config.offline { "1" } else { "0" }.into(),
         options.config.startup_timeout_secs.to_string().into(),
     ];
-    if let Some(token) = starter_token {
-        arguments.push(token.to_string().into());
-    } else if options.expected_instance.is_some() {
-        arguments.push("-".into());
-    }
-    if let Some(instance) = &options.expected_instance {
-        arguments.push(instance.into());
-    }
+    arguments.push(starter_token.map_or_else(|| "-".into(), |token| token.to_string().into()));
+    arguments.push(
+        options
+            .expected_instance
+            .as_ref()
+            .map_or_else(|| "-".into(), Into::into),
+    );
+    arguments.push(options.config.service_idle_timeout_secs.to_string().into());
     arguments
 }
 
@@ -1853,6 +1870,8 @@ pub(crate) struct ServeKnobs {
     pub(crate) first_attachment: Option<Duration>,
     /// Longest single accept wait before the owner lock is re-verified.
     pub(crate) recheck: Duration,
+    /// Retention after the last attachment task joins; zero retires immediately.
+    pub(crate) idle: Duration,
     #[cfg(test)]
     pub(crate) observer: Option<tokio::sync::mpsc::UnboundedSender<ServeEvent>>,
     #[cfg(test)]
@@ -1878,6 +1897,7 @@ impl ServeKnobs {
             admission: Admission::Never,
             first_attachment: None,
             recheck: OWNER_LOCK_RECHECK_INTERVAL,
+            idle: Duration::ZERO,
             observer: None,
             close_pause: None,
             dispatch_pause: None,
@@ -1969,6 +1989,7 @@ pub struct ServiceOwner {
     /// inside `close` while owner authority is still held.
     activity: Option<activity::Publisher>,
     startup_timeout: Duration,
+    idle_timeout: Duration,
     /// Taken after the endpoint record was published.
     published: tokio::time::Instant,
 }
@@ -2095,6 +2116,7 @@ impl ServiceOwner {
             starter_token: options.starter_token,
             activity,
             startup_timeout: Duration::from_secs(options.config.startup_timeout_secs),
+            idle_timeout: Duration::from_secs(options.config.service_idle_timeout_secs),
             published: tokio::time::Instant::now(),
         })
     }
@@ -2122,6 +2144,7 @@ impl ServiceOwner {
                 .map_or(Admission::AnyAttachment, Admission::Starter),
             first_attachment: Some(self.startup_timeout),
             recheck: OWNER_LOCK_RECHECK_INTERVAL,
+            idle: self.idle_timeout,
             #[cfg(test)]
             observer: None,
             #[cfg(test)]
@@ -2135,8 +2158,8 @@ impl ServiceOwner {
         }
     }
 
-    /// Run until the last attachment is released after the starter has
-    /// attached. Each connection has one generation-bound attachment; the
+    /// Run until the bounded idle interval after the last attachment settles.
+    /// Each connection has one generation-bound attachment; the
     /// store itself keeps reads concurrent and serializes short writes.
     pub async fn serve(self) -> Result<()> {
         let knobs = self.knobs();
@@ -2189,6 +2212,7 @@ impl ServiceOwner {
         }
         // Absolute, so rejected or non-starter connections never restart it.
         let starter_deadline = knobs.first_attachment.map(|within| self.published + within);
+        let mut idle_deadline = None;
         #[cfg(test)]
         let mut was_empty = false;
         loop {
@@ -2214,19 +2238,26 @@ impl ServiceOwner {
                 if !std::mem::replace(&mut was_empty, true) {
                     knobs.emit(ServeEvent::EnteredEmpty { reached });
                 }
-                if reached {
-                    break;
-                }
-                // Not reached yet: keep serving other clients while the
-                // starter may still attach, within its startup budget.
-                let accept_within = match starter_deadline {
+                // Start only after every handler joins. Rechecks do not extend
+                // the interval; an attachment begins a fresh busy period.
+                let deadline = if reached {
+                    Some(
+                        *idle_deadline
+                            .get_or_insert_with(|| tokio::time::Instant::now() + knobs.idle),
+                    )
+                } else {
+                    starter_deadline
+                };
+                let accept_within = match deadline {
                     Some(deadline) => {
                         let remaining =
                             deadline.saturating_duration_since(tokio::time::Instant::now());
                         if remaining.is_zero() {
-                            tracing::warn!(
-                                "memory service retiring: no starter attached within the startup timeout"
-                            );
+                            if !reached {
+                                tracing::warn!(
+                                    "memory service retiring: no starter attached within the startup timeout"
+                                );
+                            }
                             break;
                         }
                         remaining.min(knobs.recheck)
@@ -2253,6 +2284,7 @@ impl ServiceOwner {
                     () = retirement.notified() => continue,
                 }
             } else {
+                idle_deadline = None;
                 tokio::select! {
                     accepted = self.accept_once(knobs, knobs.recheck) => {
                         match accepted {
@@ -5737,7 +5769,10 @@ mod tests {
                 async |served| {
                     let _gate = crate::spawn_gate::spawning().await;
                     let owner = ServiceOwner::open(options.clone(), &project).await?;
-                    served.serve(owner)?;
+                    // Exercise immediate maintenance against the product's
+                    // thirty-second retention, not the never-reached fixture policy.
+                    let knobs = owner.knobs();
+                    served.serve_with(owner, knobs)?;
                     async {
                         let mut client = try_attach(&data, &scope, &project)
                             .await?
@@ -9221,6 +9256,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_retention_reuses_owner_resets_after_detach_and_preserves_active_client()
+    -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        let deadline = crate::test_support::FixtureDeadline::start(
+            crate::test_support::fixture_deadline(1, 0),
+            "retained owner interval fixture",
+        );
+        let root = crate::test_support::tempdir()?;
+        let (project, scope, data, options) = owner_fixture(root.path())?;
+        let idle = Duration::from_millis(400);
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = ServiceOwner::open(options.clone(), &project).await?;
+                    let authority = owner.authority().clone();
+                    let (mut knobs, mut events) = observed(Admission::AnyAttachment, None);
+                    knobs.idle = idle;
+                    knobs.recheck = Duration::from_millis(100);
+                    served.serve_with(owner, knobs)?;
+                    let mut client = attach_raw(&data, &scope, None).await?;
+                    expect_events(
+                        &mut events,
+                        &[
+                            ServeEvent::EnteredEmpty { reached: false },
+                            ServeEvent::AttachmentAccepted { active: 1 },
+                        ],
+                    )
+                    .await?;
+                    let active_since = tokio::time::Instant::now();
+                    // Existing owner events, rather than a fixture sleep, prove
+                    // actual service availability across its empty-interval bound.
+                    while active_since.elapsed() < idle {
+                        ensure!(
+                            events.recv().await == Some(ServeEvent::LockRechecked),
+                            "active owner ended during its retention interval"
+                        );
+                    }
+                    ensure!(
+                        matches!(
+                            rpc::request_attached(&mut client, &authority, ServiceCall::Revision)
+                                .await?,
+                            ServiceValue::Revision(_)
+                        ),
+                        "active retained owner could not answer"
+                    );
+                    drop(client);
+                    expect_events(
+                        &mut events,
+                        &[
+                            ServeEvent::AttachmentJoined { remaining: 0 },
+                            ServeEvent::EnteredEmpty { reached: true },
+                        ],
+                    )
+                    .await?;
+                    // Reattach during the empty interval. A stale deadline must
+                    // not retire this live attachment or its later empty period.
+                    ensure!(
+                        events.recv().await == Some(ServeEvent::LockRechecked),
+                        "empty retained owner stopped accepting"
+                    );
+                    let first_empty = tokio::time::Instant::now();
+                    let mut next = attach_raw(&data, &scope, None).await?;
+                    expect_events(&mut events, &[ServeEvent::AttachmentAccepted { active: 1 }])
+                        .await?;
+                    while first_empty.elapsed() < idle {
+                        ensure!(
+                            events.recv().await == Some(ServeEvent::LockRechecked),
+                            "reattached owner expired at its earlier deadline"
+                        );
+                    }
+                    ensure!(
+                        matches!(
+                            rpc::request_attached(&mut next, &authority, ServiceCall::Revision)
+                                .await?,
+                            ServiceValue::Revision(_)
+                        ),
+                        "reattachment did not reuse the checked owner"
+                    );
+                    let final_empty = tokio::time::Instant::now();
+                    drop(next);
+                    expect_events(
+                        &mut events,
+                        &[
+                            ServeEvent::AttachmentJoined { remaining: 0 },
+                            ServeEvent::EnteredEmpty { reached: true },
+                        ],
+                    )
+                    .await?;
+                    served
+                        .reap(
+                            crate::server::close_budget() + idle,
+                            "retained owner did not reap after its final interval",
+                        )
+                        .await?;
+                    ensure!(
+                        final_empty.elapsed() >= idle,
+                        "idle deadline was not reset after reattachment"
+                    );
+                    ensure!(
+                        EndpointRecord::read(&data, &scope)?.is_none(),
+                        "retired owner retained discovery"
+                    );
+                    ensure!(
+                        ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+                            .map(ServiceLock::release)
+                            .transpose()?
+                            .is_some(),
+                        "reaped owner retained authority"
+                    );
+                    Ok(())
+                },
+                async |served| {
+                    served
+                        .retire(
+                            &options,
+                            Some(maintenance_deadline(&options)),
+                            crate::server::close_budget(),
+                            "retention fixture cleanup",
+                        )
+                        .await
+                },
+            )
+            .await;
+        root.release(outcome)
+    }
+
+    #[tokio::test]
     async fn idle_accept_deadlines_do_not_close_live_attachment() -> Result<()> {
         crate::test_support::warm_runtime_cache().await?;
         // Real lifecycles: one fresh service owner with a short lock recheck interval.
@@ -9358,6 +9521,7 @@ mod tests {
             options.config.cache_dir = Some(crate::store::test_cache());
             options.config.offline = true;
             let executable = crate::store::test_supervisor()?;
+            options.config.service_idle_timeout_secs = 0;
             options.supervisor = Some(executable.clone());
             let barrier = root.path().join("go");
             let ready_one = root.path().join("ready-one");
@@ -9498,6 +9662,7 @@ mod tests {
         options.config.cache_dir = Some(crate::store::test_cache());
         options.config.offline = true;
         options.supervisor = Some(crate::store::test_supervisor()?);
+        options.config.service_idle_timeout_secs = 0;
         Ok((project, scope, data, options))
     }
 
@@ -10848,7 +11013,7 @@ mod tests {
         let token = uuid::Uuid::new_v4();
         let with = service_arguments(&options, &project, Some(token));
         let without = service_arguments(&options, &project, None);
-        ensure!(with.len() == without.len() + 1);
+        ensure!(with.len() == without.len());
         ensure!(parse_service_arguments(with[1..].to_vec())?.1.starter_token == Some(token));
         ensure!(
             parse_service_arguments(without[1..].to_vec())?
@@ -10860,8 +11025,30 @@ mod tests {
         extra.push("x".into());
         ensure!(parse_service_arguments(extra).is_err());
         let mut invalid = without[1..].to_vec();
-        invalid.push("not-a-token".into());
+        invalid[8] = "not-a-token".into();
         ensure!(parse_service_arguments(invalid).is_err());
+        // Legacy forms without idle or expected-instance arguments remain
+        // accepted; only absent values gain the documented default.
+        for length in [8, 9, 10] {
+            let parsed = parse_service_arguments(without[1..1 + length].to_vec())?.1;
+            ensure!(parsed.config.service_idle_timeout_secs == 30);
+        }
+        for seconds in [0, 30, 300] {
+            let mut idle = without[1..].to_vec();
+            idle[10] = seconds.to_string().into();
+            ensure!(
+                parse_service_arguments(idle)?
+                    .1
+                    .config
+                    .service_idle_timeout_secs
+                    == seconds
+            );
+        }
+        for value in ["301", "-1", "1.5", "bad"] {
+            let mut idle = without[1..].to_vec();
+            idle[10] = value.into();
+            ensure!(parse_service_arguments(idle).is_err());
+        }
 
         let hello = authority().hello();
         let expected = format!(

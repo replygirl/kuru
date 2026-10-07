@@ -237,15 +237,17 @@ will try again on a later start." when the stage is receipted, otherwise the
 not-retried notice quoted below. A service started on behalf of a command has no
 terminal and reports none.
 
-Writable runtime commands attach to the private project memory service while
-retaining the existing one-conversation driver lease. This phase does not admit
-simultaneous conversations. Attachments do not own the service process and an
-inspection handle cannot stop it. When the last attachment closes and accepted
-work has drained, the service stops accepting, retires its endpoint, reaps its
-exact Dolt child and only then releases lifecycle authority. There is no idle
-interval: a later command starts a new service after that shutdown completes, so
-each command that follows another opens the existing project again instead of
-attaching to a running service.
+Writable runtime commands attach to the private project memory service with
+independent session driver claims. Attachments do not own the service process
+and an inspection handle cannot stop it. When the last attachment closes and
+accepted work has drained, the service remains available for
+`memory.service_idle_timeout_secs` (default 30, range 0–300). Successive standalone
+commands within that interval reuse the checked service and its Dolt engine.
+Each new attachment prevents idle retirement; final detach begins a fresh
+interval. Zero selects immediate retirement. Explicit maintenance retires an
+unused owner without waiting for that interval. At retirement the service stops
+accepting, retires its endpoint, reaps its exact Dolt child and only then releases
+lifecycle authority. A later command starts a successor after shutdown completes.
 
 A service that a command started waits for that command to attach before it may
 retire, so another client that attaches and detaches first does not end it. If
@@ -736,7 +738,8 @@ inspection that meets a service that is still shutting down waits, within
 released its owner lock, then opens locally; it does not read through the
 retiring service's engine. Normal
 runtime command exit awaits attachment cleanup, including when the command
-reports an error; its service retires once its last attachment closes.
+reports an error; its service starts its idle interval once its last attachment
+closes, and explicit maintenance can retire it without waiting for that interval.
 Migration, recovery, purge, and other maintenance use explicit quiescence gates
 and hold the lifecycle lock through directory activation, so an active database
 cannot be moved underneath another process. Maintenance that meets a service

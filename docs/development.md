@@ -764,17 +764,17 @@ holds both locks and releases the owner lock before the start lock, the reverse
 of their acquisition, so a starter that wins the start lock does not meet a
 departing permit's owner lock.
 
-An owner ends itself when its last attachment releases, so a fixture that
-needs a running owner chooses its lifetime policy. `ServeKnobs`
+An owner ends itself after its final attachment joins and its configured idle
+interval expires, so a fixture chooses its lifetime policy deliberately. `ServeKnobs`
 (`service.rs`) carries the admission rule, the first-attachment deadline, the
-lock recheck interval and the test hooks. `Admission` is `Starter(token)`
+lock recheck interval, idle interval and the test hooks. `Admission` is `Starter(token)`
 (retire only after the attachment presenting that token has attached),
 `AnyAttachment` (the mixed-version fallback for an owner started without a
 token) or `Never`. `ServedOwner::serve` uses `Never` with no deadline, so an
 in-process fixture owner ends only by maintenance retirement, `restart` or lock
 loss; `ServedOwner::serve_with(owner, knobs)` and `ServiceOwner::serve_with`
-choose another policy, and the retire-on-last-detach path is covered by
-tests with a really spawned owner and by the command-line tests. Tests never
+choose another policy, and the explicit zero-interval last-detach path is covered
+by tests with a really spawned owner and by isolated command-line tests. Tests never
 sleep for an owner's lifetime; they follow events:
 
 - The serve-loop observer (`ServeKnobs::observer`, an ordered unbounded channel
@@ -952,10 +952,11 @@ terminal, its line is erased before a marker is written and drawn again below
 it, so a marker never shares a row with a sentence. A marker that cannot be
 written is dropped without affecting the open or the sentences. The first
 standard-error line of any kind is `open-start` with markers on, and the
-opening sentence without them. Each command's owner retires as soon as it is
-unused, so a measurement that repeats commands must await the previous owner's
-exit (as `await_owner_exit` does in the command-line tests); otherwise the next
-open waits for it and shows the waiting sentence.
+opening sentence without them. Ordinary commands retain an unused owner for the
+configured idle interval. Deliberately cold fixtures select
+`memory.service_idle_timeout_secs=0` and await the previous owner's exit (as
+`await_owner_exit` does in the command-line tests); a command meeting an owner
+already closing waits for it and shows the waiting sentence.
 
 With `KURU_OPEN_TIMELINE=1` (exactly `1`; unset or any other value changes
 nothing) the project memory service owner records where its own open spends
@@ -1471,7 +1472,9 @@ The harness drives the binary from outside. Each iteration uses a fresh private
 scratch root with its own HOME, configuration, data directory, engine cache,
 two project directories and copy of the executable, and runs four cases of
 `kuru --provider demo --no-dream run measure --json` with offline memory (no
-network, login or credential store), in this order:
+network, login or credential store), in this order. It explicitly selects
+`service_idle_timeout_secs=0` so these cold-start measurements remain independent
+of the product's default thirty-second retention:
 
 1. `first-launch`: empty engine cache and data directory: engine extraction and
    a new project's staged creation. The harness then waits for the memory owner
@@ -1493,7 +1496,7 @@ Since the per-machine store template (`d717b4fd`), a release build shows 3 for
 `first-launch` (it builds the template once), 2 for `new-project` (a template
 copy: one staging engine, then the active one), 1 for `cold-existing`, and for
 `warm-reopen` 0 when it attaches to the live owner and 1 when it spawns a new
-owner. Owner retirement is immediate, so the warm reopen usually spawns: every
+owner. Under this explicit cold fixture policy retirement is immediate, so the warm reopen usually spawns: every
 one of the 20 warm reopens in the two derivation runs did. Before the template
 a release build showed 4 for both `first-launch` and `new-project`.
 
@@ -2338,8 +2341,8 @@ history, journal and compaction checkpoints. Own catalog updates do not invalida
 that retained claim, but later selection still checks a newly captured full
 catalog. Other clients cannot mutate a driven session's lifecycle. Live inventory
 exposes safe session/generation metadata; standalone inspection reports unknown
-presence. Dedicated presence EOF releases its exact claim, and last-client
-retirement remains immediate.
+presence. Dedicated presence EOF releases its exact claim. Last-client retirement
+follows the configured bounded idle interval; maintenance remains immediate.
 
 Native session leases retain shared maintenance exclusion and an exclusive
 session barrier through locally owned cleanup. They prevent a surviving old
@@ -2610,8 +2613,23 @@ zero-client retirement behavior is covered independently by
 `two_fresh_terminals_share_owner_and_keep_private_sessions_through_eof` and
 `independent_clients_elect_one_real_process_and_retire_after_both_detach`.
 Ordinary drivers attach to the same checked per-project service while clients
-overlap, and the owner retires after its last driver detaches rather than
-remaining resident on an arbitrary warm-idle timer.
+overlap. Successive standalone commands also reuse its owned engine while the
+bounded idle interval remains open. The dedicated
+`service_retention::completed_standalone_calls_reuse_service_and_engine_then_retire_and_restart`
+fixture runs three completed standalone conversations with the real default30
+policy, authenticates the same service generation and checks the unchanged native
+engine instance/port, then awaits owner release and verifies a new generation.
+It keeps no attachment alive between commands. In-process owner event tests cover
+active attachments, deadline reset and final retirement. Existing isolated CLI
+and memory lifecycle fixtures explicitly select zero; explicit maintenance still
+retires a retained idle owner promptly. Retention owns no inference transport or
+conversation driver.
+
+The idle interval begins only when the retained transport tasks have all joined.
+An accepted private transport prevents retirement through its existing bounded
+hello handshake, even when that hello is ultimately rejected; that task's end
+starts a fresh empty interval. Only an authenticated admitted attachment marks
+the starter reached. Connection limits and frame deadlines are unchanged.
 
 Windows runtime activation retries access denied only after checked observations
 prove that the verified source directory has not moved and the destination is
