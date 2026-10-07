@@ -29,7 +29,7 @@ pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, Servic
 pub const PROTOCOL_MAJOR: u16 = 1;
 // Exact-ref recovery and session-provenance calls require this owner version.
 // Older owners reject the new client before a mutating frame.
-pub const PROTOCOL_MINOR: u16 = 12;
+pub const PROTOCOL_MINOR: u16 = 13;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest single accept wait before the serve loop re-verifies its owner
@@ -452,6 +452,7 @@ impl AttachmentFactory {
         ensure!(
             self.authority.project_path == previous.authority.project_path
                 && self.authority.project_scope == previous.authority.project_scope
+                && self.authority.history_scope == previous.authority.history_scope
                 && self.authority.store_instance == previous.authority.store_instance,
             "memory identity changed before logical client reattachment"
         );
@@ -480,6 +481,10 @@ impl AttachmentFactory {
             .map_err(|_| anyhow::anyhow!("driver proof state is unavailable"))? = proof;
         Ok(())
     }
+    pub(crate) fn restored_history_scope(&self) -> Option<&str> {
+        self.authority.history_scope.as_deref()
+    }
+
     pub(crate) fn store_instance(&self) -> &str {
         &self.authority.store_instance
     }
@@ -3144,6 +3149,7 @@ impl EndpointRecord {
                 version: ProtocolVersion::CURRENT,
                 project_path: project_path_bytes(project_path),
                 project_scope: scope.to_owned(),
+                history_scope: store.restored_history_scope().map(str::to_owned),
                 store_instance: store.service_instance().to_owned(),
                 service_generation: generation,
                 connection_secret: secret,
@@ -3334,6 +3340,8 @@ pub struct ClientHello {
     /// Exact bytes of the already-canonical project path on this OS.
     pub project_path: Vec<u8>,
     pub project_scope: String,
+    /// Checked persisted namespace; never attachment or driver authority.
+    pub history_scope: Option<String>,
     pub store_instance: String,
     pub service_generation: String,
     pub connection_secret: String,
@@ -3368,6 +3376,8 @@ pub struct EndpointAuthority {
     pub version: ProtocolVersion,
     pub project_path: Vec<u8>,
     pub project_scope: String,
+    /// Checked persisted namespace; never attachment or driver authority.
+    pub history_scope: Option<String>,
     pub store_instance: String,
     pub service_generation: String,
     pub connection_secret: String,
@@ -3380,6 +3390,7 @@ impl EndpointAuthority {
             version: self.version,
             project_path: self.project_path.clone(),
             project_scope: self.project_scope.clone(),
+            history_scope: self.history_scope.clone(),
             store_instance: self.store_instance.clone(),
             service_generation: self.service_generation.clone(),
             connection_secret: self.connection_secret.clone(),
@@ -3396,7 +3407,10 @@ impl EndpointAuthority {
         {
             return Err(HandshakeRejection::Protocol);
         }
-        if hello.project_path != self.project_path || hello.project_scope != self.project_scope {
+        if hello.project_path != self.project_path
+            || hello.project_scope != self.project_scope
+            || hello.history_scope != self.history_scope
+        {
             return Err(HandshakeRejection::Project);
         }
         if hello.store_instance != self.store_instance {
@@ -6185,6 +6199,7 @@ mod tests {
             version: ProtocolVersion::CURRENT,
             project_path: b"/private/project".to_vec(),
             project_scope: "scope".into(),
+            history_scope: None,
             store_instance: "store".into(),
             service_generation: "generation".into(),
             connection_secret: "test-secret".into(),
@@ -10850,7 +10865,7 @@ mod tests {
 
         let hello = authority().hello();
         let expected = format!(
-            r#"{{"version":{{"major":{},"minor":{}}},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}}"#,
+            r#"{{"version":{{"major":{},"minor":{}}},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","history_scope":null,"store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}}"#,
             PROTOCOL_MAJOR, PROTOCOL_MINOR
         );
         ensure!(

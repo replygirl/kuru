@@ -13,6 +13,7 @@ fn identity(template: Option<&str>) -> Identity {
         reader_password: "b".repeat(64),
         initialized: false,
         template: template.map(str::to_owned),
+        source: None,
     }
 }
 
@@ -57,6 +58,39 @@ fn cold_identity_record_bytes_are_unchanged() -> Result<()> {
         "a binary without the field must refuse a template-born identity"
     );
     assert!(serde_json::from_slice::<OlderIdentity>(&bytes).is_ok());
+    Ok(())
+}
+
+#[test]
+fn restored_identity_keeps_origin_separate_from_live_authority() -> Result<()> {
+    let mut restored = identity(None);
+    let origin_instance = Uuid::new_v4().to_string();
+    let origin_scope = format!("project/{}", "d".repeat(64));
+    restored.version = 2;
+    restored.source = Some(SourceIdentity {
+        instance: origin_instance.clone(),
+        project_scope: origin_scope.clone(),
+    });
+    validate_identity(&restored)?;
+    assert_eq!(
+        restored.sql_identity(),
+        (origin_instance.as_str(), origin_scope.as_str())
+    );
+    assert_ne!(restored.sql_identity().0, restored.instance);
+    let bytes = serde_json::to_vec(&restored)?;
+    assert!(serde_json::from_slice::<OlderIdentity>(&bytes).is_err());
+    let roundtrip: Identity = serde_json::from_slice(&bytes)?;
+    assert_eq!(roundtrip.sql_identity(), restored.sql_identity());
+
+    let mut inconsistent = restored.clone();
+    inconsistent.version = 1;
+    assert!(validate_identity(&inconsistent).is_err());
+    let mut reused = restored.clone();
+    reused.instance = origin_instance;
+    assert!(validate_identity(&reused).is_err());
+    let mut template = restored;
+    template.template = Some("key".into());
+    assert!(validate_identity(&template).is_err());
     Ok(())
 }
 

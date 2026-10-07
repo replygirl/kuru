@@ -291,6 +291,20 @@ publishing a partial result. Legacy project-wide focus is left unassigned.
 Complete topology reads use a single committed revision, with bounded pages for
 larger inventories, so updates during inspection cannot mix old and new records.
 
-Revision history shares the database's disk. For a backup, close all Kuru processes using the data directory, let their database processes finish, then copy the entire data directory. Restore the copy into a separate location and open it with `--data-dir`. Keep the same canonical workspace path to retain the project identity. Do not copy a live `.dolt` directory or remove a held lockfile.
+Use `kuru memory backup PATH` to capture a restorable native image while other
+sessions continue writing, and `kuru memory verify PATH` to check it through an
+independent native restore. Images retain revision history, candidates, sessions,
+private memory and usage, so keep them private. They exclude credentials, trust
+grants, live claims, service endpoints and runtime caches.
+
+`kuru --data-dir NEW_DIRECTORY memory restore PATH` requires an absent target.
+Restoring from another canonical workspace also requires `--remap-project`.
+The target receives fresh ownership while retaining its checked history namespace.
+Supported historical schemas migrate in a private stage. Dirty main and usage
+roots are preserved through appended staged and working snapshots before writable
+activation; other refs and the original image remain unchanged. Keep the image
+until you have checked restored sessions. Do not copy a live `.dolt` directory or
+remove a held lockfile. See the contributor [backup and recovery guide](https://github.com/replygirl/kuru/blob/main/docs/memory.md#backup-and-recovery)
+for publication, cancellation and retained-stage behavior.
 
 See [sessions and dreaming](./sessions) for resuming a transcript and changing the pool's membership.

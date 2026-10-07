@@ -19,6 +19,9 @@ kuru memory notes ID --limit 100
 kuru memory forget ID --note SEQUENCE
 kuru memory purge --yes
 kuru memory export --format json --output committed-memory.json
+kuru memory backup /private/backups/project
+kuru memory verify /private/backups/project
+kuru --data-dir /private/restored-state memory restore /private/backups/project
 ```
 
 `kuru memory inventory` reads one bounded, read-only SQLite/WAL snapshot from
@@ -677,16 +680,47 @@ hand.
 
 ## Backup and recovery
 
-Revision history is stored on the same disk as the database. To make a local
-backup, close all Kuru processes using the data directory, allow their supervised
-Dolt processes to finish, and copy the complete data directory to your backup
-location. Include `memory/`, its project metadata and any preserved legacy files.
-Do not copy or replace a live `.dolt` directory.
+Revision history shares the database's disk. Create a restorable native image
+at an absent destination outside the source store:
 
-Restore into a separate data directory and open it with `--data-dir`. Keep the
-original backup until you have checked session history and memory status. Project
-identity depends on the canonical workspace path; restoring the data directory
-does not remap a project to a different path.
+```sh
+kuru memory backup /private/backups/project
+kuru memory verify /private/backups/project
+```
+
+Backup captures one native dataset root while other sessions may continue
+writing. It retains reachable history, native refs and candidates, branch staged
+and working values, sessions, journals, private summaries and the usage ledger.
+The image contains private memory; protect it as carefully as the live store.
+Credentials, workspace-trust grants, live driver claims, service endpoints and
+runtime caches are excluded. Verification restores a separate private image and
+checks its native graph, refs, supported schemas and stored values. Inventory and
+hash checks alone are insufficient.
+
+Restore into an absent memory target. For the same canonical workspace, select a
+separate data directory; for another workspace, explicitly select remapping:
+
+```sh
+kuru --data-dir /private/restored-state memory restore /private/backups/project
+kuru --data-dir /private/remapped-state memory restore /private/backups/project --remap-project
+```
+
+Restore takes exclusive maintenance ownership and refuses a target that already
+exists or remains in use. It checks the original image before preparing the
+private target and running released migrations. Dirty main and usage branches
+become writable through appended native snapshots of their distinct staged and
+working values; their active heads advance, while original heads and captured
+root coordinates remain in history and restore provenance. Other native refs
+are retained. The backup itself is unchanged.
+
+The target receives fresh service identity and credentials. Its checked history
+namespace preserves existing sessions and private memory, without transferring
+source workspace trust or live claim authority. Keep the backup until you have
+checked the restored sessions and memory status. Ctrl-C requests cancellation
+and awaits the same owned operation's settlement. If publication already
+completed, Kuru reports its result; an uncertain unpublished stage remains named
+for inspection and is not automatically deleted or retried. Do not copy or
+replace a live `.dolt` directory or remove a held lockfile.
 
 Kuru's private service releases its owned sidecar after its lifetime pipe closes,
 including after a service crash, and a successor waits for exact reap before

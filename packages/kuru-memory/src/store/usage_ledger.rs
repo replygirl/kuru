@@ -620,6 +620,16 @@ async fn validate_branch_state(pool: &MemoryPool) -> Result<()> {
     Ok(())
 }
 
+/// Private restore preparation reuses the same clean branch and owned-row
+/// identity validator as ordinary establishment, without stamping a usage
+/// validation record or changing imported receipts.
+pub(super) async fn validate_restored_content(pool: &MemoryPool) -> Result<()> {
+    validate_branch_state(pool).await?;
+    let expected = state_hash(pool).await?;
+    validate_owned_rows(pool, &expected).await?;
+    Ok(())
+}
+
 /// The full scan: every owned row through [`validate_owned_row`]. The scan
 /// validates exactly the content named `expected`, read before it and
 /// checked again after it. Returns the number of owned rows decoded.

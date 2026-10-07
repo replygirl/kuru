@@ -799,6 +799,7 @@ mod windows {
             // on both success and failure, so no sampler task outlives this call.
             if let Some(sampler) = sampler {
                 sampler.abort();
+                let _ = sampler.await;
             }
             let error = match captured {
                 Ok(Ok(status)) => {

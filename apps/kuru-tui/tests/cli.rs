@@ -3663,12 +3663,275 @@ fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
         serde_json::from_str::<Value>(&env.success(&["memory", "status"])).unwrap(),
         status
     );
-    assert_eq!(env.success(&["sessions"]), sessions);
+    let mut before: Value = serde_json::from_str(&sessions).unwrap();
+    let mut after: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
+    for listing in [&mut before, &mut after] {
+        for session in listing.as_array_mut().unwrap() {
+            let row = session.as_object_mut().unwrap();
+            assert_eq!(row.get("live_driver"), Some(&Value::Null));
+            assert!(row.get("live_presence_known").unwrap().is_boolean());
+            row.remove("live_presence_known");
+        }
+    }
+    assert_eq!(after, before);
     for limit in ["0", "1001"] {
         let output = env.run(&["memory", "history", "--limit", limit]);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"));
     }
+}
+
+#[tokio::test]
+async fn native_memory_backup_restores_offline_and_resumes_a_remapped_session() -> anyhow::Result<()>
+{
+    kuru_memory::test_support::closing(async {
+        use anyhow::{Context as _, ensure};
+        use kuru_memory::MemoryStore;
+
+        let mut env = Sandbox::warmed().await;
+        let target_project = env.root.path().join("restored-project");
+        let target_data = env.root.path().join("restored-data");
+        std::fs::create_dir(&target_project)?;
+        env.root.add_data(&target_data);
+        let outcome = async {
+            let initial: Value =
+                serde_json::from_str(&env.success(&["run", "retained backup question", "--json"]))?;
+            let session = initial["session"]
+                .as_str()
+                .context("initial session missing")?
+                .to_owned();
+            let source_scope = kuru_runtime::project_scope(&env.project)?;
+            let source_options = kuru_memory::test_support::warmed_open_options(
+                env.data.clone(),
+                source_scope.clone(),
+            )
+            .await?;
+            let memory = MemoryStore::open(source_options.clone()).await?;
+            let private_key = format!("{source_scope}/backup-private-sentinel");
+            memory
+                .put(&private_key, &serde_json::json!("private restored value"))
+                .await?;
+            let candidate = memory.begin_candidate("retained backup candidate").await?;
+            let candidate_name = candidate.branch().to_owned();
+            candidate
+                .view()
+                .put("candidate-private-sentinel", &serde_json::json!(true))
+                .await?;
+            let candidate_head = candidate.view().revision().await?;
+            candidate.view().close().await?;
+            memory.close().await?;
+            kuru_memory::test_support::await_managed_quiescence(&source_options).await?;
+
+            let backup = env.root.path().join("native-backup");
+            let response = env
+                .command_for("responses")
+                .env_remove("OPENAI_API_KEY")
+                .args(["memory", "backup"])
+                .arg(&backup)
+                .output()?;
+            ensure!(
+                response.status.success(),
+                "backup: {}",
+                String::from_utf8_lossy(&response.stderr)
+            );
+            let captured: Value = serde_json::from_slice(&response.stdout)?;
+            ensure!(
+                captured
+                    .as_object()
+                    .context("backup response was not an object")?
+                    .len()
+                    == 3
+                    && captured["dataset_root"].as_str().is_some(),
+                "backup did not return bounded metadata"
+            );
+            ensure!(
+                !String::from_utf8_lossy(&response.stdout).contains("private restored value"),
+                "backup stdout exposed private memory"
+            );
+            let manifest_before = std::fs::read(backup.join("backup.json"))?;
+            let duplicate = env
+                .command()
+                .args(["memory", "backup"])
+                .arg(&backup)
+                .output()?;
+            ensure!(
+                !duplicate.status.success()
+                    && std::fs::read(backup.join("backup.json"))? == manifest_before,
+                "backup replaced an existing image"
+            );
+            kuru_memory::test_support::await_managed_quiescence(&source_options).await?;
+
+            // The selected source pathname is now absent, with its original
+            // bytes preserved elsewhere in this fake-data fixture. Verify and
+            // restore must need only the image and bundled offline engine.
+            let parked_source = env.root.path().join("offline-source-data");
+            std::fs::rename(&env.data, &parked_source)?;
+            env.root.add_data(&parked_source);
+            let target_command = |provider: &str| {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+                #[cfg(windows)]
+                command.fixture_allow_independent_service();
+                command
+                    .arg("-C")
+                    .arg(&target_project)
+                    .arg("--data-dir")
+                    .arg(&target_data)
+                    .args(["--provider", provider, "--no-dream"])
+                    .env("XDG_CONFIG_HOME", env.root.path().join("config"))
+                    .env(
+                        kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+                        env.root.owner_diagnostic_path(),
+                    )
+                    .env_remove("OPENAI_API_KEY");
+                command
+            };
+            let verified = target_command("responses")
+                .args(["memory", "verify"])
+                .arg(&backup)
+                .output()?;
+            ensure!(
+                verified.status.success(),
+                "offline verify: {}",
+                String::from_utf8_lossy(&verified.stderr)
+            );
+            ensure!(
+                serde_json::from_slice::<Value>(&verified.stdout)? == captured,
+                "offline verify changed captured provenance"
+            );
+            let target_scope = kuru_runtime::project_scope(&target_project)?;
+            let refused = target_command("responses")
+                .args(["memory", "restore"])
+                .arg(&backup)
+                .output()?;
+            ensure!(
+                !refused.status.success() && !MemoryStore::exists(&target_data, &target_scope)?,
+                "different-project restore activated without explicit remapping"
+            );
+            let activated = target_command("responses")
+                .args(["memory", "restore"])
+                .arg(&backup)
+                .arg("--remap-project")
+                .output()?;
+            ensure!(
+                activated.status.success(),
+                "remapped restore: {}",
+                String::from_utf8_lossy(&activated.stderr)
+            );
+            let activation: Value = serde_json::from_slice(&activated.stdout)?;
+            ensure!(
+                activation["source_dataset_root"] == captured["dataset_root"],
+                "restore lost its original cut"
+            );
+            let repeated = target_command("responses")
+                .args(["memory", "restore"])
+                .arg(&backup)
+                .arg("--remap-project")
+                .output()?;
+            ensure!(
+                !repeated.status.success(),
+                "restore overwrote an active target"
+            );
+            let sessions = target_command("responses").arg("sessions").output()?;
+            ensure!(
+                sessions.status.success(),
+                "restored sessions: {}",
+                String::from_utf8_lossy(&sessions.stderr)
+            );
+            ensure!(
+                serde_json::from_slice::<Value>(&sessions.stdout)?
+                    .as_array()
+                    .context("session listing missing")?
+                    .iter()
+                    .any(|entry| entry["id"] == session),
+                "restored session is absent from its catalog"
+            );
+            let resumed = target_command("demo")
+                .args([
+                    "--resume",
+                    &session,
+                    "run",
+                    "continue restored session",
+                    "--json",
+                ])
+                .output()?;
+            ensure!(
+                resumed.status.success(),
+                "restored resume: {}",
+                String::from_utf8_lossy(&resumed.stderr)
+            );
+            ensure!(
+                serde_json::from_slice::<Value>(&resumed.stdout)?["session"] == session,
+                "restored resume substituted a new session"
+            );
+            let transcript = target_command("responses")
+                .args(["sessions", "export", &session, "--format", "jsonl"])
+                .output()?;
+            ensure!(
+                transcript.status.success(),
+                "restored transcript: {}",
+                String::from_utf8_lossy(&transcript.stderr)
+            );
+            let text = String::from_utf8(transcript.stdout)?;
+            ensure!(
+                text.contains("retained backup question")
+                    && text.contains("continue restored session"),
+                "restored public history lost its original prefix or new continuation"
+            );
+            let target_options = kuru_memory::test_support::warmed_open_options(
+                target_data.clone(),
+                target_scope.clone(),
+            )
+            .await?;
+            let inspected = MemoryStore::open(target_options.clone()).await?;
+            let checks = async {
+                ensure!(
+                    inspected.history_scope(&target_scope)? == source_scope
+                        && inspected.get(&private_key).await?
+                            == Some(serde_json::json!("private restored value")),
+                    "fresh target lost its checked historical private namespace"
+                );
+                let retained = inspected.candidate_ref_status(&candidate_name).await?;
+                ensure!(
+                    retained.head.as_deref() == Some(candidate_head.as_str()),
+                    "restored session continuation changed retained candidate history"
+                );
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            let close = inspected.close().await;
+            checks?;
+            close?;
+            kuru_memory::test_support::await_managed_quiescence(&target_options).await?;
+            let second_backup = env.root.path().join("backup-of-restored-project");
+            let second = target_command("responses")
+                .args(["memory", "backup"])
+                .arg(&second_backup)
+                .output()?;
+            ensure!(
+                second.status.success(),
+                "backup of restore: {}",
+                String::from_utf8_lossy(&second.stderr)
+            );
+            let second_verify = target_command("responses")
+                .args(["memory", "verify"])
+                .arg(&second_backup)
+                .output()?;
+            ensure!(
+                second_verify.status.success()
+                    && serde_json::from_slice::<Value>(&second_verify.stdout)?
+                        == serde_json::from_slice::<Value>(&second.stdout)?,
+                "backup of restored project lost native provenance"
+            );
+            ensure!(
+                std::fs::read(backup.join("backup.json"))? == manifest_before,
+                "offline restore/resume rewrote the original backup"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        env.root.release(outcome)
+    })
+    .await
 }
 
 #[tokio::test]

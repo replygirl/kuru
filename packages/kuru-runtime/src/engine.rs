@@ -945,6 +945,7 @@ impl Harness {
             ..
         } = admission;
         memory.ensure_project_scope(&scope)?;
+        let scope = memory.history_scope(&scope)?.to_owned();
         let is_new = matches!(target, SessionDriverTarget::Absent(_));
         let selected_id = match &target {
             SessionDriverTarget::Catalog(catalog) => &catalog.session_id,
@@ -1433,8 +1434,13 @@ impl Harness {
         session_summaries(&self.memory, &self.scope, None).await
     }
     pub async fn list_sessions(memory: &MemoryStore, cwd: &Path) -> Result<Vec<SessionSummary>> {
-        let scope = project_scope(cwd)?;
-        session_summaries(memory, &scope, Some(SessionLifecycleState::Active)).await
+        let canonical_scope = project_scope(cwd)?;
+        session_summaries(
+            memory,
+            memory.history_scope(&canonical_scope)?,
+            Some(SessionLifecycleState::Active),
+        )
+        .await
     }
     pub async fn continuation_session(memory: &MemoryStore, cwd: &Path) -> Result<String> {
         memory.ensure_project_scope(&project_scope(cwd)?)?;
@@ -1687,7 +1693,8 @@ impl Harness {
         &self.memory
     }
     pub async fn load_preferences(memory: &MemoryStore, cwd: &Path) -> Result<ProjectPreferences> {
-        read_preferences(memory, &project_scope(cwd)?).await
+        let canonical_scope = project_scope(cwd)?;
+        read_preferences(memory, memory.history_scope(&canonical_scope)?).await
     }
     pub async fn memory_status(&self) -> Result<MemoryStatus> {
         self.memory.status().await
@@ -6187,7 +6194,8 @@ async fn session_summaries_inner(
     lifecycle_state: Option<SessionLifecycleState>,
     #[cfg(test)] mut pause: Option<PublicationPause>,
 ) -> Result<Vec<SessionSummary>> {
-    memory.ensure_project_scope(scope)?;
+    // Harness construction and list_sessions already checked canonical
+    // attachment identity before selecting this persisted namespace.
     let catalog = session_catalog(memory, lifecycle_state).await?;
     #[cfg(test)]
     if let Some(pause) = pause.take() {
@@ -6586,8 +6594,9 @@ async fn resolve_notes_namespace_with_profile(
         memory.status().await?.branch == "main",
         "notes inspection requires the live memory branch"
     );
-    let scope = project_scope(cwd)?;
-    let keys = checked_state_keys(&scope, profile)?;
+    let canonical_scope = project_scope(cwd)?;
+    let scope = memory.history_scope(&canonical_scope)?;
+    let keys = checked_state_keys(scope, profile)?;
     let topology = if let Some(value) = memory.get(&keys.membership).await? {
         let members = MembershipRecord::decode(value, false)?;
         Topology {
@@ -6611,7 +6620,7 @@ async fn resolve_notes_namespace_with_profile(
     let identity = resolve_human_identity(&topology, identity)?;
     let namespace = format!(
         "{}/notes",
-        checked_identity_namespace(&scope, profile, &identity)?
+        checked_identity_namespace(scope, profile, &identity)?
     );
     Ok((identity, namespace))
 }

@@ -12,6 +12,7 @@ fn identity() -> Identity {
         reader_password: secret(),
         initialized: false,
         template: None,
+        source: None,
     }
 }
 
@@ -1330,6 +1331,7 @@ fn a_failure_reason_never_carries_a_connection_secret() {
         reader_password: secret(),
         initialized: true,
         template: None,
+        source: None,
     };
     let text = format!(
         "pool refused {} and {} twice: {}",

@@ -494,6 +494,8 @@ impl StageSession {
         let initial_revision = revision(pool).await?;
         let activation = Activation {
             format: 1,
+            history_scope: None,
+            restore: None,
             project_scope: self.project_scope.clone(),
             initial_revision,
             migration: self.legacy.as_ref().map(|legacy| legacy.receipt.clone()),

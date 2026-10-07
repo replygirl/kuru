@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
 use uuid::Uuid;
 
+pub(crate) mod backup_validation;
 mod candidate_reconciliation;
 mod public_transcript_proof;
 mod session_claims;
@@ -339,6 +340,7 @@ struct Shared {
     server: Server,
     directory: PathBuf,
     project_scope: String,
+    history_scope: Option<String>,
     fixture_unbound_scope: bool,
     read_only: bool,
     write: Arc<Mutex<()>>,
@@ -1772,8 +1774,31 @@ pub enum ProjectStructure {
 struct Activation {
     format: u32,
     project_scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore: Option<RestoreReceipt>,
     initial_revision: String,
     migration: Option<MigrationReceipt>,
+}
+
+/// Immutable provenance for an explicitly remapped, checked native restore.
+/// The current owner identity lives outside Dolt; copied SQL rows retain their
+/// historical origin even after candidate promotion or undo.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreReceipt {
+    source_project_path: Vec<u8>,
+    target_project_path: Vec<u8>,
+    source_storage_scope: String,
+    history_scope: String,
+    source_store_instance: String,
+    sql_origin_instance: String,
+    sql_origin_scope: String,
+    dataset_root: String,
+    backup_manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prepared_roots: Vec<backup_restore::PreparedRoots>,
 }
 
 struct StoppedStage {
@@ -1781,6 +1806,7 @@ struct StoppedStage {
     _lease: LifecycleLease,
 }
 
+pub(crate) mod backup_restore;
 pub(crate) mod creation_template;
 mod creation_worker;
 mod export;
@@ -1886,6 +1912,98 @@ impl MemoryStore {
             "memory view belongs to a different canonical project"
         );
         Ok(())
+    }
+
+    /// Persisted namespaces may retain a checked restore origin; canonical
+    /// project identity continues to govern attachments and native ownership.
+    pub(crate) fn history_scope(&self) -> &str {
+        self.shared
+            .history_scope
+            .as_deref()
+            .unwrap_or(&self.shared.project_scope)
+    }
+
+    pub(crate) fn restored_history_scope(&self) -> Option<&str> {
+        self.shared.history_scope.as_deref()
+    }
+
+    /// A persisted transcript prefix uses checked restore provenance, while
+    /// native ownership and project attachment keep their canonical identity.
+    pub(crate) fn ensure_history_scope(&self, scope: &str) -> Result<()> {
+        match self.restored_history_scope() {
+            Some(history) => {
+                ensure!(
+                    scope == history,
+                    "transcript belongs to a different history namespace"
+                );
+                Ok(())
+            }
+            None => self.ensure_project_scope(scope),
+        }
+    }
+
+    pub(crate) fn backup_source(&self, project: &Path) -> Result<crate::backup::BackupSource> {
+        self.readable()?;
+        ensure!(
+            self.branch == "main",
+            "backup requires the owner's main view"
+        );
+        ensure!(
+            crate::service::canonical_project_scope(project)? == self.shared.project_scope,
+            "backup source is not this store's canonical project"
+        );
+        self.backup_source_identity(crate::service::project_path_bytes(project))
+    }
+
+    /// The service supplies only its authenticated canonical path bytes. They
+    /// are provenance, never a path to open or caller-controlled SQL authority.
+    pub(crate) fn backup_source_identity(
+        &self,
+        project_path: Vec<u8>,
+    ) -> Result<crate::backup::BackupSource> {
+        self.readable()?;
+        ensure!(
+            self.branch == "main" && !self.shared.read_only,
+            "backup requires the existing writable main owner"
+        );
+        ensure!(
+            !project_path.is_empty() && project_path.len() <= 16 * 1024,
+            "backup canonical project path exceeds its bound"
+        );
+        let digest = Sha256::digest(&project_path);
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        ensure!(
+            scope == self.shared.project_scope,
+            "backup source identity differs from the authenticated project"
+        );
+        let (sql_origin_instance, sql_origin_scope) = self.shared.server.sql_origin();
+        Ok(crate::backup::BackupSource {
+            project_path,
+            storage_scope: self.shared.project_scope.clone(),
+            history_scope: self.history_scope().to_owned(),
+            store_instance: self.service_instance().to_owned(),
+            sql_origin_instance: sql_origin_instance.to_owned(),
+            sql_origin_scope: sql_origin_scope.to_owned(),
+        })
+    }
+
+    pub(crate) fn backup_connection(&self) -> Result<crate::server::BackupConnection> {
+        self.readable()?;
+        ensure!(
+            self.branch == "main",
+            "backup requires the owner's main view"
+        );
+        self.shared.server.backup_connection()
+    }
+
+    pub(crate) fn image_runtime(&self) -> crate::backup::ImageRuntime {
+        self.shared.server.image_runtime()
     }
 
     pub(crate) fn service_instance(&self) -> &str {
@@ -2271,7 +2389,19 @@ impl MemoryStore {
             drop(staging);
             open_timeline::stamp(open_timeline::Event::Activated);
         }
-        read_activation(&directory, &options.project_scope)?;
+        let activation = read_activation(&directory, &options.project_scope)?;
+        if let Some(receipt) = &activation.restore {
+            crate::server::verify_restored_identity(
+                &directory,
+                &options.project_scope,
+                &receipt.source_store_instance,
+                &receipt.sql_origin_instance,
+                &receipt.sql_origin_scope,
+            )?;
+        } else {
+            crate::server::verify_unrestored_identity(&directory, &options.project_scope)?;
+        }
+        let history_scope = activation.history_scope;
         progress.report(MemoryOpenStage::OpeningDatabase);
         let server = Server::open_with_guard(
             make_options(directory.clone(), options.read_only),
@@ -2359,6 +2489,7 @@ impl MemoryStore {
             server,
             directory,
             project_scope: options.project_scope,
+            history_scope,
             fixture_unbound_scope: temporary.is_some(),
             read_only: options.read_only,
             write: Arc::new(Mutex::new(())),
@@ -3996,7 +4127,7 @@ impl MemoryStore {
         let scope = namespace
             .strip_suffix(&suffix)
             .context("public turn transcript namespace does not match its session")?;
-        self.ensure_project_scope(scope)?;
+        self.ensure_history_scope(scope)?;
         self.checkpoint_session_inner(
             namespace,
             session_id,
@@ -4019,7 +4150,7 @@ impl MemoryStore {
         let scope = namespace
             .strip_suffix(&suffix)
             .context("mode checkpoint transcript namespace does not match its session")?;
-        self.ensure_project_scope(scope)?;
+        self.ensure_history_scope(scope)?;
         self.checkpoint_session_inner(namespace, session_id, &[], values, None, Some(mode))
             .await
     }
@@ -8665,11 +8796,104 @@ fn read_activation(directory: &Path, scope: &str) -> Result<Activation> {
         "project memory has no activation record; preserve the store and repair it before opening",
     )?;
     let activation: Activation = serde_json::from_slice(&bytes)?;
+    validate_activation(&activation, scope)?;
+    Ok(activation)
+}
+
+fn validate_activation(activation: &Activation, scope: &str) -> Result<()> {
     ensure!(
-        activation.format == 1 && activation.project_scope == scope,
+        activation.project_scope == scope,
         "project memory activation identity does not match"
     );
-    Ok(activation)
+    match (
+        activation.format,
+        activation.history_scope.as_deref(),
+        activation.restore.as_ref(),
+    ) {
+        (1, None, None) => {}
+        (2, Some(history), Some(receipt)) => {
+            project_directory(Path::new("."), history)
+                .context("restored project history scope is invalid")?;
+            ensure!(
+                receipt.history_scope == history,
+                "restored project history scope differs from its remap receipt"
+            );
+            for (path, expected, label) in [
+                (
+                    &receipt.source_project_path,
+                    &receipt.source_storage_scope,
+                    "source",
+                ),
+                (
+                    &receipt.target_project_path,
+                    &activation.project_scope,
+                    "target",
+                ),
+            ] {
+                ensure!(
+                    !path.is_empty() && path.len() <= 16 * 1024,
+                    "restored project {label} path exceeds its bound"
+                );
+                let digest = Sha256::digest(path);
+                let derived = format!(
+                    "project/{}",
+                    digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                );
+                ensure!(
+                    derived == expected.as_str(),
+                    "restored project {label} scope differs from its canonical path"
+                );
+            }
+            for instance in [&receipt.source_store_instance, &receipt.sql_origin_instance] {
+                Uuid::parse_str(instance).context("restored project instance is invalid")?;
+            }
+            project_directory(Path::new("."), &receipt.sql_origin_scope)
+                .context("restored project SQL origin scope is invalid")?;
+            ensure!(
+                crate::backup::noms_hash(&receipt.dataset_root),
+                "restored project dataset root is malformed"
+            );
+            ensure!(
+                receipt.prepared_roots.len() <= 2,
+                "restored preparation provenance has unexpected branches"
+            );
+            let mut branches = std::collections::HashSet::new();
+            for roots in &receipt.prepared_roots {
+                ensure!(
+                    ["main", usage_ledger::BRANCH].contains(&roots.branch.as_str())
+                        && branches.insert(&roots.branch),
+                    "restored preparation branch is invalid or duplicated"
+                );
+                for hash in [
+                    &roots.original_head,
+                    &roots.original_working,
+                    &roots.original_staged,
+                    &roots.working_commit,
+                ]
+                .into_iter()
+                .chain(roots.staged_commit.as_ref())
+                {
+                    ensure!(
+                        crate::backup::noms_hash(hash),
+                        "restored preparation coordinate is malformed"
+                    );
+                }
+            }
+            ensure!(
+                receipt.backup_manifest_sha256.len() == 64
+                    && receipt
+                        .backup_manifest_sha256
+                        .bytes()
+                        .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) }),
+                "restored project backup manifest digest is malformed"
+            );
+        }
+        _ => bail!("unsupported project memory activation format"),
+    }
+    Ok(())
 }
 pub(crate) fn private_dir(path: &Path) -> Result<()> {
     files::private_dir(path)
@@ -8789,6 +9013,65 @@ mod tests {
     use crate::service::{self, ServiceCall, ServiceValue};
     use serde_json::json;
     use sha2::Digest;
+
+    #[test]
+    fn activation_selects_history_only_with_complete_checked_restore_provenance() -> Result<()> {
+        let scope_for = |path: &[u8]| {
+            let digest: String = Sha256::digest(path)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("project/{digest}")
+        };
+        let target = b"/checked/target".to_vec();
+        let source = b"/checked/source".to_vec();
+        let scope = scope_for(&target);
+        let mut activation = Activation {
+            format: 1,
+            project_scope: scope.clone(),
+            history_scope: None,
+            restore: None,
+            initial_revision: "0".repeat(32),
+            migration: None,
+        };
+        validate_activation(&activation, &scope)?;
+        let ordinary = serde_json::to_value(&activation)?;
+        assert_eq!(ordinary.as_object().unwrap().len(), 4);
+        assert!(ordinary.get("history_scope").is_none());
+        assert!(ordinary.get("restore").is_none());
+
+        let history = scope_for(&source);
+        activation.format = 2;
+        activation.history_scope = Some(history.clone());
+        assert!(validate_activation(&activation, &scope).is_err());
+        activation.restore = Some(RestoreReceipt {
+            source_project_path: source,
+            target_project_path: target,
+            source_storage_scope: history.clone(),
+            history_scope: history.clone(),
+            source_store_instance: Uuid::new_v4().to_string(),
+            sql_origin_instance: Uuid::new_v4().to_string(),
+            sql_origin_scope: history,
+            dataset_root: "0".repeat(32),
+            backup_manifest_sha256: "0".repeat(64),
+            prepared_roots: vec![],
+        });
+        validate_activation(&activation, &scope)?;
+        let reread: Activation = serde_json::from_slice(&serde_json::to_vec(&activation)?)?;
+        validate_activation(&reread, &scope)?;
+        activation
+            .restore
+            .as_mut()
+            .unwrap()
+            .target_project_path
+            .push(b'x');
+        assert!(validate_activation(&activation, &scope).is_err());
+        // A namespace string by itself cannot turn an ordinary activation
+        // into restored provenance or bypass the target mapping.
+        activation.format = 1;
+        assert!(validate_activation(&activation, &scope).is_err());
+        Ok(())
+    }
 
     fn pending_public_turn() -> PublicTurnRecord {
         let origin_session_id = "session-a".to_owned();
@@ -11590,6 +11873,8 @@ mod tests {
         initialize(&pool).await?;
         let activation = Activation {
             format: 1,
+            history_scope: None,
+            restore: None,
             project_scope: options.project_scope.clone(),
             initial_revision: revision(&pool).await?,
             migration: None,
@@ -11674,6 +11959,8 @@ mod tests {
             &stage.join("ready.json"),
             &Activation {
                 format: 1,
+                history_scope: None,
+                restore: None,
                 project_scope: options.project_scope.clone(),
                 initial_revision: base.clone(),
                 migration: None,
@@ -12316,6 +12603,7 @@ mod tests {
             shared: Arc::new(Shared {
                 server,
                 directory,
+                history_scope: None,
                 project_scope: scope,
                 fixture_unbound_scope: false,
                 read_only: true,
