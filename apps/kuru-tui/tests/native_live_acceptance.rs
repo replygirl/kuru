@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use clap::Parser;
 use kuru::ui::{self, TerminalSession, View};
@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 )]
 mod terminal;
 
-const MODEL: &str = "gpt-5.6-luna";
+const MODEL: &str = "gpt-5.5";
 const DEADLINE: Duration = Duration::from_secs(180);
 const CHILD: &str = "KURU_NATIVE_LIVE_ACCEPTANCE_CHILD";
 
@@ -39,6 +39,8 @@ struct Observations {
     measured_input: u64,
     output_bytes: usize,
     usages: Vec<Usage>,
+    usage_requests: Vec<usize>,
+    request_actors: Vec<String>,
     prefixes: Vec<[u8; 32]>,
     tools: Vec<[u8; 32]>,
     summaries: usize,
@@ -104,7 +106,7 @@ impl Provider for NativeObservation {
             .estimate_context(&request)
             .await
             .map_err(safe_error)?;
-        {
+        let request_index = {
             let mut observed = self.observed.lock().unwrap();
             ensure!(observed.requests < 6, "six-request live acceptance limit");
             ensure!(
@@ -116,13 +118,17 @@ impl Provider for NativeObservation {
                 "total input estimate limit"
             );
             observed.requests += 1;
+            let request_index = observed.requests - 1;
             observed.input_estimate += estimate.estimated_input_tokens;
+            observed.request_actors.push(request.actor.clone());
             // This is only a neutral CompletionRequest prefix, not final wire bytes.
+            let boundary = request
+                .shared_instruction_prefix_bytes
+                .context("runtime shared instruction boundary")?;
             let prefix = request
                 .instructions
-                .split("\nYou are ")
-                .next()
-                .unwrap_or(&request.instructions);
+                .get(..boundary)
+                .context("valid runtime shared instruction boundary")?;
             observed
                 .prefixes
                 .push(Sha256::digest(prefix.as_bytes()).into());
@@ -134,10 +140,12 @@ impl Provider for NativeObservation {
                     .plain_text()
                     .is_some_and(|text| text.contains("LIVE_REWRITTEN"))
             });
-        }
+            request_index
+        };
         let mut bounded = BoundedSink {
             downstream: sink,
             observed: self.observed.clone(),
+            request_index,
             stream_bytes: 0,
             settled_bytes: 0,
         };
@@ -151,6 +159,7 @@ impl Provider for NativeObservation {
 struct BoundedSink<'a> {
     downstream: &'a mut dyn ProviderSink,
     observed: Arc<Mutex<Observations>>,
+    request_index: usize,
     stream_bytes: usize,
     settled_bytes: usize,
 }
@@ -195,7 +204,8 @@ impl ProviderSink for BoundedSink<'_> {
                     }
                     ProviderEvent::Completed(completion) => {
                         self.settled_bytes += serde_json::to_vec(&completion.blocks)?.len();
-                        observed.usages.push(completion.usage.clone())
+                        observed.usages.push(completion.usage.clone());
+                        observed.usage_requests.push(self.request_index);
                     }
                     _ => {}
                 }
@@ -273,7 +283,7 @@ async fn acceptance(observed: Arc<Mutex<Observations>>) -> Result<()> {
     };
     config.hooks = LifecycleHooks {
         pre_turn: vec![hook(
-            r#"input=$(cat); case "$input" in *LIVE_ORIGINAL*) printf '%s' '{"decision":"rewrite","value":{"input":"LIVE_REWRITTEN: Read fixture.txt using the existing read tool if useful, then answer in one sentence with SYNTHETIC_ACCEPTED and its value. Do not mutate files."}}' ;; *) printf '%s' '{"decision":"allow"}' ;; esac"#,
+            r#"input=$(cat); case "$input" in *LIVE_ORIGINAL*) printf '%s' '{"decision":"rewrite","value":{"input":"LIVE_REWRITTEN: The invented fixture value is seventeen. Answer in one sentence with SYNTHETIC_ACCEPTED and its value. Do not call any tools."}}' ;; *) printf '%s' '{"decision":"allow"}' ;; esac"#,
         )],
         post_turn: vec![hook(
             r#"cat >/dev/null; printf '%s' '{"decision":"annotate","annotation":"SYNTHETIC_POST_ANNOTATION"}'"#,
@@ -316,9 +326,9 @@ async fn acceptance(observed: Arc<Mutex<Observations>>) -> Result<()> {
     let memory = MemoryStore::temporary().await?;
     let tools = ToolHost::new(project.path(), &config)?;
     let mut instructions = String::from(
-        "This is an entirely synthetic bounded acceptance project. Answer briefly. Never shell, mutate, contact peers or use external tools. The fixture file is safe to read.\n",
+        "This is an entirely synthetic bounded acceptance project. Answer briefly. Do not call any tools, including cognitive tools. The invented fixture value is seventeen.\n",
     );
-    for index in 0..96 {
+    for index in 0..64 {
         instructions.push_str(&format!("Synthetic shared catalogue row {index:03}: amber square, indigo triangle, silver circle; values are invented and carry no real personal information. Preserve this fixed catalogue as shared reference, never recite it.\n"));
     }
     let mut harness = Harness::with_tool_host_and_instructions(
@@ -343,8 +353,9 @@ async fn acceptance(observed: Arc<Mutex<Observations>>) -> Result<()> {
     let mut renderer = Renderer::new(CrosstermBackend::new(io::stdout()))?;
     let mut preview_frames = 0usize;
     let mut summary_frames = 0usize;
+    let mut facing_summary_turns = std::collections::BTreeSet::new();
     let mut events = harness.subscribe();
-    for (index, actor) in actors.iter().enumerate() {
+    for (index, actor) in actors.iter().cycle().take(3).enumerate() {
         let mut view =
             View::from_initial(ui::project_initial_view(&harness).await?, models.clone());
         view.busy = true;
@@ -377,6 +388,9 @@ async fn acceptance(observed: Arc<Mutex<Observations>>) -> Result<()> {
                         ensure!(preview.text_tail.len() <= 8192 && preview.summary_tail.len() <= 2048, "facing preview bounds");
                         preview_frames += 1;
                         summary_frames += usize::from(!preview.summary_tail.is_empty());
+                        if !preview.summary_tail.is_empty() {
+                            facing_summary_turns.insert((actor.clone(), preview.turn_id.clone()));
+                        }
                     }
                     renderer.draw(|frame| ui::draw(frame, &view))?;
                 }
@@ -386,7 +400,7 @@ async fn acceptance(observed: Arc<Mutex<Observations>>) -> Result<()> {
     guard.restore()?;
     let hook_events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
     ensure!(hook_events.iter().any(|event| matches!(event, kuru_runtime::Event::Hook { observation, .. } if observation.event == "pre_turn" && observation.outcome == "rewritten")), "native turn lacked observed rewrite hook");
-    ensure!(hook_events.iter().filter(|event| matches!(event, kuru_runtime::Event::Hook { observation, .. } if observation.event == "post_turn" && observation.outcome == "annotated")).count() == 2, "native turns lacked observed annotation hooks");
+    ensure!(hook_events.iter().filter(|event| matches!(event, kuru_runtime::Event::Hook { observation, .. } if observation.event == "post_turn" && observation.outcome == "annotated")).count() == 3, "native turns lacked observed annotation hooks");
     let history = harness.history().await?;
     ensure!(
         history.iter().any(|message| message
@@ -395,10 +409,16 @@ async fn acceptance(observed: Arc<Mutex<Observations>>) -> Result<()> {
         "original public input lost"
     );
     let summaries = private_summaries(&memory).await?;
-    ensure!(
-        observed.lock().unwrap().summaries == 0 || !summaries.is_empty(),
-        "delivered private summaries were not persisted"
-    );
+    for (actor, turn) in &facing_summary_turns {
+        ensure!(
+            summaries.iter().any(|(_, value)| {
+                value["session_id"] == session
+                    && value["actor_id"] == *actor
+                    && value["turn_id"] == *turn
+            }),
+            "visible facing summary lacks its own private session/actor/turn record"
+        );
+    }
     for (_, value) in &summaries {
         ensure!(
             value["session_id"] == session,
@@ -498,8 +518,27 @@ async fn acceptance(observed: Arc<Mutex<Observations>>) -> Result<()> {
         stable_prefix,
         "shared CompletionRequest instruction prefix changed"
     );
+    let repeated_hit =
+        observed
+            .usages
+            .iter()
+            .zip(&observed.usage_requests)
+            .any(|(usage, &request_index)| {
+                usage.cached_input_tokens.is_some_and(|tokens| tokens > 0)
+                    && (0..request_index).any(|prior| {
+                        observed.prefixes[prior] == observed.prefixes[request_index]
+                            && observed.tools[prior] == observed.tools[request_index]
+                            && observed.request_actors[prior]
+                                != observed.request_actors[request_index]
+                    })
+            });
+    ensure!(
+        repeated_hit,
+        "native subscription did not report positive cached input across actors sharing the same prefix and tool inventory"
+    );
+    println!("LIVE_CACHE_REUSE cross_actor_shared_prefix_positive_cached_input={repeated_hit}");
     println!(
-        "LIVE_RESULT requests={} estimated_input={} native_measured_input={} observed_payload_bytes={} preview_frames={preview_frames} summary_frames={summary_frames} private_summaries={} settled_summaries={} tool_deltas={} shared_request_prefix_stable={stable_prefix} tools_stable={stable_tools} final_wire_proof=false post_annotations=2 rewrite_observed=true cleared_settled_frames=2",
+        "LIVE_RESULT requests={} estimated_input={} native_measured_input={} observed_payload_bytes={} preview_frames={preview_frames} summary_frames={summary_frames} private_summaries={} settled_summaries={} tool_deltas={} shared_request_prefix_stable={stable_prefix} tools_stable={stable_tools} final_wire_proof=false post_annotations=3 rewrite_observed=true cleared_settled_frames=3",
         observed.requests,
         observed.input_estimate,
         observed.measured_input,
@@ -512,7 +551,7 @@ async fn acceptance(observed: Arc<Mutex<Observations>>) -> Result<()> {
 }
 
 #[test]
-#[ignore = "paid native gpt-5.6-luna acceptance; requires Kuru's own existing login"]
+#[ignore = "paid native gpt-5.5 acceptance; requires Kuru's own existing login"]
 fn native_live_acceptance() -> Result<()> {
     if std::env::var_os(CHILD).is_some() {
         let observed = Arc::new(Mutex::new(Observations::default()));
@@ -525,7 +564,7 @@ fn native_live_acceptance() -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("bounded native acceptance deadline expired"))
                     .and_then(|outcome| outcome);
                 let observed = observed.lock().unwrap();
-                println!("LIVE_ATTEMPT acceptance_succeeded={} delegated_streams={} terminal_completions={}", result.is_ok(), observed.requests, observed.usages.len());
+                println!("LIVE_ATTEMPT acceptance_succeeded={} delegated_streams={} terminal_completions={} estimated_input={} native_measured_input={}", result.is_ok(), observed.requests, observed.usages.len(), observed.input_estimate, observed.measured_input);
                 for (index, usage) in observed.usages.iter().enumerate() {
                     println!("LIVE_USAGE completion={index} input={:?} output={:?} cached={:?} reasoning={:?}", usage.input_tokens, usage.output_tokens, usage.cached_input_tokens, usage.reasoning_output_tokens);
                 }
@@ -565,6 +604,7 @@ fn native_live_acceptance() -> Result<()> {
     for line in output.lines() {
         if let Some(start) = [
             "LIVE_MODEL ",
+            "LIVE_CACHE_REUSE ",
             "LIVE_RESULT ",
             "LIVE_USAGE ",
             "LIVE_ATTEMPT ",

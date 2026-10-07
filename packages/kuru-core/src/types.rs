@@ -291,6 +291,10 @@ pub enum CacheWriteTerms {
 pub struct CompletionRequest {
     pub actor: String,
     pub instructions: String,
+    /// Byte boundary after shared, stable instructions and before actor-local
+    /// context. Providers may mark this prefix for caching; this is not a hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_instruction_prefix_bytes: Option<usize>,
     pub messages: Vec<Message>,
     /// Number of messages at the end of `messages` retained from this actor
     /// invocation's inputs. `None` is a legacy/direct caller: native provider

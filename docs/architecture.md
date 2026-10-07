@@ -68,8 +68,15 @@ shared contributions.
 
 The request builder puts common Kuru rules and reviewed project instructions
 before the speaking actor's identity, phase and changing public transcript.
-This makes a common prefix available for provider caching without mixing
-private actor histories. Tool schemas use a stable order. Kuru records cache use
+The runtime marks the byte boundary after common instructions. The native ChatGPT
+connector renders shared and actor-local instructions as separate developer text
+blocks and supplies a cache routing key derived from the shared instructions,
+the actually offered tool schemas, model and effort. Changing private context or
+actor identity does not change that key; different phase tool inventories retain
+separate keys. The native endpoint rejects the API's explicit cache-breakpoint
+field, so Kuru does not send it. API-key requests and callers without a boundary
+keep their existing wire shape. Tool schemas use a stable order. Cache reuse is
+opportunistic and depends on the selected model and service. Kuru records cache use
 only when the provider reports cached input; a matching prefix alone is not a
 cache-hit claim.
 

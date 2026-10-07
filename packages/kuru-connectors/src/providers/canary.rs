@@ -154,6 +154,7 @@ pub(super) async fn with_manager(
             .complete(CompletionRequest {
                 actor: "kuru-canary".into(),
                 instructions: "Reply with the single word OK.".into(),
+                shared_instruction_prefix_bytes: None,
                 messages: vec![Message::text("user", "Reply with OK.")],
                 current_message_count: Some(1),
                 context_budget: None,

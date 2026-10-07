@@ -245,6 +245,7 @@ impl CompactionSource {
         Ok(CompletionRequest {
             actor: actor.into(),
             instructions: COMPACTION_INSTRUCTION.into(),
+            shared_instruction_prefix_bytes: None,
             messages,
             // Compaction is a fresh no-tools request and must never inherit a
             // provider-native tool continuation from ordinary actor traffic.

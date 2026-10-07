@@ -905,6 +905,41 @@ fn prepare_responses_request(
     } = input_items_selected(&request.messages, pending, request.current_message_count)?;
     let native_continuation_mandatory = native_output_ranges.is_some();
     let input_bytes = serde_json::to_vec(&input)?.len() as u64;
+    let prefix = request
+        .shared_instruction_prefix_bytes
+        .map(|boundary| {
+            ensure!(
+                boundary > 0
+                    && boundary <= request.instructions.len()
+                    && request.instructions.is_char_boundary(boundary),
+                "invalid shared instruction prefix boundary"
+            );
+            Ok(boundary)
+        })
+        .transpose()?;
+    // The subscription transport accepts plain developer content blocks, but
+    // rejects the API's explicit cache-breakpoint field. Keep API wire shapes
+    // unchanged and let the native service account for actual cache use.
+    let cache_boundary = prefix.filter(|_| subscription);
+    let mut wire_input = input.clone();
+    let mut sizing_ranges = native_output_ranges.clone();
+    let instructions = if let Some(boundary) = cache_boundary {
+        let (shared, local) = request.instructions.split_at(boundary);
+        let mut content = vec![json!({"type":"input_text","text":shared})];
+        if !local.is_empty() {
+            content.push(json!({"type":"input_text","text":local}));
+        }
+        wire_input.insert(0, json!({"role":"developer","content":content}));
+        if let Some(ranges) = &mut sizing_ranges {
+            for range in ranges {
+                range.start += 1;
+                range.end += 1;
+            }
+        }
+        "Follow the developer instructions in input."
+    } else {
+        &request.instructions
+    };
     let mut tools = request
         .tools
         .iter()
@@ -916,7 +951,22 @@ fn prepare_responses_request(
             .cmp(&right["name"].as_str())
             .then_with(|| left.to_string().cmp(&right.to_string()))
     });
-    let mut body = json!({"model":request.model,"instructions":request.instructions,"input":input,"store":false,"include":["reasoning.encrypted_content"],"tools":tools});
+    let mut body = json!({"model":request.model,"instructions":instructions,"input":wire_input,"store":false,"include":["reasoning.encrypted_content"],"tools":tools});
+    if let Some(boundary) = prefix.filter(|_| subscription) {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(serde_json::to_vec(&json!({
+            "instructions": &request.instructions[..boundary],
+            "tools": &body["tools"],
+            "model": request.model,
+            "effort": request.effort,
+        }))?);
+        body["prompt_cache_key"] = json!(
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
     if let Some(effort) = &request.effort {
         body["reasoning"] = json!({"effort":effort});
         if effort != "none" {
@@ -929,7 +979,12 @@ fn prepare_responses_request(
         body["parallel_tool_calls"] = json!(true);
     }
     let payload = serde_json::to_vec(&body)?;
-    let instructions_bytes = serde_json::to_vec(&body["instructions"])?.len() as u64;
+    let instructions_bytes = serde_json::to_vec(&body["instructions"])?.len() as u64
+        + if cache_boundary.is_some() {
+            serde_json::to_vec(&body["input"][0])?.len() as u64
+        } else {
+            0
+        };
     let tools_bytes = serde_json::to_vec(&body["tools"])?.len() as u64;
     let source = |kind, serialized_bytes, units, mandatory| ContextSourceSize {
         kind,
@@ -947,7 +1002,7 @@ fn prepare_responses_request(
         .unwrap_or_else(ContextBudget::legacy_default);
     effective_budget.validate()?;
     let (estimated_input_tokens, sizing) =
-        estimate_native_input(route, &body, &payload, native_output_ranges.as_deref())?;
+        estimate_native_input(route, &body, &payload, sizing_ranges.as_deref())?;
     let context = ContextEstimate::from_measured_final_body(
         effective_budget,
         payload.len() as u64,
@@ -974,7 +1029,7 @@ fn prepare_responses_request(
                     ContextSourceKind::SelectedInput
                 },
                 input_bytes,
-                body["input"].as_array().map_or(0, Vec::len) as u64,
+                input.len() as u64,
                 native_continuation_mandatory,
             ),
             source(
@@ -2586,6 +2641,150 @@ mod tests {
                 .contains("explicit model")
         );
         assert!(ResponsesProvider::new("file:///tmp/key", "").is_err());
+    }
+
+    #[test]
+    fn cache_boundary_validates_metadata_and_preserves_legacy_routes() {
+        let mut request = request();
+        request.instructions = "共通\nActor A".into();
+        for boundary in [0, 1, request.instructions.len() + 1] {
+            request.shared_instruction_prefix_bytes = Some(boundary);
+            let error =
+                prepare_responses_request(ModelRoute::CodexSubscription, true, &request, None)
+                    .err()
+                    .expect("invalid boundary rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid shared instruction prefix boundary")
+            );
+        }
+        request.shared_instruction_prefix_bytes = Some("共通\n".len());
+        for (route, model) in [
+            (ModelRoute::CodexSubscription, "future-model"),
+            (ModelRoute::OpenAiResponses, "gpt-5.5"),
+            (ModelRoute::OpenAiResponses, "gpt-5.6-sol"),
+            (ModelRoute::OpenAiResponses, "future-model"),
+            (ModelRoute::CustomResponses, "gpt-5.6-sol"),
+        ] {
+            request.model = model.into();
+            let prepared = prepare_responses_request(route, false, &request, None).unwrap();
+            assert_eq!(prepared.body["instructions"], request.instructions);
+            assert_eq!(prepared.body["input"][0]["role"], "user");
+        }
+        request.model = "gpt-5.6-sol".into();
+        request.shared_instruction_prefix_bytes = None;
+        let legacy =
+            prepare_responses_request(ModelRoute::CodexSubscription, true, &request, None).unwrap();
+        assert_eq!(legacy.body["instructions"], request.instructions);
+        assert!(legacy.body.get("prompt_cache_key").is_none());
+        request.shared_instruction_prefix_bytes = Some(request.instructions.len());
+        let modern =
+            prepare_responses_request(ModelRoute::CodexSubscription, true, &request, None).unwrap();
+        assert_eq!(
+            modern.body["input"][0]["content"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(modern.context.final_body_bytes, modern.payload.len() as u64);
+        let instruction_source = modern
+            .context
+            .sources
+            .iter()
+            .find(|source| source.kind == ContextSourceKind::SelectedInstructions)
+            .unwrap();
+        assert_eq!(
+            instruction_source.serialized_bytes,
+            (serde_json::to_vec(&modern.body["instructions"])
+                .unwrap()
+                .len()
+                + serde_json::to_vec(&modern.body["input"][0]).unwrap().len()) as u64
+        );
+    }
+
+    #[test]
+    fn native_cache_key_groups_only_shared_instructions_tools_and_inference_settings() {
+        let mut request = request();
+        let shared = "Shared reviewed instructions.\n";
+        request.instructions = format!("{shared}Actor A");
+        request.shared_instruction_prefix_bytes = Some(shared.len());
+        let mut other_tool = request.tools[0].clone();
+        other_tool.name = "other_read".into();
+        request.tools.push(other_tool);
+        let key = |request: &CompletionRequest| {
+            prepare_responses_request(ModelRoute::CodexSubscription, true, request, None)
+                .unwrap()
+                .body["prompt_cache_key"]
+                .clone()
+        };
+        let expected = key(&request);
+        request.actor = "part-b".into();
+        request.instructions = format!("{shared}Actor B with changed public context");
+        request.messages = vec![Message::text("user", "PRIVATE_B")];
+        request.tools.reverse();
+        assert_eq!(key(&request), expected);
+
+        let mut changed = request.clone();
+        changed.instructions = changed.instructions.replacen("Shared", "Edited", 1);
+        assert_ne!(key(&changed), expected);
+        let mut changed = request.clone();
+        changed.model = "future-native-model".into();
+        assert_ne!(key(&changed), expected);
+        let mut changed = request.clone();
+        changed.effort = Some("high".into());
+        assert_ne!(key(&changed), expected);
+        request.tools.clear();
+        assert_ne!(key(&request), expected);
+    }
+
+    #[test]
+    fn cache_boundary_keeps_native_continuation_and_opaque_sizing_ranges() {
+        let mut request = request();
+        request.model = "gpt-5.6-sol".into();
+        request.instructions = "Shared common instructions.\nActor A".into();
+        request.shared_instruction_prefix_bytes = Some("Shared common instructions.\n".len());
+        let pending = Pending {
+            input: vec![
+                json!({"role":"user","content":"original"}),
+                json!({"type":"reasoning","encrypted_content":"prior opaque"}),
+            ],
+            native_output_ranges: std::iter::once(1..2).collect(),
+            output: vec![
+                json!({"type":"reasoning","encrypted_content":"fresh opaque"}),
+                json!({"type":"function_call","call_id":"a","name":"file_read","arguments":"{}"}),
+            ],
+            calls: vec!["a".into()],
+        };
+        request.messages = vec![Message::tool_result("a", json!("receipt"), false)];
+        request.current_message_count = Some(1);
+        let prepared = prepare_responses_request(
+            ModelRoute::CodexSubscription,
+            true,
+            &request,
+            Some(&pending),
+        )
+        .unwrap();
+        let wire = prepared.body["input"].as_array().unwrap();
+        assert_eq!(
+            wire.iter()
+                .filter(|item| item["role"] == "developer")
+                .count(),
+            1
+        );
+        assert_eq!(&wire[1..3], pending.input.as_slice());
+        assert_eq!(&wire[3..5], pending.output.as_slice());
+        assert_eq!(wire[5]["type"], "function_call_output");
+        assert_eq!(prepared.input[0]["role"], "user");
+        assert_eq!(prepared.native_output_ranges, Some(vec![1..2, 2..4]));
+        let (expected, sizing) = estimate_native_input(
+            ModelRoute::CodexSubscription,
+            &prepared.body,
+            &prepared.payload,
+            Some(&[2..3, 3..5]),
+        )
+        .unwrap();
+        assert_eq!(prepared.context.estimated_input_tokens, expected);
+        assert_eq!(prepared.context.sizing, sizing);
+        assert_eq!(sizing, ContextSizing::MixedNativeEstimate);
     }
 
     #[test]

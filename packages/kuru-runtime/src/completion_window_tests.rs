@@ -31,6 +31,7 @@ fn request() -> CompletionRequest {
     CompletionRequest {
         actor: "part".into(),
         instructions: String::new(),
+        shared_instruction_prefix_bytes: None,
         messages: vec![],
         current_message_count: None,
         context_budget: None,

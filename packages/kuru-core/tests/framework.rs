@@ -244,6 +244,7 @@ fn transport_contracts_preserve_tool_replay_unicode_and_future_efforts() {
     let request = CompletionRequest {
         actor: "witness".into(),
         instructions: "Do useful work.".into(),
+        shared_instruction_prefix_bytes: None,
         messages: vec![Message::tool_result(
             "call-1",
             json!("こんにちは 🪶"),

@@ -578,6 +578,7 @@ pub fn request() -> kuru_core::CompletionRequest {
     kuru_core::CompletionRequest {
         actor: "project/ifs/part-a".into(),
         instructions: "Actor-specific context".into(),
+        shared_instruction_prefix_bytes: None,
         messages: vec![kuru_core::Message::text("user", "hello")],
         current_message_count: Some(1),
         context_budget: None,

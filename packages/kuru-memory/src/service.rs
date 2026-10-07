@@ -267,7 +267,7 @@ fn optional_path(argument: OsString) -> Option<PathBuf> {
 }
 
 /// Test-support stand-in owner: names a release file. An owner process
-/// started with it takes no lock, opens nothing and writes nothing; it stays
+/// started with it takes no lock and opens no database; it stays
 /// alive until the file holds a decimal exit status, then exits with that
 /// status. A test passes it only through the task-local owner environment,
 /// so its readiness tests drive the starter against a real child process on
@@ -278,8 +278,9 @@ pub const SERVICE_STAND_IN_ENV: &str = "KURU_TEST_MEMORY_SERVICE_STAND_IN";
 /// The stand-in owner's whole life. It polls in its own fixture process,
 /// as `client_fixture_entry` does, every 10 ms of real time. A missing or
 /// not yet complete file is not a release. It consumes a release by
-/// removing the file and then exits at once, so its fixture can wait for
-/// that removal before the test ends: an instrumented stand-in that outlived
+/// renaming the fully read file to a sibling `.consumed` receipt and then
+/// exits at once, so its fixture can observe that positive receipt before
+/// the test ends: an instrumented stand-in that outlived
 /// its test would write its coverage profile after the partition's tests.
 /// The 120 s bound is only a backstop for a fixture that never releases it.
 #[cfg(feature = "test-support")]
@@ -289,7 +290,7 @@ async fn stand_in_owner(release: &Path) -> Result<()> {
         match std::fs::read_to_string(release) {
             Ok(text) => {
                 if let Ok(status) = text.trim().parse::<i32>() {
-                    std::fs::remove_file(release)
+                    std::fs::rename(release, release.with_extension("consumed"))
                         .context("consume memory service stand-in release")?;
                     std::process::exit(status);
                 }
@@ -4643,8 +4644,8 @@ mod tests {
             executable: PathBuf,
             release: PathBuf,
             tag: String,
-            /// Whether a release has been written; the first one decides.
-            released: Cell<bool>,
+            /// The first released status; subsequent releases cannot change it.
+            released: Cell<Option<i32>>,
         }
 
         impl StandInOwner {
@@ -4658,7 +4659,7 @@ mod tests {
                     release: root.path().join("release"),
                     executable: crate::store::test_supervisor()?,
                     tag: activity::activity_tag(&token),
-                    released: Cell::new(false),
+                    released: Cell::new(None),
                     root,
                     project,
                     data,
@@ -4669,12 +4670,13 @@ mod tests {
 
             /// Release the stand-in with `status`, staged and then renamed
             /// onto the release name so it never reads a partial file. Only
-            /// the first release is written: a stand-in that consumed it has
-            /// exited, and a second file would never be consumed.
+            /// the first release is written: a stand-in that consumed it is
+            /// exiting, and a second file would never be consumed.
             fn release(&self, status: i32) -> Result<()> {
-                if self.released.replace(true) {
+                if self.released.get().is_some() {
                     return Ok(());
                 }
+                self.released.set(Some(status));
                 let staged = self.root.path().join("release.staged");
                 std::fs::write(&staged, status.to_string())?;
                 std::fs::rename(&staged, &self.release)?;
@@ -4685,21 +4687,41 @@ mod tests {
                 Duration::from_secs(self.options.config.startup_timeout_secs)
             }
 
+            /// A positive receipt avoids probing a name the child removed,
+            /// which can be delete-pending on Windows. Only the exact first
+            /// status acknowledges this release; real I/O errors still fail.
+            fn has_consumed(&self) -> Result<bool> {
+                let receipt = self.release.with_extension("consumed");
+                let text = match std::fs::read_to_string(receipt) {
+                    Ok(text) => text,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => {
+                        return Err(error).context("read the stand-in owner's consumed receipt");
+                    }
+                };
+                let status = text
+                    .trim()
+                    .parse::<i32>()
+                    .context("parse the stand-in owner's consumed status")?;
+                ensure!(
+                    Some(status) == self.released.get(),
+                    "the stand-in owner's consumed status {status} differs from its first release {:?}",
+                    self.released.get()
+                );
+                Ok(true)
+            }
+
             /// Wait in real time, which the paused test clock does not
-            /// advance, until the stand-in has removed its release file. It
-            /// removes the file only to exit at once, so a test whose body
+            /// advance, until the stand-in acknowledges its release. It
+            /// publishes the receipt only to exit at once, so a test whose body
             /// finishes within one of its polls, as these virtual-time tests
             /// do, never removes the fixture directory first and leaves the
             /// stand-in polling a vanished release until its 120 s bound.
             fn consumed(&self) -> Result<()> {
                 let deadline = std::time::Instant::now() + CONSUME_BOUND;
                 loop {
-                    match std::fs::symlink_metadata(&self.release) {
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                        Err(error) => {
-                            return Err(error).context("inspect the stand-in owner's release");
-                        }
-                        Ok(_) => {}
+                    if self.has_consumed()? {
+                        return Ok(());
                     }
                     ensure!(
                         std::time::Instant::now() < deadline,
@@ -4713,8 +4735,9 @@ mod tests {
             /// after each failed poll, recording every failed poll's instant.
             /// The stand-in is released with status 0 whatever the outcome,
             /// before any result is examined, so no failing test leaves it;
-            /// once it was spawned, its release is consumed before this
-            /// returns, so it never outlives the test.
+            /// once it was spawned, consumption immediately before exit is
+            /// acknowledged before this returns. The existing retained child
+            /// reaper still observes process completion.
             async fn start(
                 &self,
                 missed: &Missed,
@@ -5140,13 +5163,55 @@ mod tests {
                 !missed.borrow().is_empty(),
                 "the starter never polled the stand-in"
             );
-            match std::fs::symlink_metadata(&fixture.release) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error).context("inspect the stand-in owner's release"),
-                Ok(_) => {
-                    bail!("the stand-in's release was still unconsumed when its start returned")
-                }
-            }
+            ensure!(
+                fixture.has_consumed()?,
+                "the stand-in's release was still unconsumed when its start returned"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn a_consumed_receipt_requires_the_first_released_status() -> Result<()> {
+            let fixture = StandInOwner::new(1)?;
+            fixture.release(3)?;
+            fixture.release(0)?;
+            ensure!(
+                std::fs::read_to_string(&fixture.release)? == "3",
+                "a later release replaced the first status"
+            );
+            ensure!(!fixture.has_consumed()?, "an absent receipt was consumed");
+            let receipt = fixture.release.with_extension("consumed");
+            std::fs::write(&receipt, "not-a-status")?;
+            ensure!(
+                fixture
+                    .has_consumed()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("parse"),
+                "a malformed receipt was accepted"
+            );
+            std::fs::write(&receipt, "0")?;
+            ensure!(
+                fixture
+                    .has_consumed()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("differs"),
+                "a different status acknowledged the first release"
+            );
+            std::fs::remove_file(&receipt)?;
+            std::fs::create_dir(&receipt)?;
+            ensure!(
+                fixture.has_consumed().is_err(),
+                "a receipt I/O error was hidden"
+            );
+            std::fs::remove_dir(&receipt)?;
+            std::fs::rename(&fixture.release, &receipt)?;
+            ensure!(
+                fixture.has_consumed()?,
+                "the exact consumed status was rejected"
+            );
+            Ok(())
         }
 
         /// A record its owner marks failing ends the wait at the poll that
