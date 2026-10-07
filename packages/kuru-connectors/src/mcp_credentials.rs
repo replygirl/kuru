@@ -711,6 +711,7 @@ impl<S: ItemStore> Vault<S> {
         self.store
             .delete(&self.manifest_account, committed.native_generation)
             .map_err(item_failure)
+            .context("delete MCP OAuth native manifest")
     }
 
     fn recover(&mut self) -> Result<Option<LoadedManifest>> {
@@ -773,7 +774,8 @@ impl<S: ItemStore> Vault<S> {
         let record = manifest_record(native_generation, &state)?;
         self.store
             .replace(&self.manifest_account, prior.native_generation, &record)
-            .map_err(item_failure)?;
+            .map_err(item_failure)
+            .context("transition MCP OAuth native manifest")?;
         Ok(LoadedManifest {
             native_generation,
             state,
@@ -826,14 +828,20 @@ impl<S: ItemStore> Vault<S> {
         let expected = native_secret_generation(descriptor.generation)?;
         for index in 0..descriptor.chunks {
             let account = chunk_account(self.account_seed, descriptor.generation, index);
-            if let Some(record) = self.store.get(&account).map_err(item_failure)? {
+            if let Some(record) = self
+                .store
+                .get(&account)
+                .map_err(item_failure)
+                .context("read retired MCP OAuth native chunk")?
+            {
                 ensure!(
                     record.generation() == expected,
                     "MCP OAuth retired chunk generation changed"
                 );
                 self.store
                     .delete(&account, expected)
-                    .map_err(item_failure)?;
+                    .map_err(item_failure)
+                    .context("delete retired MCP OAuth native chunk")?;
             }
         }
         Ok(())
@@ -1209,8 +1217,9 @@ mod tests {
                         .replace(prior.unwrap(), b"replacement-private-token".to_vec())
                         .map(|_| ()),
                 };
-                let diagnostic = result.unwrap_err().to_string();
-                assert_eq!(diagnostic, message);
+                let error = result.unwrap_err();
+                assert_eq!(error.root_cause().to_string(), message);
+                let diagnostic = format!("{error:#}");
                 assert!(!diagnostic.contains("private-token"));
                 assert!(items.records.lock().unwrap().as_slice() == before.as_slice());
                 *items.failure.lock().unwrap() = None;
