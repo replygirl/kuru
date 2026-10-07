@@ -69,12 +69,23 @@ async fn preferences_survive_reopening_without_resuming_chats_or_crossing_projec
         assert_eq!(preferences.mode, Some(Mode::Jungian));
         assert_eq!(preferences.providers["demo"].model, "future-demo");
         assert_eq!(preferences.providers["demo"].effort, None);
+        let refused = Harness::load_preferences(&memory, other.path())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("memory view belongs to a different canonical project"),
+            "foreign project preferences were not refused: {refused:#}"
+        );
+        let other_memory = MemoryStore::open(memory_options(state.path(), other.path()).await)
+            .await
+            .unwrap();
         assert_eq!(
-            Harness::load_preferences(&memory, other.path())
+            Harness::load_preferences(&other_memory, other.path())
                 .await
                 .unwrap(),
             ProjectPreferences::default()
         );
+        other_memory.close().await.unwrap();
         let startup = Config::load_with_preferences(
             None,
             project.path(),

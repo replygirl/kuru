@@ -178,7 +178,7 @@ async fn commit_snapshot(pool: &MemoryPool, working: bool) -> Result<()> {
     let (flags, message) = if working {
         ("-Am", "Preserve restored working snapshot")
     } else {
-        ("-m", "Preserve restored staged snapshot")
+        ("--message", "Preserve restored staged snapshot")
     };
     crate::pool::within(
         QUERY_TIMEOUT,
