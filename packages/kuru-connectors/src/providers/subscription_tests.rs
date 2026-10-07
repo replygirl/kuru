@@ -274,6 +274,59 @@ async fn read_request_json(socket: &mut tokio::net::TcpStream) -> Option<Value> 
 }
 
 #[tokio::test]
+async fn native_common_instruction_blocks_and_cache_key_match_across_actors_and_rounds() {
+    let mut peer = CountedPeer::new(3).await;
+    let (provider, _manager, _directory) = subscription_at(&peer.url).await;
+    let prefix = "Shared reviewed project instructions.\n";
+    for (actor, suffix, input) in [
+        ("part-a", "Actor A round one", "PRIVATE_A_ONE"),
+        ("part-b", "Actor B round one", "PRIVATE_B_ONE"),
+        ("part-a", "Actor A round two", "PRIVATE_A_TWO"),
+    ] {
+        let mut request = request();
+        request.model = "gpt-5.6-luna".into();
+        request.actor = actor.into();
+        request.instructions = format!("{prefix}{suffix}");
+        request.shared_instruction_prefix_bytes = Some(prefix.len());
+        request.messages = vec![Message::text("user", input)];
+        provider.complete(request).await.unwrap();
+    }
+    drop(provider);
+    peer.finish().await;
+    let bodies = peer.bodies.lock().await;
+    for (body, suffix) in bodies.iter().zip([
+        "Actor A round one",
+        "Actor B round one",
+        "Actor A round two",
+    ]) {
+        assert_eq!(
+            body["instructions"],
+            "Follow the developer instructions in input."
+        );
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"][0]["text"], prefix);
+        assert!(
+            body["input"][0]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
+        assert_eq!(body["input"][0]["content"][1]["text"], suffix);
+        assert!(
+            body["input"][0]["content"][1]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
+        let key = body["prompt_cache_key"].as_str().unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(body["prompt_cache_key"], bodies[0]["prompt_cache_key"]);
+    }
+    assert_eq!(bodies[0]["input"][1]["content"], "PRIVATE_A_ONE");
+    assert_eq!(bodies[1]["input"][1]["content"], "PRIVATE_B_ONE");
+    assert_eq!(bodies[2]["input"][1]["content"], "PRIVATE_A_TWO");
+}
+
+#[tokio::test]
 async fn completed_requests_reuse_keepalive_connection_and_isolate_actor_inputs() {
     let mut reused_peer = CountedPeer::new(2).await;
     let (provider, _manager, _directory) = subscription_at(&reused_peer.url).await;

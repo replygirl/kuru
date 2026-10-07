@@ -1,9 +1,4 @@
-# prompt-prefix-reuse Specification
-
-## Purpose
-Define which prompt material Kuru can place in a stable, shared leading segment across actor requests while preserving actor-private boundaries, and require provider-reported usage before claiming cached tokens or savings.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Shared stable prompt prefix
 
@@ -24,15 +19,3 @@ Kuru SHALL place genuinely shared, stable mode and reviewed project instructions
 #### Scenario: Native continuation
 - **WHEN** a part continues its native tool request
 - **THEN** the common developer prefix appears once and saved native output remains in that part's protocol continuation with valid sizing ranges.
-
-### Requirement: Evidence-based cache reporting
-
-Kuru SHALL base any cache-hit or cached-token claim on usage actually returned for that invocation, retaining a missing report distinct from an explicit zero. It MAY show matching request-prefix measurements as potential reuse, but SHALL NOT call such a match a cache hit or infer support for the Codex subscription route from direct-API documentation. Cost estimates SHALL continue to disclose unapplied cache-write pricing terms rather than treating them as zero.
-
-#### Scenario: Identical prefix without cached usage
-- **WHEN** consecutive requests have a matching common prefix but the provider reports no cached-input component
-- **THEN** Kuru may report the prefix match but does not report cached tokens or savings.
-
-#### Scenario: Observed cached tokens
-- **WHEN** a provider response reports cached-input tokens, including explicit zero
-- **THEN** the invocation and session accounting retain that observed value with its route and do not add it to total input a second time.

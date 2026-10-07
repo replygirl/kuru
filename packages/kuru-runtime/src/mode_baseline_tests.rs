@@ -460,6 +460,29 @@ async fn all_four_modes_keep_pre_extraction_requests_and_facing_outcomes() {
                 format!("{}/{mode}/identity/{}", harness.scope, ids[0])
             );
             assert_eq!(harness.history().await.unwrap().len(), 10);
+            let requests = provider.requests.lock().unwrap().clone();
+            let prefix = requests[0]
+                .instructions
+                .get(..requests[0].shared_instruction_prefix_bytes.unwrap())
+                .unwrap();
+            assert!(prefix.ends_with("Project instructions, outermost to most local:\n\n"));
+            for request in &requests {
+                let boundary = request
+                    .shared_instruction_prefix_bytes
+                    .expect("runtime common instruction boundary");
+                assert_eq!(request.instructions.get(..boundary).unwrap(), prefix);
+                assert!(
+                    !prefix.contains("Phase:")
+                        && !prefix.contains("Active peers:")
+                        && !prefix.contains("baseline cold")
+                );
+                let actor_instructions = &request.instructions[boundary..];
+                assert!(
+                    actor_instructions.contains("Phase:")
+                        && actor_instructions.contains("Active peers:")
+                );
+                assert!(actor_instructions.contains(request.actor.rsplit('/').next().unwrap()));
+            }
             harness.shutdown(false).await.unwrap();
             crate::tests::close_stores([harness.memory.clone()]).await;
         }

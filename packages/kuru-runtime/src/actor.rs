@@ -175,6 +175,7 @@ pub(crate) struct Work {
     pub turn_id: Option<String>,
     pub inputs: Vec<Message>,
     pub instructions: String,
+    pub shared_instruction_prefix_bytes: usize,
     pub public_input_override: Option<PublicInputOverride>,
     pub context_sources: Vec<ContextSource>,
     pub context_budget: ContextBudget,
@@ -1106,6 +1107,7 @@ fn ordinary_request(
         CompletionRequest {
             actor: namespace.into(),
             instructions,
+            shared_instruction_prefix_bytes: Some(work.shared_instruction_prefix_bytes),
             messages,
             current_message_count: Some(required.len()),
             context_budget: Some(work.context_budget.clone()),
