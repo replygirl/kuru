@@ -64,6 +64,128 @@ fn published_schema_accepts_defaults_and_documented_configuration() {
 }
 
 #[test]
+fn theme_configuration_has_schema_parity_layered_leaves_and_no_authority_claim() {
+    let validator = schema();
+    for text in [
+        "[ui]\ntheme='dark'",
+        "[ui]\ntheme='light'\n[ui.palette]\naccent='#0F766E'",
+        "[ui.palette]\ntext='#ffffff'",
+    ] {
+        let schema_valid = validator.is_valid(&json_from_toml(text));
+        let native_valid = parse_config(text).is_ok();
+        assert_eq!(schema_valid, native_valid, "theme parity: {text}");
+    }
+    for text in [
+        "[ui]\nunknown=true",
+        "[ui]\ntheme='solarized'",
+        "[ui.palette]\nunknown='#ffffff'",
+        "[ui.palette]\ntext='ffffff'",
+        "[ui.palette]\ntext='#fffffff'",
+    ] {
+        assert!(!validator.is_valid(&json_from_toml(text)), "schema: {text}");
+        assert!(parse_config(text).is_err(), "native: {text}");
+    }
+    let user_chosen = "[ui.palette]\ntext='#151b2a'";
+    assert!(validator.is_valid(&json_from_toml(user_chosen)));
+    assert!(parse_config(user_chosen).is_ok());
+
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let user = dir.path().join("user.toml");
+    let local = dir.path().join("local.toml");
+    write(&user, "[ui]\ntheme='light'\n[ui.palette]\naccent='#0f766e'");
+    write(project.join(".kuru/config.toml"), "[ui]\ntheme='dark'");
+    write(&local, "[ui.palette]\nsecondary='#c1a6f7'");
+    let config = Config::load(Some(&user), &project, Some(&local)).unwrap();
+    assert_eq!(config.ui.theme, kuru_core::UiThemeName::Dark);
+    assert_eq!(config.ui.palette["accent"], "#0f766e");
+    assert_eq!(config.ui.palette["secondary"], "#c1a6f7");
+
+    let managed = dir.path().join("managed.toml");
+    let managed_text = "[defaults.ui]\ntheme='light'\n[defaults.ui.palette]\nwarning='#c68820'";
+    write(&managed, managed_text);
+    assert!(managed_schema().is_valid(&json_from_toml(managed_text)));
+    let effective = ConfigSnapshot::parse_with_layers(
+        Some(&user),
+        &project,
+        None,
+        Some(&local),
+        Some(&managed),
+        InvocationOverrides {
+            typed_config: vec![
+                "ui.theme='light'".into(),
+                "ui.palette.error='#b91c1c'".into(),
+            ],
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    let projection = effective
+        .display_projection(
+            &kuru_core::ProjectPreferences::default(),
+            kuru_core::ConfigDisplayBounds::default(),
+        )
+        .unwrap();
+    let theme_leaf = projection
+        .rows
+        .iter()
+        .find(|row| row.path == "ui.theme")
+        .unwrap();
+    assert_eq!(theme_leaf.value, "light");
+    assert_eq!(theme_leaf.source, "command line");
+    let secondary_leaf = projection
+        .rows
+        .iter()
+        .find(|row| row.path == "ui.palette.secondary")
+        .unwrap();
+    let expected_source = local
+        .to_string_lossy()
+        .chars()
+        .flat_map(char::escape_default)
+        .take(160)
+        .collect::<String>();
+    assert_eq!(secondary_leaf.source, expected_source);
+    let effective = effective
+        .finalize(&kuru_core::ProjectPreferences::default())
+        .unwrap();
+    assert_eq!(effective.ui.theme, kuru_core::UiThemeName::Light);
+    assert_eq!(effective.ui.palette["warning"], "#c68820");
+    assert_eq!(effective.ui.palette["accent"], "#0f766e");
+    assert_eq!(effective.ui.palette["secondary"], "#c1a6f7");
+    assert_eq!(effective.ui.palette["error"], "#b91c1c");
+
+    write(&managed, "[constraints.ui]\ntheme='dark'\n");
+    assert!(managed_schema().is_valid(&json_from_toml("[constraints.ui]\ntheme='dark'")));
+    let constrained = ConfigSnapshot::parse_with_layers(
+        Some(&user),
+        &project,
+        None,
+        Some(&local),
+        Some(&managed),
+        InvocationOverrides {
+            typed_config: vec!["ui.theme='light'".into()],
+            ..InvocationOverrides::default()
+        },
+    );
+    assert!(
+        constrained.is_err(),
+        "typed theme bypassed managed constraint"
+    );
+
+    let before = ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default())
+        .unwrap()
+        .manifest()
+        .full_digest();
+    write(project.join(".kuru/config.toml"), "[ui]\ntheme='light'");
+    let after = ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default())
+        .unwrap()
+        .manifest()
+        .full_digest();
+    assert_eq!(before, after, "theme preference became workspace authority");
+}
+
+#[test]
 fn lifecycle_hook_schema_matches_native_parser_and_bounds() {
     let validator = schema();
     for (text, accepted) in [

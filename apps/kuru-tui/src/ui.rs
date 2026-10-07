@@ -24,7 +24,7 @@ use kuru_connectors::{
 };
 use kuru_core::{
     ConfigDisplayProjection, Mode, ModelInfo, NativeTool, PermissionSelector, Relationship,
-    SessionUsage, UsagePhase,
+    SessionUsage, UiConfig, UsagePhase,
 };
 use kuru_memory::{
     PublicTranscriptCursor, PublicTranscriptEntry, PublicTranscriptPage, SessionLifecycleState,
@@ -53,11 +53,14 @@ use crate::{
     memory_notice::MemoryNotice,
 };
 
+mod ansi16;
 mod composer;
 mod render;
 #[cfg(test)]
 mod runtime_tests;
 mod scene;
+pub(crate) mod theme;
+use theme::{Depth as ColorDepth, Theme};
 mod terminal_integration;
 mod tool_cards;
 mod transcript;
@@ -291,6 +294,7 @@ pub struct View {
     pub scroll: u16,
     pub frame: u64,
     pub motion: bool,
+    theme: Theme,
     pub part_activity: BTreeMap<String, String>,
     pub relationships: Vec<Relationship>,
     pub focus: Option<String>,
@@ -600,6 +604,7 @@ impl View {
             scroll: 0,
             frame: 0,
             motion,
+            theme: Theme::new(&UiConfig::default(), ColorDepth::Rgb),
             part_activity: BTreeMap::new(),
             relationships: runtime.relationships,
             focus: runtime.focus,
@@ -645,7 +650,11 @@ impl View {
             self.operation_ms = duration;
         }
         let interval = if self.busy { 80 } else { 250 };
-        if self.motion && self.focused && now.saturating_sub(self.last_frame_ms) >= interval {
+        if self.motion
+            && self.focused
+            && (self.busy || self.theme.depth() != ColorDepth::None)
+            && now.saturating_sub(self.last_frame_ms) >= interval
+        {
             self.frame = now / 80;
             self.last_frame_ms = now;
             return true;
@@ -2184,7 +2193,11 @@ pub(crate) async fn run_with_notice_commands_and_config(
         "interactive mode requires a terminal; use kuru run PROMPT"
     );
     let mut guard = TerminalSession::enter(&mut io::stdout())?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let color_depth = ColorDepth::from_environment();
+    let mut terminal = Terminal::new(CrosstermBackend::new(ansi16::Writer::new(
+        io::stdout(),
+        color_depth == ColorDepth::Ansi16,
+    )))?;
     let result = run_loop_with_stream_and_notice(
         &mut terminal,
         harness,
@@ -2193,7 +2206,8 @@ pub(crate) async fn run_with_notice_commands_and_config(
         notice,
         registry,
         config_projection,
-        terminal_integration::Signals::new(guard.title.supported(), true),
+        terminal_integration::Signals::new(guard.title.supported(), true)
+            .with_color_depth(color_depth),
     )
     .await;
     // Ratatui's Drop may show its cursor. Finish that while terminal output
@@ -2902,6 +2916,7 @@ where
     let mut public_source = crate::public_transcript::Source::capture(&harness);
     let mut view = View::from_initial(initial, models).with_command_registry(registry);
     view.config_projection = config_projection;
+    view.theme = Theme::new(&harness.config.ui, terminal_signals.color_depth);
     let permission_service = harness.permission_service();
     refresh_permission_state(&permission_service, &mut view)?;
     if let Some(notice) = &notice {
@@ -5093,6 +5108,179 @@ mod tests {
             };
             assert_eq!(grant_scope_label(&scope), expected);
         }
+    }
+
+    #[test]
+    fn theme_scene_draw_uses_its_own_view_palette_after_another_surface() {
+        let mut plain = fixture();
+        plain.theme = Theme::new(&UiConfig::default(), ColorDepth::None);
+        plain.motion = false;
+        let scene_buffer = |view: &View| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            terminal
+                .draw(|frame| scene::draw(frame, view, frame.area()))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let before = scene_buffer(&plain);
+        assert!(
+            before
+                .content
+                .iter()
+                .all(|cell| cell.fg == ratatui::style::Color::Reset
+                    && cell.bg == ratatui::style::Color::Reset)
+        );
+        let colored = fixture();
+        let _ = rendered(&colored);
+        assert_eq!(before, scene_buffer(&plain));
+    }
+
+    #[test]
+    fn theme_palettes_preserve_error_card_and_scene_text_at_practical_widths() {
+        let mut view = fixture();
+        view.motion = false;
+        view.status = "error · fixture tool failed".into();
+        view.input = "unsent 🧭 draft".into();
+        view.cursor = view.input.len();
+        view.transcript
+            .push(("user".into(), "theme card request".into()));
+        view.transcript
+            .bind_user("plain-session", "theme-card", "main");
+        view.refresh_tool_cards((vec![card_fixture("theme-card", 1)], 0));
+        for scene in [false, true] {
+            view.show_scene = scene;
+            for width in [80, 120] {
+                let mut baseline = None;
+                for (name, depth) in [
+                    (kuru_core::UiThemeName::Dark, ColorDepth::Rgb),
+                    (kuru_core::UiThemeName::Light, ColorDepth::Rgb),
+                    (kuru_core::UiThemeName::Dark, ColorDepth::Ansi256),
+                    (kuru_core::UiThemeName::Light, ColorDepth::Ansi16),
+                    (kuru_core::UiThemeName::Dark, ColorDepth::None),
+                ] {
+                    view.theme = Theme::new(
+                        &UiConfig {
+                            theme: name,
+                            ..UiConfig::default()
+                        },
+                        depth,
+                    );
+                    let mut terminal = Terminal::new(TestBackend::new(width, 35)).unwrap();
+                    terminal.draw(|frame| draw(frame, &view)).unwrap();
+                    let cursor = terminal.get_cursor_position().unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let text = buffer
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(text.contains("fixture tool failed"));
+                    assert!(text.contains("file_write"));
+                    assert!(text.contains("theme card request"));
+                    let projection = (text, (cursor.x, cursor.y));
+                    if let Some(expected) = &baseline {
+                        assert_eq!(
+                            &projection, expected,
+                            "{width} scene={scene} {name:?} {depth:?}"
+                        );
+                    } else {
+                        baseline = Some(projection);
+                    }
+                    for cell in &buffer.content {
+                        match depth {
+                            ColorDepth::None => assert_eq!(
+                                (cell.fg, cell.bg),
+                                (ratatui::style::Color::Reset, ratatui::style::Color::Reset)
+                            ),
+                            ColorDepth::Ansi16 | ColorDepth::Ansi256 => assert!(
+                                !matches!(cell.fg, ratatui::style::Color::Rgb(..))
+                                    && !matches!(cell.bg, ratatui::style::Color::Rgb(..))
+                            ),
+                            ColorDepth::Rgb => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn theme_modes_preserve_permission_text_draft_and_cursor_at_practical_widths() {
+        let mut view = fixture();
+        view.show_scene = false;
+        view.input = "unsent 🧭 draft".into();
+        view.cursor = view.input.len();
+        view.permission_prompt = Some(PermissionPrompt {
+            display: PermissionDisplay {
+                label: "shell".into(),
+                scope: "whole tool".into(),
+                preview: "read-only preview".into(),
+                rememberable: false,
+                remember_disabled_reason: Some("Once only".into()),
+            },
+            whole_tool: true,
+            scroll: 0,
+        });
+
+        for width in [80, 120] {
+            let mut baseline = None;
+            for (name, depth) in [
+                (kuru_core::UiThemeName::Dark, ColorDepth::Rgb),
+                (kuru_core::UiThemeName::Light, ColorDepth::Rgb),
+                (kuru_core::UiThemeName::Dark, ColorDepth::Ansi256),
+                (kuru_core::UiThemeName::Light, ColorDepth::Ansi16),
+                (kuru_core::UiThemeName::Dark, ColorDepth::None),
+            ] {
+                view.theme = Theme::new(
+                    &UiConfig {
+                        theme: name,
+                        ..UiConfig::default()
+                    },
+                    depth,
+                );
+                let mut terminal = Terminal::new(TestBackend::new(width, 35)).unwrap();
+                terminal.draw(|frame| draw(frame, &view)).unwrap();
+                let cursor = terminal.get_cursor_position().unwrap();
+                let buffer = terminal.backend().buffer();
+                let visible = buffer
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(visible.contains("Permission request"), "{name:?} {depth:?}");
+                assert!(visible.contains("1 once"), "{name:?} {depth:?}");
+                // The wide compass occupies a continuation cell in TestBackend.
+                let draft = visible.find("unsent").unwrap();
+                let compass = visible[draft..].find('🧭').unwrap() + draft;
+                assert!(visible[compass..].contains("draft"), "{name:?} {depth:?}");
+                let projection = (visible, (cursor.x, cursor.y));
+                if let Some(expected) = &baseline {
+                    assert_eq!(&projection, expected, "{width} columns {name:?} {depth:?}");
+                } else {
+                    baseline = Some(projection);
+                }
+                if depth == ColorDepth::None {
+                    assert!(buffer.content.iter().all(|cell| {
+                        cell.fg == ratatui::style::Color::Reset
+                            && cell.bg == ratatui::style::Color::Reset
+                    }));
+                } else {
+                    assert!(
+                        buffer
+                            .content
+                            .iter()
+                            .any(|cell| cell.fg != ratatui::style::Color::Reset)
+                    );
+                }
+            }
+        }
+
+        view.permission_prompt = None;
+        view.theme = Theme::new(&UiConfig::default(), ColorDepth::None);
+        view.motion = true;
+        view.focused = true;
+        assert!(!view.advance_animation(Duration::from_millis(500)));
+        assert_eq!(view.frame, 0, "idle no-colour scene ticked decoratively");
     }
 
     #[test]

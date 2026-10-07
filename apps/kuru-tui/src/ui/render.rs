@@ -6,27 +6,28 @@ use kuru_core::{FactProvenance, RelationshipKind, UsagePhase};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{Picker, View, editor_layout, scene};
+use super::{Picker, View, editor_layout, scene, theme};
+use theme::{Role, Theme};
 
-const INK: Color = Color::Rgb(15, 19, 30);
-const SURFACE: Color = Color::Rgb(21, 27, 42);
-const RAISED: Color = Color::Rgb(30, 38, 57);
-const EDGE: Color = Color::Rgb(57, 69, 92);
-const TEXT: Color = Color::Rgb(222, 231, 244);
-const MUTED: Color = Color::Rgb(145, 161, 184);
-const MINT: Color = Color::Rgb(131, 231, 199);
-const LILAC: Color = Color::Rgb(193, 166, 247);
-const AMBER: Color = Color::Rgb(241, 200, 129);
-const BLUE: Color = Color::Rgb(135, 191, 250);
-const ROSE: Color = Color::Rgb(242, 149, 173);
-const PALETTE: [Color; 6] = [MINT, BLUE, LILAC, ROSE, AMBER, LILAC];
+const INK: Role = Role::Background;
+const SURFACE: Role = Role::Surface;
+const RAISED: Role = Role::Raised;
+const EDGE: Role = Role::Border;
+const TEXT: Role = Role::Text;
+const MUTED: Role = Role::Muted;
+const MINT: Role = Role::Accent;
+const LILAC: Role = Role::Secondary;
+const AMBER: Role = Role::Warning;
+const BLUE: Role = Role::Info;
+const ROSE: Role = Role::Error;
+const PALETTE: [Role; 6] = [MINT, BLUE, LILAC, ROSE, AMBER, LILAC];
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 struct CardLayout {
@@ -67,8 +68,8 @@ thread_local! {
     static TRANSCRIPT: RefCell<TranscriptCache> = RefCell::default();
 }
 
-fn style(color: Color) -> Style {
-    Style::default().fg(color)
+fn style(theme: &Theme, color: Role) -> Style {
+    theme.foreground(Style::default(), color)
 }
 
 fn update_transcript_cache(cache: &mut TranscriptCache, view: &View, width: u16) {
@@ -131,17 +132,21 @@ fn update_transcript_cache(cache: &mut TranscriptCache, view: &View, width: u16)
     }
 }
 
-fn bold(color: Color) -> Style {
-    style(color).add_modifier(Modifier::BOLD)
+fn bg(theme: &Theme, style: Style, color: Role) -> Style {
+    theme.background(style, color)
 }
 
-fn panel(title: impl Into<Line<'static>>, color: Color) -> Block<'static> {
+fn bold(theme: &Theme, color: Role) -> Style {
+    style(theme, color).add_modifier(Modifier::BOLD)
+}
+
+fn panel(theme: &Theme, title: impl Into<Line<'static>>, color: Role) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(style(EDGE))
-        .style(style(TEXT).bg(SURFACE))
-        .title(title.into().style(bold(color)))
+        .border_style(style(theme, EDGE))
+        .style(bg(theme, style(theme, TEXT), SURFACE))
+        .title(title.into().style(bold(theme, color)))
 }
 
 fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
@@ -182,7 +187,7 @@ fn short_name(view: &View, id: &str) -> String {
         .unwrap_or_else(|| id.chars().take(8).collect())
 }
 
-fn identity_color(label: &str) -> Color {
+fn identity_color(label: &str) -> Role {
     let role = label.rsplit(" · ").next().unwrap_or(label);
     match role {
         "self" | "ego" | "ventral" | "ventral_vagal" => MINT,
@@ -193,7 +198,7 @@ fn identity_color(label: &str) -> Color {
     }
 }
 
-fn relationship_color(kind: RelationshipKind) -> Color {
+fn relationship_color(kind: RelationshipKind) -> Role {
     match kind {
         RelationshipKind::Protection => BLUE,
         RelationshipKind::Polarization => AMBER,
@@ -215,8 +220,12 @@ fn spinner(view: &View) -> &'static str {
 
 /// Draw from presentation state only; no timers, random values or runtime work.
 pub fn draw(frame: &mut Frame<'_>, view: &View) {
+    let theme = &view.theme;
     let area = frame.area();
-    frame.render_widget(Block::default().style(style(TEXT).bg(INK)), area);
+    frame.render_widget(
+        Block::default().style(bg(theme, style(theme, TEXT), INK)),
+        area,
+    );
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -413,6 +422,7 @@ pub(super) fn clamp_scroll(view: &mut View, size: Rect) {
 }
 
 fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     let Some(preview) = &view.preview else { return };
     if area.width < 4 || area.height < 3 {
         return;
@@ -433,7 +443,7 @@ fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
                 &format!("{prefix}{}", safe_preview_line(&preview.summary_tail)),
                 inner.width as usize,
             ),
-            style(LILAC),
+            style(theme, LILAC),
         )));
     }
     // A dispatched tool call carries its raw catalog name; while its arguments
@@ -463,7 +473,7 @@ fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
                 &format!("{prefix}{}", safe_preview_line(&activity)),
                 inner.width as usize,
             ),
-            style(MUTED),
+            style(theme, MUTED),
         )));
     }
     let info_height = (info.len() as u16).min(inner.height.saturating_sub(1));
@@ -472,13 +482,13 @@ fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let text = if preview.text_tail.is_empty() {
         vec![Line::from(Span::styled(
             "Waiting for the selected voice…",
-            style(MUTED),
+            style(theme, MUTED),
         ))]
     } else {
         preview
             .text_tail
             .lines()
-            .map(|line| Line::from(Span::styled(safe_preview(line), style(TEXT))))
+            .map(|line| Line::from(Span::styled(safe_preview(line), style(theme, TEXT))))
             .collect()
     };
     let wrapped = wrap_lines(text, inner.width as usize);
@@ -487,7 +497,7 @@ fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
     } else {
         " draft · provisional "
     };
-    frame.render_widget(panel(title, MINT), area);
+    frame.render_widget(panel(theme, title, MINT), area);
     let visible = wrapped
         .into_iter()
         .rev()
@@ -549,17 +559,18 @@ fn draw_tiny(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn draw_header(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     let mut spans = vec![Span::raw("  ")];
     spans.extend(
         "KURU"
             .chars()
             .enumerate()
-            .map(|(i, c)| Span::styled(c.to_string(), bold(PALETTE[i]))),
+            .map(|(i, c)| Span::styled(c.to_string(), bold(theme, PALETTE[i]))),
     );
-    spans.push(Span::styled("  /  ", style(EDGE)));
+    spans.push(Span::styled("  /  ", style(theme, EDGE)));
     spans.push(Span::styled(
         clipped(&view.project, usize::from(area.width.saturating_sub(38))),
-        style(MUTED),
+        style(theme, MUTED),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     if area.width >= 62 {
@@ -570,13 +581,14 @@ fn draw_header(frame: &mut Frame<'_>, view: &View, area: Rect) {
         );
         let width = label.width() as u16;
         frame.render_widget(
-            Paragraph::new(label).style(style(MUTED)),
+            Paragraph::new(label).style(style(theme, MUTED)),
             Rect::new(area.right().saturating_sub(width), area.y, width, 1),
         );
     }
 }
 
 fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -647,8 +659,11 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
             search.status
         );
         frame.render_widget(
-            Paragraph::new(clipped(&label, usize::from(area.width)))
-                .style(style(AMBER).bg(SURFACE)),
+            Paragraph::new(clipped(&label, usize::from(area.width))).style(bg(
+                theme,
+                style(theme, AMBER),
+                SURFACE,
+            )),
             Rect::new(area.x, area.y, area.width, 1),
         );
     } else if view.transcript.omitted_records() > 0 || view.transcript.local_omitted > 0 {
@@ -658,14 +673,21 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
             view.transcript.local_omitted
         );
         frame.render_widget(
-            Paragraph::new(clipped(&label, usize::from(area.width)))
-                .style(style(MUTED).bg(SURFACE)),
+            Paragraph::new(clipped(&label, usize::from(area.width))).style(bg(
+                theme,
+                style(theme, MUTED),
+                SURFACE,
+            )),
             Rect::new(area.x, area.y, area.width, 1),
         );
     }
     if view.scroll > 0 && area.width > 28 {
         frame.render_widget(
-            Paragraph::new(" ↑ history · PgDn to return ").style(style(AMBER).bg(SURFACE)),
+            Paragraph::new(" ↑ history · PgDn to return ").style(bg(
+                theme,
+                style(theme, AMBER),
+                SURFACE,
+            )),
             Rect::new(area.right() - 28, area.y, 26, 1),
         );
     }
@@ -748,6 +770,7 @@ fn visit_item_rows_with_source_at(
     remembered: &mut Option<BodyResume>,
     mut visit: impl FnMut(Line<'static>, Option<(usize, usize)>),
 ) {
+    let theme = &view.theme;
     let (speaker, body) = &view.transcript[index];
     let source_line = std::cell::Cell::new(None);
     let window = RowWindow {
@@ -778,8 +801,8 @@ fn visit_item_rows_with_source_at(
     let label = if speaker == "user" { "you" } else { speaker };
     if resume.is_none() {
         emit(Line::from(vec![
-            Span::styled("● ", style(color)),
-            Span::styled(label, bold(color)),
+            Span::styled("● ", style(theme, color)),
+            Span::styled(label, bold(theme, color)),
         ]));
     }
     if window.done() {
@@ -806,27 +829,28 @@ fn visit_item_rows_with_source_at(
             code = !code;
             emit(if code {
                 Line::from(vec![
-                    Span::styled("  ┌─ ", style(MUTED)),
+                    Span::styled("  ┌─ ", style(theme, MUTED)),
                     Span::styled(
                         if language.is_empty() {
                             "code"
                         } else {
                             language
                         },
-                        style(MUTED),
+                        style(theme, MUTED),
                     ),
                 ])
             } else {
-                Line::from(Span::styled("  └─", style(MUTED)))
+                Line::from(Span::styled("  └─", style(theme, MUTED)))
             });
         } else if code {
             emit(Line::from(vec![
-                Span::styled("  │ ", style(EDGE)),
-                Span::styled(line, style(AMBER).bg(RAISED)),
+                Span::styled("  │ ", style(theme, EDGE)),
+                Span::styled(line, bg(theme, style(theme, AMBER), RAISED)),
             ]));
         } else if let Some(quote) = line.strip_prefix("> ") {
             emit_inline(
-                Line::from(Span::styled("  ▎ ", style(LILAC))),
+                theme,
+                Line::from(Span::styled("  ▎ ", style(theme, LILAC))),
                 quote,
                 MUTED,
                 width,
@@ -838,18 +862,22 @@ fn visit_item_rows_with_source_at(
         } else if line.starts_with('#') && line.trim_start_matches('#').starts_with(' ') {
             emit(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(line.trim_start_matches('#').trim_start(), bold(LILAC)),
+                Span::styled(
+                    line.trim_start_matches('#').trim_start(),
+                    bold(theme, LILAC),
+                ),
             ]));
         } else {
             let mut prefix = vec![Span::raw("  ")];
             let text =
                 if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-                    prefix.push(Span::styled("• ", style(MINT)));
+                    prefix.push(Span::styled("• ", style(theme, MINT)));
                     item
                 } else {
                     line
                 };
             emit_inline(
+                theme,
                 Line::from(prefix),
                 text,
                 TEXT,
@@ -873,7 +901,7 @@ fn visit_item_rows_with_source_at(
     {
         detail.push(Line::from(Span::styled(
             format!("  {metadata}"),
-            style(MUTED),
+            style(theme, MUTED),
         )));
     }
     for card in view
@@ -897,7 +925,7 @@ fn visit_item_rows_with_source_at(
         };
         emit(Line::from(Span::styled(
             format!("Tool cards · F6 select · F7 expand/collapse{omitted}"),
-            style(MUTED),
+            style(theme, MUTED),
         )));
     }
 }
@@ -1028,9 +1056,10 @@ fn emit_units<'a>(
     reason = "private logical-row formatter carries only source/layout facts and the row visitor"
 )]
 fn emit_inline(
+    theme: &Theme,
     prefix: Line<'_>,
     text: &str,
-    color: Color,
+    color: Role,
     width: usize,
     body: &str,
     fallback: Option<(usize, usize)>,
@@ -1048,9 +1077,13 @@ fn emit_inline(
         }
         let marker = remaining
             .find('`')
-            .map(|index| (index, "`", style(AMBER).bg(RAISED)))
+            .map(|index| (index, "`", bg(theme, style(theme, AMBER), RAISED)))
             .into_iter()
-            .chain(remaining.find("**").map(|index| (index, "**", bold(color))))
+            .chain(
+                remaining
+                    .find("**")
+                    .map(|index| (index, "**", bold(theme, color))),
+            )
             .min_by_key(|(index, _, _)| *index);
         if let Some((start, delimiter, selected)) = marker {
             let after = &remaining[start + delimiter.len()..];
@@ -1062,10 +1095,10 @@ fn emit_inline(
                     return Some((selected_text, selected));
                 }
                 pending = Some((selected_text, selected));
-                return Some((before, style(color)));
+                return Some((before, style(theme, color)));
             }
         }
-        let result = Some((remaining, style(color)));
+        let result = Some((remaining, style(theme, color)));
         remaining = "";
         result
     });
@@ -1099,17 +1132,23 @@ fn emit_inline(
     );
 }
 
-fn card_detail(lines: &mut Vec<Line<'static>>, text: &str, limit: usize, color: Color) {
+fn card_detail(
+    theme: &Theme,
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    limit: usize,
+    color: Role,
+) {
     let safe = super::tool_cards::safe(text);
     lines.extend(
         safe.lines()
             .take(limit)
-            .map(|line| Line::from(Span::styled(format!("    {line}"), style(color)))),
+            .map(|line| Line::from(Span::styled(format!("    {line}"), style(theme, color)))),
     );
     if safe.lines().count() > limit {
         lines.push(Line::from(Span::styled(
             "    [remaining lines omitted in this view]",
-            style(AMBER),
+            style(theme, AMBER),
         )));
     }
 }
@@ -1119,6 +1158,7 @@ fn draw_card_lines(
     card: &super::tool_cards::CardView,
     lines: &mut Vec<Line<'static>>,
 ) {
+    let theme = &view.theme;
     use kuru_runtime::{ToolCardState, ToolOutcome};
     let (state, color) = match card.card.state {
         ToolCardState::Pending => ("Pending", AMBER),
@@ -1130,15 +1170,15 @@ fn draw_card_lines(
     };
     let selected = view.selected_tool_card.as_deref() == Some(card.card.id.as_str());
     lines.push(Line::from(vec![
-        Span::styled(if selected { "  ▸ " } else { "  ▹ " }, style(color)),
-        Span::styled(super::tool_cards::safe(&card.card.name), bold(color)),
+        Span::styled(if selected { "  ▸ " } else { "  ▹ " }, style(theme, color)),
+        Span::styled(super::tool_cards::safe(&card.card.name), bold(theme, color)),
         Span::styled(
             format!(
                 " · #{} · {} · {state}",
                 card.card.ordinal,
                 super::tool_cards::safe(&short_name(view, &card.card.actor_id))
             ),
-            style(MUTED),
+            style(theme, MUTED),
         ),
     ]));
     if !card.expanded {
@@ -1146,6 +1186,7 @@ fn draw_card_lines(
     }
     if card.card.source_view != "main" {
         card_detail(
+            theme,
             lines,
             &format!("Candidate view: {}", card.card.source_view),
             1,
@@ -1153,16 +1194,17 @@ fn draw_card_lines(
         );
     }
     if card.card.private_content {
-        card_detail(lines, "Arguments and result withheld", 1, MUTED);
+        card_detail(theme, lines, "Arguments and result withheld", 1, MUTED);
         return;
     }
     if let Some(arguments) = &card.card.arguments {
-        card_detail(lines, &format!("Arguments: {arguments}"), 8, MUTED);
+        card_detail(theme, lines, &format!("Arguments: {arguments}"), 8, MUTED);
     }
     if let Some(output) = &card.card.output {
-        card_detail(lines, output, 48, TEXT);
+        card_detail(theme, lines, output, 48, TEXT);
     } else {
         card_detail(
+            theme,
             lines,
             if card.card.state == ToolCardState::Pending {
                 "Settled result not available yet"
@@ -1174,15 +1216,16 @@ fn draw_card_lines(
         );
     }
     if !card.stdout.is_empty() {
-        card_detail(lines, "stdout (partial)", 1, MUTED);
-        card_detail(lines, &card.stdout, 24, TEXT);
+        card_detail(theme, lines, "stdout (partial)", 1, MUTED);
+        card_detail(theme, lines, &card.stdout, 24, TEXT);
     }
     if !card.stderr.is_empty() {
-        card_detail(lines, "stderr (partial)", 1, MUTED);
-        card_detail(lines, &card.stderr, 24, AMBER);
+        card_detail(theme, lines, "stderr (partial)", 1, MUTED);
+        card_detail(theme, lines, &card.stderr, 24, AMBER);
     }
     if card.gap {
         card_detail(
+            theme,
             lines,
             "Partial preview truncated or updates omitted; settled result is authoritative",
             2,
@@ -1190,17 +1233,18 @@ fn draw_card_lines(
         );
     }
     if let Some(diff) = &card.diff {
-        card_detail(lines, "checked recorded file diff", 1, MUTED);
+        card_detail(theme, lines, "checked recorded file diff", 1, MUTED);
         match diff {
             kuru_connectors::CheckpointDiff::Available { text, .. } => {
-                card_detail(lines, text, 64, TEXT)
+                card_detail(theme, lines, text, 64, TEXT)
             }
             kuru_connectors::CheckpointDiff::Unavailable { reason } => {
-                card_detail(lines, reason, 2, AMBER)
+                card_detail(theme, lines, reason, 2, AMBER)
             }
         }
     } else if card.card.checkpoint_id.is_some() {
         card_detail(
+            theme,
             lines,
             "Checked file diff available after this operation settles",
             2,
@@ -1210,27 +1254,34 @@ fn draw_card_lines(
 }
 
 #[cfg(test)]
-fn inline_spans(text: &str, color: Color) -> Vec<Span<'static>> {
+fn inline_spans(theme: &Theme, text: &str, color: Role) -> Vec<Span<'static>> {
     let mut spans = vec![];
     let mut remaining = text;
     while !remaining.is_empty() {
         let marker = remaining
             .find('`')
-            .map(|index| (index, "`", style(AMBER).bg(RAISED)))
+            .map(|index| (index, "`", bg(theme, style(theme, AMBER), RAISED)))
             .into_iter()
-            .chain(remaining.find("**").map(|index| (index, "**", bold(color))))
+            .chain(
+                remaining
+                    .find("**")
+                    .map(|index| (index, "**", bold(theme, color))),
+            )
             .min_by_key(|(index, _, _)| *index);
         let Some((start, delimiter, selected)) = marker else {
-            spans.push(Span::styled(remaining.to_owned(), style(color)));
+            spans.push(Span::styled(remaining.to_owned(), style(theme, color)));
             break;
         };
         let after = &remaining[start + delimiter.len()..];
         let Some(end) = after.find(delimiter) else {
-            spans.push(Span::styled(remaining.to_owned(), style(color)));
+            spans.push(Span::styled(remaining.to_owned(), style(theme, color)));
             break;
         };
         if start > 0 {
-            spans.push(Span::styled(remaining[..start].to_owned(), style(color)));
+            spans.push(Span::styled(
+                remaining[..start].to_owned(),
+                style(theme, color),
+            ));
         }
         spans.push(Span::styled(after[..end].to_owned(), selected));
         remaining = &after[end + delimiter.len()..];
@@ -1295,6 +1346,7 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
 }
 
 fn draw_welcome(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1331,7 +1383,7 @@ fn draw_welcome(frame: &mut Frame<'_>, view: &View, area: Rect) {
                             } else {
                                 AMBER
                             };
-                            Span::styled(c.to_string(), bold(color))
+                            Span::styled(c.to_string(), bold(theme, color))
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -1341,23 +1393,29 @@ fn draw_welcome(frame: &mut Frame<'_>, view: &View, area: Rect) {
         lines.push(Line::default());
     }
     lines.push(
-        Line::from(Span::styled("Many voices. One conversation.", style(TEXT)))
-            .alignment(Alignment::Center),
+        Line::from(Span::styled(
+            "Many voices. One conversation.",
+            style(theme, TEXT),
+        ))
+        .alignment(Alignment::Center),
     );
     lines.push(Line::default());
     lines.push(
         Line::from(vec![
             Span::styled(
                 format!("{}  {}", identity.symbol, identity.title),
-                bold(identity.accent),
+                bold(theme, identity.accent),
             ),
-            Span::styled(format!("  /  {} parts", view.parts.len()), style(MUTED)),
+            Span::styled(
+                format!("  /  {} parts", view.parts.len()),
+                style(theme, MUTED),
+            ),
         ])
         .alignment(Alignment::Center),
     );
     if body.width >= 48 {
         lines.push(
-            Line::from(Span::styled(identity.description, style(MUTED)))
+            Line::from(Span::styled(identity.description, style(theme, MUTED)))
                 .alignment(Alignment::Center),
         );
     }
@@ -1377,10 +1435,11 @@ fn draw_welcome(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     let block = Block::default()
         .borders(Borders::LEFT)
-        .border_style(style(EDGE))
-        .style(style(TEXT).bg(INK));
+        .border_style(style(theme, EDGE))
+        .style(bg(theme, style(theme, TEXT), INK));
     let mut inner = inset(block.inner(area), 2, 0);
     frame.render_widget(block, area);
     let numbered = inner.height >= 26 && !view.parts.is_empty();
@@ -1391,7 +1450,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let mut lines = vec![
         Line::from(Span::styled(
             format!("PARTS / {}", view.parts.len()),
-            style(MUTED),
+            style(theme, MUTED),
         )),
         Line::default(),
     ];
@@ -1425,27 +1484,30 @@ fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
         let name = clipped(&name, label_width);
         let spacing = label_width.saturating_sub(name.width()) + 1;
         lines.push(Line::from(vec![
-            Span::styled(prefix, style(state_color)),
-            Span::styled(name, bold(identity_color(label))),
+            Span::styled(prefix, style(theme, state_color)),
+            Span::styled(name, bold(theme, identity_color(label))),
             Span::raw(" ".repeat(spacing)),
-            Span::styled(state, style(state_color)),
+            Span::styled(state, style(theme, state_color)),
         ]));
         if detailed {
             lines.push(Line::from(Span::styled(
                 format!("  {}", label.rsplit(" · ").next().unwrap_or(label)),
-                style(MUTED),
+                style(theme, MUTED),
             )));
         }
     }
     if view.parts.len() > limit {
         lines.push(Line::from(Span::styled(
             format!("+{} more · /parts", view.parts.len() - limit),
-            style(MUTED),
+            style(theme, MUTED),
         )));
     }
     if !view.relationships.is_empty() {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("Relationships", bold(LILAC))));
+        lines.push(Line::from(Span::styled(
+            "Relationships",
+            bold(theme, LILAC),
+        )));
         for relationship in &view.relationships {
             if lines.len() + 2 > usize::from(inner.height) {
                 break;
@@ -1467,7 +1529,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
                         ""
                     }
                 ),
-                style(relationship_color(relationship.kind)),
+                style(theme, relationship_color(relationship.kind)),
             )));
             lines.push(Line::from(Span::styled(
                 relationship
@@ -1476,31 +1538,34 @@ fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
                     .map(|id| short_name(view, id))
                     .collect::<Vec<_>>()
                     .join(" + "),
-                style(TEXT),
+                style(theme, TEXT),
             )));
         }
     }
     if !view.routes.is_empty() && lines.len() + 3 <= usize::from(inner.height) {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("Peer exchange", bold(BLUE))));
+        lines.push(Line::from(Span::styled("Peer exchange", bold(theme, BLUE))));
         for (from, to) in view.routes.iter().rev().take(2) {
             lines.push(Line::from(Span::styled(
                 format!("{} → {}", short_name(view, from), short_name(view, to)),
-                style(MUTED),
+                style(theme, MUTED),
             )));
         }
     }
     if lines.len() + 3 <= usize::from(inner.height) {
         lines.push(Line::default());
-        lines.push(Line::from(Span::styled("Activity", bold(AMBER))));
+        lines.push(Line::from(Span::styled("Activity", bold(theme, AMBER))));
         let available = usize::from(inner.height).saturating_sub(lines.len());
         if view.activity.is_empty() {
-            lines.push(Line::from(Span::styled("No activity yet.", style(MUTED))));
+            lines.push(Line::from(Span::styled(
+                "No activity yet.",
+                style(theme, MUTED),
+            )));
         } else {
             lines.extend(view.activity.iter().rev().take(available).map(|text| {
                 Line::from(Span::styled(
                     clipped(text, usize::from(inner.width)),
-                    style(MUTED),
+                    style(theme, MUTED),
                 ))
             }));
         }
@@ -1509,12 +1574,13 @@ fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn dock_controls(view: &View, width: u16) -> Vec<Line<'static>> {
+    let theme = &view.theme;
     let identity = scene::identity(&view.mode);
-    let chip = |symbol: &str, value: String, key: &str, color: Color| {
+    let chip = |symbol: &str, value: String, key: &str, color: Role| {
         vec![
-            Span::styled(format!("{symbol} "), style(color)),
-            Span::styled(value, bold(color)),
-            Span::styled(format!(" {key}  "), style(MUTED)),
+            Span::styled(format!("{symbol} "), style(theme, color)),
+            Span::styled(value, bold(theme, color)),
+            Span::styled(format!(" {key}  "), style(theme, MUTED)),
         ]
     };
     let effort_budget = if width >= 68 {
@@ -1552,7 +1618,7 @@ fn dock_controls(view: &View, width: u16) -> Vec<Line<'static>> {
     };
     rows.push(Line::from(Span::styled(
         clipped(&dock_meters(view, width), usize::from(width)),
-        style(AMBER),
+        style(theme, AMBER),
     )));
     rows.push(Line::from(Span::styled(
         clipped(
@@ -1562,7 +1628,7 @@ fn dock_controls(view: &View, width: u16) -> Vec<Line<'static>> {
             ),
             usize::from(width),
         ),
-        style(MINT),
+        style(theme, MINT),
     )));
     rows
 }
@@ -1646,6 +1712,7 @@ fn dock_meters(view: &View, width: u16) -> String {
 }
 
 fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     let Some(prompt) = &view.permission_prompt else {
         return;
     };
@@ -1658,8 +1725,8 @@ fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
     } else {
         "Permission request · Once only"
     };
-    let inner = panel(title, AMBER).inner(area);
-    frame.render_widget(panel(title, AMBER), area);
+    let inner = panel(theme, title, AMBER).inner(area);
+    frame.render_widget(panel(theme, title, AMBER), area);
     if inner.height < 3 {
         return;
     }
@@ -1689,7 +1756,7 @@ fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
             .as_deref()
             .unwrap_or("Exact grant scope is unavailable.");
         frame.render_widget(
-            Paragraph::new(clipped(reason, usize::from(inner.width))).style(style(ROSE)),
+            Paragraph::new(clipped(reason, usize::from(inner.width))).style(style(theme, ROSE)),
             Rect::new(inner.x, body.bottom(), inner.width, reason_height),
         );
     }
@@ -1705,7 +1772,7 @@ fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
         "1 once · 4 deny  (Alt+digit)\nSession/Always unavailable"
     };
     frame.render_widget(
-        Paragraph::new(choices).style(bold(AMBER)),
+        Paragraph::new(choices).style(bold(theme, AMBER)),
         Rect::new(
             inner.x,
             inner.bottom().saturating_sub(choices_height),
@@ -1716,6 +1783,7 @@ fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn draw_instruction_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     let Some(prompt) = &view.instruction_prompt else {
         return;
     };
@@ -1724,8 +1792,8 @@ fn draw_instruction_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
     }
     frame.render_widget(Clear, area);
     let title = "Workspace instruction review · ↑↓ claims";
-    let inner = panel(title, AMBER).inner(area);
-    frame.render_widget(panel(title, AMBER), area);
+    let inner = panel(theme, title, AMBER).inner(area);
+    frame.render_widget(panel(theme, title, AMBER), area);
     if inner.height < 2 {
         return;
     }
@@ -1752,7 +1820,7 @@ fn draw_instruction_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
         "1 continue once · 2 approve complete manifest\n3 deny"
     };
     frame.render_widget(
-        Paragraph::new(choices).style(bold(AMBER)),
+        Paragraph::new(choices).style(bold(theme, AMBER)),
         Rect::new(
             inner.x,
             inner.bottom().saturating_sub(choices_height),
@@ -1763,6 +1831,7 @@ fn draw_instruction_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn draw_permission_inspector(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     let Some(rows) = &view.permission_rows else {
         return;
     };
@@ -1771,8 +1840,8 @@ fn draw_permission_inspector(frame: &mut Frame<'_>, view: &View, area: Rect) {
     }
     frame.render_widget(Clear, area);
     let title = "Permissions · ↑↓ select · PgUp/PgDn detail · Delete revoke · Esc close";
-    let inner = panel(title, MINT).inner(area);
-    frame.render_widget(panel(title, MINT), area);
+    let inner = panel(theme, title, MINT).inner(area);
+    frame.render_widget(panel(theme, title, MINT), area);
     if inner.height == 0 {
         return;
     }
@@ -1799,7 +1868,7 @@ fn draw_permission_inspector(frame: &mut Frame<'_>, view: &View, area: Rect) {
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(view.permission_selected));
     frame.render_stateful_widget(
-        List::new(items).highlight_style(bold(AMBER)),
+        List::new(items).highlight_style(bold(theme, AMBER)),
         list_area,
         &mut state,
     );
@@ -1812,13 +1881,14 @@ fn draw_permission_inspector(frame: &mut Frame<'_>, view: &View, area: Rect) {
             Paragraph::new(detail)
                 .wrap(Wrap { trim: false })
                 .scroll((view.permission_detail_scroll, 0))
-                .style(style(TEXT)),
+                .style(style(theme, TEXT)),
             Rect::new(inner.x, list_area.bottom(), inner.width, detail_height),
         );
     }
 }
 
 fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     if area.height == 0 {
         return;
     }
@@ -1946,21 +2016,25 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
         )
     };
     let text = Line::from(vec![
-        Span::styled(format!("  {glyph} "), style(color)),
+        Span::styled(format!("  {glyph} "), style(theme, color)),
         Span::styled(
             clipped(&label, usize::from(area.width.saturating_sub(6))),
-            style(if error { ROSE } else { MUTED }),
+            style(theme, if error { ROSE } else { MUTED }),
         ),
     ]);
     frame.render_widget(Paragraph::new(text), area);
 }
 
 fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     if area.height == 0 || area.width == 0 {
         return;
     }
     let accent = scene::identity(&view.mode).accent;
-    frame.render_widget(Block::default().style(style(TEXT).bg(SURFACE)), area);
+    frame.render_widget(
+        Block::default().style(bg(theme, style(theme, TEXT), SURFACE)),
+        area,
+    );
     let inner = inset(area, u16::from(area.width >= 8) * 2, 0);
     let controls = dock_controls(view, inner.width);
     let control_height = (controls.len() as u16).min(inner.height.saturating_sub(1));
@@ -1979,7 +2053,7 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
     );
     let line = Line::from(
         (0..area.width)
-            .map(|x| Span::styled(if x % 5 == 0 { "." } else { " " }, style(EDGE)))
+            .map(|x| Span::styled(if x % 5 == 0 { "." } else { " " }, style(theme, EDGE)))
             .collect::<Vec<_>>(),
     );
     frame.render_widget(
@@ -1990,7 +2064,7 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
         return;
     }
     frame.render_widget(
-        Paragraph::new("›").style(bold(accent)),
+        Paragraph::new("›").style(bold(theme, accent)),
         Rect::new(inner.x, input.y, 1, 1),
     );
     let (projected_input, projected_cursor) = view.paste_chips.project(&view.input, view.cursor);
@@ -2003,7 +2077,7 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
             } else {
                 "What shall we explore or build?"
             })
-            .style(style(MUTED)),
+            .style(style(theme, MUTED)),
             input,
         );
     } else {
@@ -2028,13 +2102,15 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     if let Some(hint) = view.recall_hint() {
-        frame.render_widget(Paragraph::new(hint).style(style(AMBER)), area);
+        frame.render_widget(Paragraph::new(hint).style(style(theme, AMBER)), area);
         return;
     }
     if view.paste_chips.get_at(&view.input, view.cursor).is_some() {
         frame.render_widget(
-            Paragraph::new("  paste · Ctrl+G expand/compact · Ctrl+X remove").style(style(MUTED)),
+            Paragraph::new("  paste · Ctrl+G expand/compact · Ctrl+X remove")
+                .style(style(theme, MUTED)),
             area,
         );
         return;
@@ -2044,9 +2120,9 @@ fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
     } else {
         "  enter send  ·  alt+enter newline"
     };
-    let mut spans = vec![Span::styled(hint, style(MUTED))];
+    let mut spans = vec![Span::styled(hint, style(theme, MUTED))];
     if area.width >= 65 {
-        spans.push(Span::styled("  ·  /help", style(MUTED)));
+        spans.push(Span::styled("  ·  /help", style(theme, MUTED)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     if area.width >= 90 {
@@ -2057,13 +2133,14 @@ fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
         };
         let width = label.width() as u16;
         frame.render_widget(
-            Paragraph::new(label).style(style(MUTED)),
+            Paragraph::new(label).style(style(theme, MUTED)),
             Rect::new(area.right().saturating_sub(width), area.y, width, 1),
         );
     }
 }
 
 fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     let options = view.options();
     let modes = view.picker == Some(Picker::Modes);
     let width = area.width.saturating_sub(4).clamp(
@@ -2106,9 +2183,9 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
         ),
         None => unreachable!("picker rendering requires an active picker"),
     };
-    let block = panel(format!(" {title} "), color)
-        .border_style(style(color))
-        .style(style(TEXT).bg(RAISED));
+    let block = panel(theme, format!(" {title} "), color)
+        .border_style(style(theme, color))
+        .style(bg(theme, style(theme, TEXT), RAISED));
     let inner = inset(block.inner(popup), 1, 0);
     frame.render_widget(block, popup);
     if inner.height == 0 || inner.width == 0 {
@@ -2127,10 +2204,10 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" / ", bold(color)),
+            Span::styled(" / ", bold(theme, color)),
             Span::styled(
                 clipped(query, usize::from(rows[0].width.saturating_sub(4))),
-                style(if view.query.is_empty() { MUTED } else { TEXT }),
+                style(theme, if view.query.is_empty() { MUTED } else { TEXT }),
             ),
         ])),
         rows[0],
@@ -2169,21 +2246,26 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
         .collect::<Vec<_>>();
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new(" No matches. Backspace to edit.").style(style(MUTED)),
+            Paragraph::new(" No matches. Backspace to edit.").style(style(theme, MUTED)),
             columns[0],
         );
     } else {
         let mut selected = ListState::default().with_selected(Some(view.selected));
         frame.render_stateful_widget(
-            List::new(items)
-                .highlight_symbol("› ")
-                .highlight_style(bold(INK).bg(color)),
+            List::new(items).highlight_symbol("› ").highlight_style(bg(
+                theme,
+                bold(theme, INK),
+                color,
+            )),
             columns[0],
             &mut selected,
         );
     }
     if let Some(preview_area) = columns.get(1) {
-        frame.render_widget(Block::default().style(style(TEXT).bg(INK)), *preview_area);
+        frame.render_widget(
+            Block::default().style(bg(theme, style(theme, TEXT), INK)),
+            *preview_area,
+        );
         if let Some(mode) = options.get(view.selected) {
             let identity = scene::identity(mode);
             let mut preview = view.clone();
@@ -2210,10 +2292,10 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
             let caption = vec![
                 Line::from(Span::styled(
                     format!("{} {}", identity.symbol, identity.title),
-                    bold(identity.accent),
+                    bold(theme, identity.accent),
                 ))
                 .alignment(Alignment::Center),
-                Line::from(Span::styled(identity.description, style(MUTED)))
+                Line::from(Span::styled(identity.description, style(theme, MUTED)))
                     .alignment(Alignment::Center),
                 Line::from(Span::styled(
                     if mode == &view.mode {
@@ -2221,7 +2303,7 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
                     } else {
                         "Framework preview"
                     },
-                    style(MUTED),
+                    style(theme, MUTED),
                 ))
                 .alignment(Alignment::Center),
             ];
@@ -2241,7 +2323,7 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
     } else {
         " Enter selects · Esc back"
     };
-    frame.render_widget(Paragraph::new(guide).style(style(MUTED)), rows[2]);
+    frame.render_widget(Paragraph::new(guide).style(style(theme, MUTED)), rows[2]);
 }
 
 #[cfg(test)]
@@ -2257,29 +2339,32 @@ mod tests {
 
     #[test]
     fn wrapping_preserves_unicode_spaces_and_styles_at_word_boundaries() {
+        let theme = &Theme::new(&kuru_core::UiConfig::default(), theme::Depth::Rgb);
         let original = vec![Line::from(vec![
-            Span::styled("Build ", bold(MINT)),
-            Span::styled("猫 tools safely", style(AMBER)),
+            Span::styled("Build ", bold(theme, MINT)),
+            Span::styled("猫 tools safely", style(theme, AMBER)),
         ])];
         let wrapped = wrap_lines(original, 9);
         assert_eq!(text(&wrapped), "Build 猫 tools safely");
         assert_eq!(text(&wrapped[..1]), "Build 猫 ");
         assert!(wrapped.iter().all(|line| line.width() <= 9));
-        assert_eq!(wrapped[0].spans[0].style, bold(MINT));
-        assert_eq!(wrapped[0].spans[1].style, style(AMBER));
+        assert_eq!(wrapped[0].spans[0].style, bold(theme, MINT));
+        assert_eq!(wrapped[0].spans[1].style, style(theme, AMBER));
         assert!(
             wrapped
                 .last()
                 .unwrap()
                 .spans
                 .iter()
-                .all(|span| span.style == style(AMBER))
+                .all(|span| span.style == style(theme, AMBER))
         );
     }
 
     #[test]
     fn inline_formatting_distinguishes_code_bold_and_literal_unmatched_markers() {
+        let theme = &Theme::new(&kuru_core::UiConfig::default(), theme::Depth::Rgb);
         let spans = inline_spans(
+            theme,
             "Use `cargo check` for **validation**, keep `unfinished",
             TEXT,
         );
@@ -2293,8 +2378,8 @@ mod tests {
             .iter()
             .find(|span| span.content == "cargo check")
             .unwrap();
-        assert_eq!(code.style.fg, Some(AMBER));
-        assert_eq!(code.style.bg, Some(RAISED));
+        assert_eq!(code.style.fg, theme.color(AMBER));
+        assert_eq!(code.style.bg, theme.color(RAISED));
         let emphasis = line
             .spans
             .iter()

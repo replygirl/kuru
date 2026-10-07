@@ -12,22 +12,27 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::View;
+use super::{View, theme};
+use theme::{Role, Theme};
 
-const INK: Color = Color::Rgb(15, 19, 30);
-const MINT: Color = Color::Rgb(131, 231, 199);
-const BLUE: Color = Color::Rgb(135, 191, 250);
-const AMBER: Color = Color::Rgb(241, 200, 129);
-const LILAC: Color = Color::Rgb(193, 166, 247);
-const ROSE: Color = Color::Rgb(242, 149, 173);
-const GHOST: Color = Color::Rgb(43, 57, 76);
-const TRACE: Color = Color::Rgb(62, 81, 104);
+const INK: Role = Role::Background;
+const MINT: Role = Role::Accent;
+const BLUE: Role = Role::Info;
+const AMBER: Role = Role::Warning;
+const LILAC: Role = Role::Secondary;
+const ROSE: Role = Role::Error;
+const GHOST: Role = Role::SceneGhost;
+const TRACE: Role = Role::SceneTrace;
+
+fn themed(theme: &Theme, role: Role) -> Color {
+    theme.color(role).unwrap_or(Color::Reset)
+}
 
 pub(super) struct Identity {
     pub title: &'static str,
     pub description: &'static str,
     pub symbol: &'static str,
-    pub accent: Color,
+    pub accent: Role,
 }
 
 pub(super) fn identity(mode: &str) -> Identity {
@@ -106,15 +111,16 @@ impl Canvas {
         }
     }
 
-    fn paint(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn paint(&self, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
         for (index, value) in self.cells.iter().enumerate() {
             if let Some((glyph, color)) = value {
                 let x = area.x + (index % usize::from(self.width)) as u16;
                 let y = area.y + (index / usize::from(self.width)) as u16;
-                frame.buffer_mut()[(x, y)]
-                    .set_char(*glyph)
-                    .set_fg(*color)
-                    .set_bg(INK);
+                let cell = &mut frame.buffer_mut()[(x, y)];
+                cell.set_char(*glyph);
+                if theme.depth() != theme::Depth::None {
+                    cell.set_fg(*color).set_bg(themed(theme, INK));
+                }
             }
         }
     }
@@ -146,74 +152,97 @@ fn name(label: &str) -> &str {
     label.rsplit_once(" · ").map_or(label, |(name, _)| name)
 }
 
-fn color(label: &str) -> Color {
-    match role(label) {
-        "self" | "ego" | "ventral_vagal" => MINT,
-        "manager" | "persona" | "superego" => BLUE,
-        "firefighter" | "id" | "sympathetic" => AMBER,
-        "exile" | "shadow" | "dorsal_vagal" => LILAC,
-        _ => ROSE,
-    }
+fn color(theme: &Theme, label: &str) -> Color {
+    themed(
+        theme,
+        match role(label) {
+            "self" | "ego" | "ventral_vagal" => MINT,
+            "manager" | "persona" | "superego" => BLUE,
+            "firefighter" | "id" | "sympathetic" => AMBER,
+            "exile" | "shadow" | "dorsal_vagal" => LILAC,
+            _ => ROSE,
+        },
+    )
 }
 
-fn relationship_color(kind: RelationshipKind) -> Color {
-    match kind {
-        RelationshipKind::Protection => BLUE,
-        RelationshipKind::Polarization => AMBER,
-        RelationshipKind::Alliance => LILAC,
-    }
+fn relationship_color(theme: &Theme, kind: RelationshipKind) -> Color {
+    themed(
+        theme,
+        match kind {
+            RelationshipKind::Protection => BLUE,
+            RelationshipKind::Polarization => AMBER,
+            RelationshipKind::Alliance => LILAC,
+        },
+    )
 }
 
 /// Render a portrait without querying time or inventing actor activity.
 pub(super) fn draw(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let theme = &view.theme;
     let area = area.intersection(frame.area());
     if area.width == 0 || area.height == 0 {
         return;
     }
-    frame.render_widget(Block::default().style(Style::default().bg(INK)), area);
+    frame.render_widget(
+        Block::default().style(theme.background(Style::default(), INK)),
+        area,
+    );
     let compact = area.width < 40 || area.height < 10;
     let mut canvas = Canvas::new(area.width, area.height);
-    let phase = if view.motion {
+    let phase = if view.motion && theme.depth() != theme::Depth::None {
         view.frame as f64 / 12.5
     } else {
         0.0
     };
-    let accent = identity(&view.mode).accent;
+    let accent = themed(theme, identity(&view.mode).accent);
     match view.mode.as_str() {
-        "polyvagal" => flowing_traces(&mut canvas, phase, accent),
-        "freudian" => triangle(&mut canvas, phase, accent),
-        "jungian" => rosette(&mut canvas, phase, accent),
-        _ => orbit(&mut canvas, phase, accent),
+        "polyvagal" => flowing_traces(theme, &mut canvas, phase, accent),
+        "freudian" => triangle(theme, &mut canvas, phase, accent),
+        "jungian" => rosette(theme, &mut canvas, phase, accent),
+        _ => orbit(theme, &mut canvas, phase, accent),
     }
     let positions = positions(view, &canvas);
     draw_relationships(&mut canvas, view, &positions, phase);
-    canvas.paint(frame, area);
+    canvas.paint(theme, frame, area);
     draw_peers(frame, view, area, &positions, compact);
 }
 
 // Time changes only dim color, never contour cells or glyphs. A full pass
 // takes 24 seconds, independent of typing and the busy-indicator frame rate.
-fn ambient_color(base: Color, phase: f64, offset: f64, accent: Color) -> Color {
+fn ambient_color(theme: &Theme, base: Color, phase: f64, offset: f64, accent: Color) -> Color {
     let light = ((phase * TAU / 24.0 - offset).sin() + 1.0) as f32 / 2.0;
-    mix(base, mix(TRACE, accent, 0.12), light)
+    mix(base, mix(themed(theme, TRACE), accent, 0.12), light)
 }
 
-fn ornament(canvas: &mut Canvas, point: Point, index: usize, phase: f64, accent: Color) {
+fn ornament(
+    theme: &Theme,
+    canvas: &mut Canvas,
+    point: Point,
+    index: usize,
+    phase: f64,
+    accent: Color,
+) {
     canvas.put(
         point,
         '.',
-        ambient_color(GHOST, phase, index as f64 * 0.025, accent),
+        ambient_color(
+            theme,
+            themed(theme, GHOST),
+            phase,
+            index as f64 * 0.025,
+            accent,
+        ),
     );
 }
 
-fn orbit(canvas: &mut Canvas, phase: f64, accent: Color) {
+fn orbit(theme: &Theme, canvas: &mut Canvas, phase: f64, accent: Color) {
     // Four interrupted orbits suggest regions without inventing network edges.
     for region in 0..4 {
         let start = region as f64 * FRAC_PI_2 + 0.16;
         for step in 0..48 {
             let angle = start + step as f64 / 47.0 * 1.06;
             let point = canvas.point(0.5 + 0.45 * angle.cos(), 0.48 + 0.43 * angle.sin());
-            ornament(canvas, point, region * 48 + step, phase, accent);
+            ornament(theme, canvas, point, region * 48 + step, phase, accent);
         }
     }
     for step in 0..76 {
@@ -222,11 +251,11 @@ fn orbit(canvas: &mut Canvas, phase: f64, accent: Color) {
             continue;
         }
         let point = canvas.point(0.5 + 0.24 * angle.cos(), 0.48 + 0.24 * angle.sin());
-        ornament(canvas, point, step + 90, phase, accent);
+        ornament(theme, canvas, point, step + 90, phase, accent);
     }
 }
 
-fn flowing_traces(canvas: &mut Canvas, phase: f64, accent: Color) {
+fn flowing_traces(theme: &Theme, canvas: &mut Canvas, phase: f64, accent: Color) {
     for band in 0..3 {
         let baseline = 0.19 + band as f64 * 0.30;
         for x in 0..canvas.width {
@@ -236,11 +265,18 @@ fn flowing_traces(canvas: &mut Canvas, phase: f64, accent: Color) {
             canvas.put(
                 point,
                 '-',
-                ambient_color(GHOST, phase, t * TAU + band as f64, accent),
+                ambient_color(
+                    theme,
+                    themed(theme, GHOST),
+                    phase,
+                    t * TAU + band as f64,
+                    accent,
+                ),
             );
             if x % 4 == band {
                 let echo = canvas.point(t, baseline + wave + 0.08);
                 ornament(
+                    theme,
                     canvas,
                     echo,
                     usize::from(x) + usize::from(band) * 19,
@@ -252,7 +288,7 @@ fn flowing_traces(canvas: &mut Canvas, phase: f64, accent: Color) {
     }
 }
 
-fn triangle(canvas: &mut Canvas, phase: f64, accent: Color) {
+fn triangle(theme: &Theme, canvas: &mut Canvas, phase: f64, accent: Color) {
     for layer in 0..2 {
         let inset = layer as f64 * 0.085;
         let vertices = [
@@ -281,7 +317,8 @@ fn triangle(canvas: &mut Canvas, phase: f64, accent: Color) {
                     point,
                     glyph,
                     ambient_color(
-                        if layer == 0 { TRACE } else { GHOST },
+                        theme,
+                        themed(theme, if layer == 0 { TRACE } else { GHOST }),
                         phase,
                         t * TAU + side as f64,
                         accent,
@@ -292,7 +329,7 @@ fn triangle(canvas: &mut Canvas, phase: f64, accent: Color) {
     }
 }
 
-fn rosette(canvas: &mut Canvas, phase: f64, accent: Color) {
+fn rosette(theme: &Theme, canvas: &mut Canvas, phase: f64, accent: Color) {
     for ring in 0..2 {
         for step in 0..128 {
             let angle = step as f64 / 127.0 * TAU;
@@ -301,7 +338,7 @@ fn rosette(canvas: &mut Canvas, phase: f64, accent: Color) {
                 0.5 + radius * angle.cos(),
                 0.47 + radius * 0.91 * angle.sin(),
             );
-            ornament(canvas, point, step + ring * 23, phase, accent);
+            ornament(theme, canvas, point, step + ring * 23, phase, accent);
         }
     }
     // A broken outer field keeps the rosette open rather than enclosing the peers.
@@ -311,7 +348,7 @@ fn rosette(canvas: &mut Canvas, phase: f64, accent: Color) {
         }
         let angle = step as f64 / 89.0 * TAU;
         let point = canvas.point(0.5 + 0.47 * angle.cos(), 0.47 + 0.45 * angle.sin());
-        canvas.put(point, '.', GHOST);
+        canvas.put(point, '.', themed(theme, GHOST));
     }
 }
 
@@ -371,6 +408,7 @@ fn positions(view: &View, canvas: &Canvas) -> Vec<Point> {
 }
 
 fn draw_relationships(canvas: &mut Canvas, view: &View, positions: &[Point], phase: f64) {
+    let theme = &view.theme;
     let position = |id: &str| {
         view.parts
             .iter()
@@ -385,7 +423,11 @@ fn draw_relationships(canvas: &mut Canvas, view: &View, positions: &[Point], pha
                         start,
                         end,
                         '.',
-                        mix(TRACE, relationship_color(relationship.kind), 0.38),
+                        mix(
+                            themed(theme, TRACE),
+                            relationship_color(theme, relationship.kind),
+                            0.38,
+                        ),
                     );
                 }
             }
@@ -393,12 +435,17 @@ fn draw_relationships(canvas: &mut Canvas, view: &View, positions: &[Point], pha
     }
     for (sender, recipient) in &view.routes {
         if let (Some(start), Some(end)) = (position(sender), position(recipient)) {
-            canvas.line(start, end, ':', mix(TRACE, MINT, 0.48));
+            canvas.line(
+                start,
+                end,
+                ':',
+                mix(themed(theme, TRACE), themed(theme, MINT), 0.48),
+            );
             if view.busy && view.motion {
                 canvas.put(
                     interpolate(start, end, 0.15 + (phase * 0.4).fract() * 0.70),
                     '*',
-                    MINT,
+                    themed(theme, MINT),
                 );
             }
         }
@@ -406,6 +453,7 @@ fn draw_relationships(canvas: &mut Canvas, view: &View, positions: &[Point], pha
 }
 
 fn draw_peers(frame: &mut Frame<'_>, view: &View, area: Rect, positions: &[Point], compact: bool) {
+    let theme = &view.theme;
     for (index, ((id, label), point)) in view.parts.iter().zip(positions).enumerate() {
         let active = view.busy
             && view
@@ -422,13 +470,17 @@ fn draw_peers(frame: &mut Frame<'_>, view: &View, area: Rect, positions: &[Point
         } else {
             "○"
         };
-        let selected = Style::default()
-            .fg(if state == Some("error") {
-                ROSE
-            } else {
-                color(label)
-            })
-            .bg(INK)
+        let selected = theme
+            .background(
+                if state == Some("error") {
+                    theme.foreground(Style::default(), ROSE)
+                } else if theme.depth() != theme::Depth::None {
+                    Style::default().fg(color(theme, label))
+                } else {
+                    Style::default()
+                },
+                INK,
+            )
             .add_modifier(Modifier::BOLD);
         let x = area.x + (point.x as u16).min(area.width - 1);
         let y = area.y + (point.y as u16).min(area.height - 1);

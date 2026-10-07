@@ -75,6 +75,150 @@ const EXIT_TIMEOUT: Duration = OPERATION_TIMEOUT
     .saturating_add(IO_TIMEOUT)
     .saturating_add(FRAME_ALLOWANCE);
 
+#[derive(Default)]
+struct ColorEscapes {
+    rgb: bool,
+    indexed: bool,
+    ansi16: bool,
+}
+
+fn color_escapes(output: &[u8]) -> ColorEscapes {
+    let mut colors = ColorEscapes::default();
+    let text = String::from_utf8_lossy(output);
+    for sequence in text.split("\x1b[").skip(1) {
+        let Some(parameters) = sequence.split_once('m').map(|(parameters, _)| parameters) else {
+            continue;
+        };
+        let codes = parameters
+            .split(';')
+            .map(str::parse::<u16>)
+            .collect::<std::result::Result<Vec<_>, _>>();
+        let Ok(codes) = codes else { continue };
+        colors.rgb |= codes.windows(2).any(|codes| matches!(codes, [38 | 48, 2]));
+        colors.indexed |= codes.windows(2).any(|codes| matches!(codes, [38 | 48, 5]));
+        if !codes.contains(&38) && !codes.contains(&48) {
+            colors.ansi16 |= codes
+                .iter()
+                .any(|code| matches!(code, 30..=37 | 40..=47 | 90..=107));
+        }
+    }
+    colors
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_theme_depth_and_no_color_preserve_the_completed_composer() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::warmed().await?;
+        let mut default_terminal = Terminal::spawn(sandbox.command("demo"), 35, 80)?;
+        default_terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+        ensure!(color_escapes(&default_terminal.output).rgb);
+        ensure!(
+            String::from_utf8_lossy(&default_terminal.output).contains("131;231;199"),
+            "default dark accent changed"
+        );
+        default_terminal.send(b"/quit\r")?;
+        default_terminal.wait_exit(EXIT_TIMEOUT)?;
+        default_terminal.assert_restored()?;
+        let config = sandbox.root.path().join("config/kuru/config.toml");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&config)?
+            .write_all(b"\n[ui]\ntheme = 'light'\n[ui.palette]\naccent = '#0F766E'\n")?;
+
+        for (term, colorterm, no_color, expected, width) in [
+            ("xterm-256color", Some("truecolor"), None, "rgb", 120),
+            ("xterm-256color", None, None, "indexed", 80),
+            ("xterm", None, None, "ansi16", 80),
+            ("vt100", None, None, "none", 80),
+            ("dumb", Some("truecolor"), None, "none", 80),
+            ("xterm-256color", Some("truecolor"), Some("1"), "none", 120),
+        ] {
+            let mut command = sandbox.command("demo");
+            command.env("TERM", term).env_remove("COLORTERM");
+            if let Some(value) = colorterm {
+                command.env("COLORTERM", value);
+            }
+            if let Some(value) = no_color {
+                command.env("NO_COLOR", value);
+            }
+            let mut terminal = Terminal::spawn(command, 35, width)?;
+            terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+            let colors = color_escapes(&terminal.output);
+            if expected == "rgb" {
+                ensure!(
+                    String::from_utf8_lossy(&terminal.output).contains("15;118;110"),
+                    "configured light-theme accent was absent from the real frame"
+                );
+            }
+            ensure!(
+                (colors.rgb, colors.indexed, colors.ansi16)
+                    == match expected {
+                        "rgb" => (true, false, false),
+                        "indexed" => (false, true, false),
+                        "ansi16" => (false, false, true),
+                        _ => (false, false, false),
+                    },
+                "{term} {expected}: unexpected SGR depth rgb={} indexed={} ansi16={}",
+                colors.rgb,
+                colors.indexed,
+                colors.ansi16
+            );
+            terminal.send(b"/quit\r")?;
+            terminal.wait_exit(EXIT_TIMEOUT)?;
+            terminal.assert_restored()?;
+        }
+
+        // This disabled route produces the ordinary human warning without
+        // starting any configured process or using a provider credential.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&config)?
+            .write_all(
+                b"\n[mcp.theme-status]\nenabled = false\ncommand = 'unused-fixture-command'\n",
+            )?;
+        for no_color in [false, true] {
+            let mut command = sandbox.command("demo");
+            command.arg("tools");
+            if no_color {
+                command.env("NO_COLOR", "1");
+            }
+            let mut terminal = Terminal::spawn(command, 35, 80)?;
+            terminal.wait_exit(sandbox.startup_timeout + EXIT_TIMEOUT)?;
+            ensure!(
+                String::from_utf8_lossy(&terminal.output).contains("MCP theme-status: disabled")
+            );
+            let colors = color_escapes(&terminal.output);
+            ensure!(
+                colors.rgb != no_color && !colors.indexed && !colors.ansi16,
+                "human status colour did not follow its terminal and NO_COLOR"
+            );
+            terminal.assert_restored()?;
+        }
+        let redirected = sandbox.command("demo").arg("tools").output()?;
+        ensure!(redirected.status.success());
+        ensure!(String::from_utf8_lossy(&redirected.stderr).contains("MCP theme-status: disabled"));
+        ensure!(!redirected.stdout.contains(&0x1b) && !redirected.stderr.contains(&0x1b));
+        let _: Value = serde_json::from_slice(&redirected.stdout)?;
+
+        let output = sandbox
+            .command("demo")
+            .args(["run", "theme JSON remains uncoloured", "--json"])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "themed structured command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _: Value = serde_json::from_slice(&output.stdout)?;
+        ensure!(
+            !output.stdout.contains(&0x1b) && !output.stderr.contains(&0x1b),
+            "themed redirected JSON or diagnostics contained ANSI"
+        );
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn headless_tty_argument_never_reads_stdin_at_120_and_80() -> Result<()> {
     kuru_memory::test_support::closing(async {

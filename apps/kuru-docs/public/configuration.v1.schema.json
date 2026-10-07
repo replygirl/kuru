@@ -88,6 +88,37 @@
     "memory": {
       "$ref": "#/$defs/memory",
       "default": { "offline": false, "startup_timeout_secs": 30 }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "theme": { "type": "string", "enum": ["dark", "light"], "default": "dark" },
+        "palette": {
+          "type": "object",
+          "maxProperties": 13,
+          "propertyNames": {
+            "enum": [
+              "background",
+              "surface",
+              "raised",
+              "border",
+              "text",
+              "muted",
+              "accent",
+              "secondary",
+              "warning",
+              "info",
+              "error",
+              "scene_ghost",
+              "scene_trace"
+            ]
+          },
+          "additionalProperties": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+          "default": {}
+        }
+      },
+      "default": { "theme": "dark", "palette": {} }
     }
   },
   "$defs": {

@@ -795,3 +795,33 @@ Notices never install, download a candidate, invoke a provider or change memory.
 They are suppressed for headless `run`, pure inspection, fixed account commands,
 `update`, `serve` and internal modes, and when stderr is not a terminal. There is
 no update-check command.
+
+## Terminal presentation
+
+The interactive terminal uses the existing dark palette by default. Select the
+light palette with `ui.theme = "light"`; `dark` and `light` are the supported
+names. Presentation settings do not grant workspace authority or change provider
+selection.
+
+```toml
+[ui]
+theme = "light"
+
+[ui.palette]
+accent = "#0F766E"
+error = "#B91C1C"
+```
+
+Palette overrides accept `#RRGGBB` values for `background`, `surface`, `raised`,
+`border`, `text`, `muted`, `accent`, `secondary`, `warning`, `info`, `error`,
+`scene_ghost`, and `scene_trace`. Unknown roles and malformed values are rejected.
+These leaves follow normal configuration precedence and managed constraints.
+
+A nonempty `NO_COLOR` disables color regardless of theme. Otherwise Kuru uses
+truecolor when advertised by `COLORTERM`, 256 colors for a compatible `TERM`,
+classic 16 colors for known basic ANSI terminals, and plain presentation for
+unknown or limited terminals. Windows interactive mode uses its existing native
+console setup. Human command statuses use color only on their own capable terminal
+stream; Windows additionally requires that stream's VT output already be enabled.
+Redirected output and JSON/JSONL retain their plain serialized bytes. Permission,
+error, and activity labels retain their textual meaning at every color depth.
