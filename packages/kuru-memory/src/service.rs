@@ -10865,7 +10865,7 @@ mod tests {
 
         let hello = authority().hello();
         let expected = format!(
-            r#"{{"version":{{"major":{},"minor":{}}},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}}"#,
+            r#"{{"version":{{"major":{},"minor":{}}},"project_path":[47,112,114,105,118,97,116,101,47,112,114,111,106,101,99,116],"project_scope":"scope","history_scope":null,"store_instance":"store","service_generation":"generation","connection_secret":"test-secret","schema_version":4}}"#,
             PROTOCOL_MAJOR, PROTOCOL_MINOR
         );
         ensure!(
