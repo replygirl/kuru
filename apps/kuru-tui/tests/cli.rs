@@ -3663,7 +3663,17 @@ fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
         serde_json::from_str::<Value>(&env.success(&["memory", "status"])).unwrap(),
         status
     );
-    assert_eq!(env.success(&["sessions"]), sessions);
+    let mut before: Value = serde_json::from_str(&sessions).unwrap();
+    let mut after: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
+    for listing in [&mut before, &mut after] {
+        for session in listing.as_array_mut().unwrap() {
+            let row = session.as_object_mut().unwrap();
+            assert_eq!(row.get("live_driver"), Some(&Value::Null));
+            assert!(row.get("live_presence_known").unwrap().is_boolean());
+            row.remove("live_presence_known");
+        }
+    }
+    assert_eq!(after, before);
     for limit in ["0", "1001"] {
         let output = env.run(&["memory", "history", "--limit", limit]);
         assert!(!output.status.success());
