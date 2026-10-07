@@ -9651,7 +9651,10 @@ mod tests {
         project: &Path,
         gate: tokio::sync::RwLockReadGuard<'static, ()>,
     ) -> Result<RetiredWithPendingWrite> {
-        let owner = service::ServiceOwner::open(options.clone(), project).await?;
+        let owner = service::ServiceOwner::open(options.clone(), project)
+            .await
+            .map_err(|error| crate::test_support::fixture_startup_error(options, error))
+            .context("open initial owner for pending-write recovery fixture")?;
         let (first, mut first_events) = serve_retiring(owner, None);
         let memory = open_retiring(options, project).await?;
         let hook = observe_replacement(&memory, false)?;
@@ -9681,7 +9684,10 @@ mod tests {
         memory.close_transport_for_test().await?;
         expect_retired(&mut first_events, first).await?;
         let (successor, gate) = crate::spawn_gate::excluding_spawns(gate, async {
-            service::ServiceOwner::open(options.clone(), project).await
+            service::ServiceOwner::open(options.clone(), project)
+                .await
+                .map_err(|error| crate::test_support::fixture_startup_error(options, error))
+                .context("open successor for pending-write recovery fixture")
         })
         .await?;
         let successor_generation = successor.authority().service_generation.clone();
@@ -9712,7 +9718,9 @@ mod tests {
                     served,
                     mut events,
                     _gate,
-                } = retire_with_pending_write(&options, &project, gate).await?;
+                } = retire_with_pending_write(&options, &project, gate)
+                    .await
+                    .with_context(|| format!("prepare checked recovery with reopen={reopen}"))?;
                 ensure!(
                     memory.reconcile().await? == Some(true),
                     "the successor did not prove the pending write"
