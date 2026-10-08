@@ -7739,7 +7739,8 @@ async fn update_notice_https_bounds_cache_and_restored_120_80_terminal() -> Resu
             let cache = notice_cache(&sandbox)?.unwrap();
             ensure!(
                 cache["outcome"] == "failed" && cache["failure"] == failure,
-                "{cache}"
+                "{cache}; transport={:?}",
+                peer.failures()
             );
             ensure!(cache["latest"].is_null());
             terminal.send(b"/quit\r")?;

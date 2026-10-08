@@ -47,9 +47,9 @@ pub mod snapshot;
 /// platform spawn's descriptor-table copy. Guards no data.
 static SPAWN: Mutex<()> = Mutex::new(());
 
-/// Hold the platform spawn lock across pipe creation and child creation only.
+/// Hold the platform spawn lock across native descriptor and child creation only.
 /// No caller code, waiting or child I/O runs under it in product builds.
-fn spawn_lock() -> MutexGuard<'static, ()> {
+pub(crate) fn spawn_lock() -> MutexGuard<'static, ()> {
     match SPAWN.try_lock() {
         Ok(guard) => guard,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -2533,6 +2533,301 @@ mod tests {
         Blocked,
         Spawned,
         Failed,
+    }
+
+    #[tokio::test]
+    async fn checked_listener_binding_waits_for_descriptor_copy_and_cannot_leak_to_owned_child() {
+        use crate::{
+            fs::Directory,
+            local_ipc::{PrivateServiceListener, connect},
+        };
+        use std::{
+            ffi::OsStr,
+            io::Write as _,
+            os::unix::fs::{FileTypeExt, MetadataExt},
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = temporary.path().join("private");
+        let directory = Directory::ensure_private(&private).unwrap();
+        std::fs::write(private.join("adjacent"), b"unchanged").unwrap();
+        let (first, listener) = {
+            let runtime = tokio::runtime::Handle::current();
+            let (event, events) = std::sync::mpsc::channel();
+            let spawning = spawn_lock();
+            let binder = thread::spawn(move || {
+                let _runtime = runtime.enter();
+                let blocked = event.clone();
+                BLOCKED.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        let _ = blocked.send(true);
+                    }));
+                });
+                let result =
+                    PrivateServiceListener::bind_at(directory, OsStr::new("generation.sock"));
+                BLOCKED.with(|seam| seam.borrow_mut().take());
+                let _ = event.send(false);
+                result
+            });
+            let first = events.recv_timeout(TEST_BOUND);
+            drop(spawning);
+            (first, binder.join().unwrap().unwrap())
+        };
+        assert_eq!(
+            first,
+            Ok(true),
+            "checked listener binding must wait for descriptor-copy admission"
+        );
+
+        // A completed cat roundtrip proves the owned child is alive after exec.
+        // Its retained input keeps it alive through the listener's close probe.
+        let mut command = Command::new("/bin/cat");
+        command.env_clear();
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        let mut owner = OwnedProcessGroup::spawn(
+            command,
+            StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Null),
+        )
+        .unwrap();
+        let mut input = owner.take_stdin().unwrap();
+        let mut output = owner.take_stdout().unwrap();
+        let (read, readback) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut bytes = [0; 6];
+            let result = output.read_exact(&mut bytes).map(|()| bytes);
+            let _ = read.send(result);
+        });
+        let written = input.write_all(b"ready\n");
+        let ready = readback.recv_timeout(TEST_BOUND);
+        let observed: Result<(), Box<dyn std::error::Error>> = async {
+            written?;
+            let bytes = ready??;
+            if bytes != *b"ready\n" || !matches!(owner.root_state(), RootState::Running) {
+                return Err(io::Error::other(
+                    "owned cat was not live after the completed roundtrip",
+                )
+                .into());
+            }
+            let original = listener.path();
+            let stale = private.join("stale.sock");
+            std::fs::rename(&original, &stale)?;
+            let identity = std::fs::symlink_metadata(&stale)?.ino();
+            drop(listener);
+            let directory = Directory::ensure_private(&private)?;
+            let refused =
+                tokio::time::timeout(TEST_BOUND, connect(&directory, OsStr::new("stale.sock")))
+                    .await?;
+            match refused {
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                result => {
+                    return Err(io::Error::other(format!(
+                        "closed listener was not refused: {result:?}"
+                    ))
+                    .into());
+                }
+            }
+            let retained = std::fs::symlink_metadata(&stale)?;
+            if !retained.file_type().is_socket() || retained.ino() != identity {
+                return Err(io::Error::other("stale connect changed the retained endpoint").into());
+            }
+            if PrivateServiceListener::bind_at(directory, OsStr::new("stale.sock")).is_ok() {
+                return Err(
+                    io::Error::other("stale endpoint was adopted by a checked bind").into(),
+                );
+            }
+            if std::fs::read(private.join("adjacent"))? != b"unchanged"
+                || !matches!(owner.root_state(), RootState::Running)
+            {
+                return Err(io::Error::other(
+                    "adjacent state changed or the owned child exited during the probe",
+                )
+                .into());
+            }
+            Ok(())
+        }
+        .await;
+        drop(input);
+        let settled = settle_without_sleep(&mut owner, TEST_BOUND);
+        reader.join().unwrap();
+        settled.unwrap();
+        observed.unwrap();
+    }
+
+    async fn private_ipc_operation_waits_for_descriptor_copy(accepting: bool) {
+        use crate::{
+            fs::Directory,
+            local_ipc::{PrivateServiceListener, connect},
+        };
+        use std::{
+            ffi::OsStr,
+            future::Future as _,
+            task::{Context, Poll, Waker},
+        };
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = temporary.path().join("private");
+        let listener = Arc::new(
+            PrivateServiceListener::bind_at(
+                Directory::ensure_private(&private).unwrap(),
+                OsStr::new("generation.sock"),
+            )
+            .unwrap(),
+        );
+        let directory = Directory::ensure_private(&private).unwrap();
+        // The accept case starts with a real queued connection, retained until
+        // the protected poll completes and its accepted stream exchanges bytes.
+        let queued = if accepting {
+            Some(
+                tokio::time::timeout(
+                    TEST_BOUND,
+                    connect(&directory, OsStr::new("generation.sock")),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let (first, polled, operation) = {
+            let runtime = tokio::runtime::Handle::current();
+            let serving = Arc::clone(&listener);
+            let (event, events) = std::sync::mpsc::channel();
+            let spawning = spawn_lock();
+            let worker = thread::spawn(move || {
+                let _runtime = runtime.enter();
+                let blocked = event.clone();
+                BLOCKED.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        let _ = blocked.send(true);
+                    }));
+                });
+                let mut operation = Box::pin(async move {
+                    if accepting {
+                        serving.accept().await
+                    } else {
+                        connect(&directory, OsStr::new("generation.sock")).await
+                    }
+                });
+                let polled = operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()));
+                BLOCKED.with(|seam| seam.borrow_mut().take());
+                let _ = event.send(false);
+                (polled, operation)
+            });
+            let first = events.recv_timeout(TEST_BOUND);
+            drop(spawning);
+            let (polled, operation) = worker.join().unwrap();
+            (first, polled, operation)
+        };
+        let stream = match polled {
+            Poll::Ready(result) => {
+                drop(operation);
+                result.unwrap()
+            }
+            Poll::Pending => tokio::time::timeout(TEST_BOUND, operation)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        let (mut client, mut server) = if accepting {
+            (queued.unwrap(), stream)
+        } else {
+            let server = tokio::time::timeout(TEST_BOUND, listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            (stream, server)
+        };
+        let exchanged = tokio::time::timeout(TEST_BOUND, async {
+            client.write_all(b"ipc").await?;
+            let mut bytes = [0; 3];
+            server.read_exact(&mut bytes).await?;
+            Ok::<_, io::Error>(bytes)
+        })
+        .await;
+        drop((client, server));
+        drop(listener);
+        assert_eq!(
+            first,
+            Ok(true),
+            "private IPC creation must wait for descriptor copying: accepting={accepting}"
+        );
+        assert_eq!(exchanged.unwrap().unwrap(), *b"ipc");
+        assert!(!private.join("generation.sock").exists());
+    }
+
+    #[tokio::test]
+    async fn checked_ipc_connect_waits_for_descriptor_copy() {
+        private_ipc_operation_waits_for_descriptor_copy(false).await;
+    }
+
+    #[tokio::test]
+    async fn checked_ipc_accept_waits_for_descriptor_copy() {
+        private_ipc_operation_waits_for_descriptor_copy(true).await;
+    }
+
+    #[test]
+    fn refused_owned_spawns_release_admission_before_a_complete_piped_successor() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let nonexecutable = temporary.path().join("nonexecutable");
+        std::fs::write(&nonexecutable, b"#!/bin/sh\nprintf invoked > invoked\n").unwrap();
+        std::fs::set_permissions(&nonexecutable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let plan = StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Pipe);
+        for (executable, expected) in [
+            (temporary.path().join("missing"), io::ErrorKind::NotFound),
+            (nonexecutable, io::ErrorKind::PermissionDenied),
+        ] {
+            let mut command = Command::new(executable);
+            command.current_dir(temporary.path()).env_clear();
+            if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+                command.env("LLVM_PROFILE_FILE", profile);
+            }
+            let error = OwnedProcessGroup::spawn(command, plan).err().unwrap();
+            assert_eq!(error.kind(), expected);
+            assert!(!temporary.path().join("invoked").exists());
+        }
+
+        // The successor must use the same owned admission and all three pipe
+        // slots, then prove actual echo, independent EOFs and exact owner reap.
+        let mut command = Command::new("/bin/cat");
+        command.current_dir(temporary.path()).env_clear();
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        let mut owner = OwnedProcessGroup::spawn(command, plan).unwrap();
+        let mut input = owner.take_stdin().unwrap();
+        let mut output = owner.take_stdout().unwrap();
+        let mut errors = owner.take_stderr().unwrap();
+        let (sent_output, received_output) = std::sync::mpsc::channel();
+        let (sent_errors, received_errors) = std::sync::mpsc::channel();
+        let output_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = sent_output.send(output.read_to_end(&mut bytes).map(|_| bytes));
+        });
+        let error_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = sent_errors.send(errors.read_to_end(&mut bytes).map(|_| bytes));
+        });
+        let written = input.write_all(b"exact successor echo\n");
+        drop(input);
+        let output = received_output.recv_timeout(TEST_BOUND);
+        let errors = received_errors.recv_timeout(TEST_BOUND);
+        let settled = settle_without_sleep(&mut owner, TEST_BOUND);
+        output_reader.join().unwrap();
+        error_reader.join().unwrap();
+        settled.unwrap();
+        written.unwrap();
+        assert_eq!(output.unwrap().unwrap(), b"exact successor echo\n");
+        assert!(errors.unwrap().unwrap().is_empty());
+        assert!(matches!(owner.root_state(), RootState::Reaped(_)));
+        assert!(!temporary.path().join("invoked").exists());
     }
 
     #[test]

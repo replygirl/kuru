@@ -814,11 +814,15 @@ async fn native_conpty_notice_https_bounds_failure_cache_and_console_restoration
                     stored["outcome"] == "failed"
                         && stored["failure"] == failure
                         && stored["latest"].is_null(),
-                    "unexpected failed cache: {stored}"
+                    "unexpected failed cache for {path}: {stored}; requests={}; transport={:?}",
+                    peer.requests().len(),
+                    peer.failures()
                 ),
                 None => ensure!(
                     stored["outcome"] == "newer" && stored["latest"] == "999.0.0",
-                    "unexpected successful cache: {stored}"
+                    "unexpected successful cache for {path}: {stored}; requests={}; transport={:?}",
+                    peer.requests().len(),
+                    peer.failures()
                 ),
             }
             finish_native_notice(&mut terminal, failure.is_none())?;
@@ -868,9 +872,25 @@ async fn native_conpty_notice_quit_releases_held_https_response_without_cache() 
         let peer = notice_https::NoticeHttps::start(&sandbox.root).await?;
         let mut terminal = native_notice_start(&sandbox, &peer, "notice-held", "/held")?;
         terminal.text(&["enter send"], sandbox.startup)?;
-        tokio::time::timeout(READY, peer.held.notified()).await?;
+        tokio::time::timeout(READY, peer.held.notified())
+            .await
+            .with_context(|| {
+                format!(
+                    "held notice request absent; requests={}; transport={:?}",
+                    peer.requests().len(),
+                    peer.failures()
+                )
+            })?;
         finish_native_notice(&mut terminal, false)?;
-        tokio::time::timeout(READY, peer.disconnected.notified()).await?;
+        tokio::time::timeout(READY, peer.disconnected.notified())
+            .await
+            .with_context(|| {
+                format!(
+                    "held notice response remained open; requests={}; transport={:?}",
+                    peer.requests().len(),
+                    peer.failures()
+                )
+            })?;
         ensure!(!sandbox.data.join("update/notice.json").exists());
         ensure!(peer.requests().len() == 1);
         peer.close().await;
@@ -952,7 +972,7 @@ async fn native_conpty_permission_choices_preserve_exact_scope_and_revoke_author
             }
             terminal.frame_text(&["No session or always grants"], READY)?;
             terminal.send(b"\x1b")?;
-            terminal.wait("native permission inspector closed", READY, |terminal| !terminal.screen().contains("Permissions ·"))?;
+            terminal.wait("native permission inspector closed", READY, |terminal| !terminal.screen().contains("Permissions · ↑↓ select"))?;
             terminal.frame_text(&["enter send"], READY)?;
             if granted { std::fs::remove_file(&marker)?; }
             terminal.send(b"Verify revoked native authority")?;

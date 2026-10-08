@@ -179,6 +179,8 @@ call sites instead of claiming isolation across arbitrary spawn mechanisms.
 Owned Unix spawns create their stdio pipes close-on-exec and start the child
 under one platform spawn lock, so a concurrent owned child cannot inherit
 another's pipe ends (std's macOS pipes set close-on-exec in a second step).
+Private Unix IPC socket creation uses that same lock, including listener bind,
+outgoing socket creation and synchronous accept polling; no guard spans an await.
 Unrelated legacy spawns and other non-atomic descriptor creation can still
 inherit, or leak into owned children; concurrent callers requiring isolation must
 use the platform consistently. On std's fork path a legacy spawn that inherits an

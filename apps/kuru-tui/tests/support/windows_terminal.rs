@@ -421,6 +421,20 @@ impl Terminal {
         })
     }
 
+    /// Some ConPTY versions omit nonspacing accents from their screen output.
+    /// Both projections still require the completed visible composer cursor;
+    /// the caller verifies canonical bytes separately through persisted state.
+    pub fn composer_projection(&mut self, canonical: &str, projected: &str) -> Result<()> {
+        self.wait(
+            &format!("completed native composer projection of {canonical:?}"),
+            READY,
+            |terminal| {
+                composer_frame_ready(terminal.parser.screen(), canonical)
+                    || composer_frame_ready(terminal.parser.screen(), projected)
+            },
+        )
+    }
+
     /// Assert the entire observation interval, without first waiting for silence.
     pub fn quiet(&mut self, description: &str, duration: Duration) -> Result<()> {
         let settled = self.output.len();

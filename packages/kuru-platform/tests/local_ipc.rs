@@ -55,9 +55,12 @@ async fn pending_accept_refuses_a_replaced_directory_and_drop_preserves_both_nam
         fs::rename(&original, &moved).unwrap();
         fs::create_dir(&original).unwrap();
         fs::write(original.join("generation.sock"), b"replacement sentinel").unwrap();
-        let _client = tokio::net::UnixStream::connect(moved.join("generation.sock"))
-            .await
-            .unwrap();
+        let _client = local_ipc::connect(
+            &Directory::ensure_private(&moved).unwrap(),
+            OsStr::new("generation.sock"),
+        )
+        .await
+        .unwrap();
         tokio::time::timeout(DEADLINE, accepting)
             .await
             .unwrap()
@@ -69,6 +72,45 @@ async fn pending_accept_refuses_a_replaced_directory_and_drop_preserves_both_nam
         fs::read(original.join("generation.sock")).unwrap(),
         b"replacement sentinel"
     );
+    assert!(moved.join("generation.sock").exists());
+}
+
+#[tokio::test]
+async fn stale_parent_authority_refuses_bind_connect_and_accept_before_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("private");
+    let moved = root.path().join("displaced");
+    let listener = local_ipc::PrivateServiceListener::bind_at(
+        Directory::ensure_private(&original).unwrap(),
+        OsStr::new("generation.sock"),
+    )
+    .unwrap();
+    let connector = Directory::ensure_private(&original).unwrap();
+    let binder = Directory::ensure_private(&original).unwrap();
+    fs::rename(&original, &moved).unwrap();
+    Directory::ensure_private(&original).unwrap();
+    fs::write(original.join("generation.sock"), b"replacement sentinel").unwrap();
+
+    let rejected_bind = local_ipc::PrivateServiceListener::bind_at(binder, OsStr::new("new.sock"))
+        .err()
+        .unwrap();
+    let rejected_connect = local_ipc::connect(&connector, OsStr::new("generation.sock"))
+        .await
+        .unwrap_err();
+    let rejected_accept = tokio::time::timeout(DEADLINE, listener.accept())
+        .await
+        .expect("stale listener authority reached a native accept wait")
+        .unwrap_err();
+    for error in [rejected_bind, rejected_connect, rejected_accept] {
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+    drop(listener);
+    assert_eq!(
+        fs::read(original.join("generation.sock")).unwrap(),
+        b"replacement sentinel"
+    );
+    assert!(!original.join("new.sock").exists());
+    assert!(!moved.join("new.sock").exists());
     assert!(moved.join("generation.sock").exists());
 }
 
@@ -121,6 +163,70 @@ async fn private_socket_accepts_successive_clients_and_cleans_only_its_name() {
 
     drop(listener);
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn pending_accepts_retain_independent_waiters_and_receive_distinct_clients() {
+    use std::{
+        future::{Future, poll_fn},
+        sync::Arc,
+        task::Poll,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let private = root.path().join("private");
+    let name = OsStr::new("generation.sock");
+    let listener = Arc::new(
+        local_ipc::PrivateServiceListener::bind_at(
+            Directory::ensure_private(&private).unwrap(),
+            name,
+        )
+        .unwrap(),
+    );
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let listener = listener.clone();
+        let (registered, pending) = tokio::sync::oneshot::channel();
+        workers.spawn(async move {
+            let mut accepting = std::pin::pin!(listener.accept());
+            // Register this task's real waker before admitting either client.
+            poll_fn(|cx| {
+                assert!(accepting.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            registered.send(()).unwrap();
+            let mut stream = accepting.await.unwrap();
+            let mut payload = [0; 3];
+            stream.read_exact(&mut payload).await.unwrap();
+            payload
+        });
+        tokio::time::timeout(DEADLINE, pending)
+            .await
+            .expect("accept did not register its waiter")
+            .unwrap();
+    }
+    for payload in [b"one", b"two"] {
+        let directory = Directory::ensure_private(&private).unwrap();
+        let mut client = tokio::time::timeout(DEADLINE, local_ipc::connect(&directory, name))
+            .await
+            .expect("pending accepts prevented client admission")
+            .unwrap();
+        client.write_all(payload).await.unwrap();
+    }
+    let received = tokio::time::timeout(DEADLINE, async {
+        let mut received = Vec::new();
+        while let Some(result) = workers.join_next().await {
+            received.push(result.unwrap());
+        }
+        received.sort();
+        received
+    })
+    .await
+    .expect("one accept lost its independent readiness waiter");
+    assert_eq!(received, [*b"one", *b"two"]);
+    drop(listener);
+    assert!(!private.join(name).exists());
 }
 
 #[tokio::test]

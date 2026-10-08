@@ -2,11 +2,18 @@
 
 use super::*;
 
+const LITERAL_DRAFT: &str = "literal draft e\u{301} 猫";
+const NATIVE_DRAFT_PROJECTION: &str = "literal draft e 猫";
+
 fn draft_frame(terminal: &mut Terminal, cursor_after: &str, labels: &[&str]) -> Result<()> {
     terminal.text(labels, READY)?;
     // The text can precede the final cursor update. Search and paste states
     // remain stable until another key, so bind the cursor before sending it.
-    terminal.composer(cursor_after)
+    if cursor_after == LITERAL_DRAFT {
+        terminal.composer_projection(cursor_after, NATIVE_DRAFT_PROJECTION)
+    } else {
+        terminal.composer(cursor_after)
+    }
 }
 
 fn settled_turn(terminal: &mut Terminal, count: usize) -> Result<()> {
@@ -40,9 +47,9 @@ async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts(
                 settled_turn(&mut terminal, index + 1)?;
             }
 
-            let draft = "literal draft e\u{301} 猫";
+            let draft = LITERAL_DRAFT;
             terminal.send(draft.as_bytes())?;
-            terminal.composer(draft)?;
+            draft_frame(&mut terminal, draft, &["enter send"])?;
             for (key, prompt, label) in [
                 (b"\x1b[A".as_slice(), newest, "history 1/2"),
                 (b"\x1b[B".as_slice(), draft, "enter send"),
@@ -73,13 +80,17 @@ async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts(
             )?;
             terminal.send(b"\x1b")?;
             draft_frame(&mut terminal, draft, &["enter send"])?;
+            // Submit the restored decomposed draft so the durable byte check
+            // proves the accent survived independently of ConPTY's projection.
+            terminal.send(b"\r")?;
+            settled_turn(&mut terminal, 3)?;
             terminal.send(b"\x12oldest")?;
             draft_frame(&mut terminal, oldest, &["reverse search", "1/1"])?;
             // Enter accepts a recalled draft; the next Enter submits it.
             terminal.send(b"\r")?;
             draft_frame(&mut terminal, oldest, &["enter send"])?;
             terminal.send(b"\r")?;
-            settled_turn(&mut terminal, 3)?;
+            settled_turn(&mut terminal, 4)?;
 
             let pasted = "日本語猫".repeat(50);
             let chip = format!("[paste · {} bytes · 1 lines]", pasted.len());
@@ -90,7 +101,7 @@ async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts(
             terminal.send(b"post")?;
             draft_frame(&mut terminal, &projected, &[&chip])?;
             terminal.send(b"\x1b[A")?;
-            draft_frame(&mut terminal, oldest, &["history 1/3"])?;
+            draft_frame(&mut terminal, oldest, &["history 1/4"])?;
             terminal.send(b"\x1b[B")?;
             draft_frame(&mut terminal, &projected, &[&chip, "enter send"])?;
             terminal.send(b"\x12newest")?;
@@ -111,7 +122,7 @@ async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts(
             terminal.send(b"\x05")?;
             terminal.composer(&removed)?;
             terminal.send(b"\r")?;
-            settled_turn(&mut terminal, 4)?;
+            settled_turn(&mut terminal, 5)?;
 
             let literal = format!("literal-paste:{pasted}:end");
             let compact = format!("literal-paste:{chip}:end");
@@ -120,23 +131,23 @@ async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts(
             terminal.send(b":end")?;
             draft_frame(&mut terminal, &compact, &[&chip])?;
             terminal.send(b"\r")?;
-            settled_turn(&mut terminal, 5)?;
+            settled_turn(&mut terminal, 6)?;
             // Submitted history carries canonical text, not chip labels or
             // terminal control sequences. Its wrapped final row owns the cursor.
             terminal.send(b"\x1b[A")?;
-            draft_frame(&mut terminal, ":end", &["history 1/5"])?;
+            draft_frame(&mut terminal, ":end", &["history 1/6"])?;
             ensure!(!terminal.screen().contains(&chip));
             terminal.send(b":again")?;
             terminal.composer(":end:again")?;
             terminal.send(b"\r")?;
-            settled_turn(&mut terminal, 6)?;
+            settled_turn(&mut terminal, 7)?;
             terminal.send(b"/quit\r")?;
             ensure!(terminal.finish(EXIT)?["status"] == 0);
             drop(terminal);
 
             let sessions: Vec<kuru_runtime::Session> =
                 serde_json::from_str(&sandbox.output("sessions")?)?;
-            ensure!(sessions.len() == 1 && sessions[0].turns == 6);
+            ensure!(sessions.len() == 1 && sessions[0].turns == 7);
             let output = BlockingCommand::new(env!("CARGO_BIN_EXE_kuru"))
                 .fixture_allow_independent_service()
                 .args(sandbox.args("demo"))
@@ -168,6 +179,7 @@ async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts(
                     == [
                         oldest.to_owned(),
                         newest.to_owned(),
+                        draft.to_owned(),
                         oldest.to_owned(),
                         removed,
                         literal.clone(),

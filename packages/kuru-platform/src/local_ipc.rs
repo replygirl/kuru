@@ -7,11 +7,13 @@
 use crate::fs::{Directory, NameRetention, Privacy, validate_component};
 use std::{
     ffi::{OsStr, OsString},
-    fs, io,
+    fs,
+    future::Future as _,
+    io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{UnixListener, UnixSocket, UnixStream};
 
 /// A checked, short owner-private socket directory. Unix-domain socket names
 /// have a fixed native path limit, so a configured data directory cannot be
@@ -50,6 +52,13 @@ fn short_directory_path(locator: &str) -> io::Result<PathBuf> {
         .join(locator))
 }
 
+// Mio sets close-on-exec in a separate step on Darwin. Listener creation
+// must not overlap an owned child's copy of the descriptor table.
+fn bind_listener(path: &Path) -> io::Result<UnixListener> {
+    let _spawning = crate::unix::spawn_lock();
+    UnixListener::bind(path)
+}
+
 pub struct PrivateServiceListener {
     directory: Directory,
     name: OsString,
@@ -73,7 +82,7 @@ impl PrivateServiceListener {
         }
         let directory = private;
         let path = directory.path().join(name);
-        let listener = UnixListener::bind(&path)?;
+        let listener = bind_listener(&path)?;
         let result = (|| {
             directory.revalidate()?;
             let metadata = fs::symlink_metadata(&path)?;
@@ -120,7 +129,14 @@ impl PrivateServiceListener {
 
     pub async fn accept(&self) -> io::Result<UnixStream> {
         self.directory.revalidate()?;
-        let (stream, _) = self.listener.accept().await?;
+        // Guard each synchronous poll, including accept's descriptor creation,
+        // while retaining the existing future's independent readiness waiter.
+        let mut accepting = std::pin::pin!(self.listener.accept());
+        let (stream, _) = std::future::poll_fn(|cx| {
+            let _spawning = crate::unix::spawn_lock();
+            accepting.as_mut().poll(cx)
+        })
+        .await?;
         self.directory.revalidate()?;
         Ok(stream)
     }
@@ -165,7 +181,11 @@ pub async fn connect(directory: &Directory, name: &OsStr) -> io::Result<UnixStre
             "private service endpoint is not an owner-private socket",
         ));
     }
-    let stream = UnixStream::connect(&path).await?;
+    let socket = {
+        let _spawning = crate::unix::spawn_lock();
+        UnixSocket::new_stream()?
+    };
+    let stream = socket.connect(&path).await?;
     private.revalidate()?;
     Ok(stream)
 }
@@ -249,7 +269,7 @@ mod refusal_contracts {
             io::ErrorKind::NotFound
         );
         let endpoint = path.join("stale.sock");
-        let native = UnixListener::bind(&endpoint).unwrap();
+        let native = bind_listener(&endpoint).unwrap();
         fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
         drop(native);
         let error = tokio::time::timeout(
@@ -285,7 +305,7 @@ mod refusal_contracts {
         let original = listener.path();
         let moved = original.with_file_name("displaced.sock");
         fs::rename(&original, &moved).unwrap();
-        let replacement = UnixListener::bind(&original).unwrap();
+        let replacement = bind_listener(&original).unwrap();
         let identity = fs::symlink_metadata(&original).unwrap().ino();
         drop(listener);
         assert_eq!(fs::symlink_metadata(&original).unwrap().ino(), identity);

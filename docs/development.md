@@ -314,7 +314,9 @@ Owned Unix children (`kuru_platform::unix::OwnedProcessGroup`) declare their
 standard streams as a `StdioPlan`; the platform creates each pipe close-on-exec
 and starts the child under one platform spawn lock, so a concurrent owned child
 cannot inherit another's pipe ends (std's macOS pipes set close-on-exec in a
-second step). The bounded `ps` snapshot spawns under the same lock. Independent
+second step). The bounded `ps` snapshot spawns under the same lock. Private Unix
+IPC listener binding, outgoing socket creation, and accepted socket creation
+also use that lock; asynchronous waits retain no lock guard. Independent
 memory-service launches also use that lock through `spawn_independent`, with
 null stdin/stdout and null or private-file stderr; their existing caller still
 retains and reaps the child without group kill-on-drop authority. Unrelated

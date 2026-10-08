@@ -16,19 +16,26 @@ description = "Install only the pinned cargo-audit scanner used by advisory task
 run = "mise install --locked \"cargo:cargo-audit[default-features=false,locked=true]@{{vars.kuru_cargo_audit_version}}\""
 
 [tasks."audit:advisories:refresh"]
+shell = "{% if os() == 'windows' %}powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command{% else %}sh -e -c{% endif %}"
+# This owned stock PowerShell launch reconstructs its standard module paths.
+env.PSModulePath = false
 description = "Explicitly refresh the isolated public RustSec advisory database"
 dir = "{{config_root}}"
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit refresh --database \"$KURU_ADVISORY_DB\""
-run_windows = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit refresh --database \"$env:KURU_ADVISORY_DB\""
+run_windows = "$ErrorActionPreference = 'Stop'; cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit refresh --database \"$env:KURU_ADVISORY_DB\"; exit $LASTEXITCODE"
 
 [tasks."audit:advisories"]
+shell = "{% if os() == 'windows' %}powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command{% else %}sh -e -c{% endif %}"
+# This owned stock PowerShell launch reconstructs its standard module paths.
+env.PSModulePath = false
 description = "Scan the root Cargo.lock against an already-refreshed RustSec database"
 dir = "{{config_root}}"
 tools."cargo:cargo-audit" = { version = "{{vars.kuru_cargo_audit_version}}", locked = true, default-features = false }
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit scan --database \"$KURU_ADVISORY_DB\" --audit-bin \"$(command -v cargo-audit)\""
-run_windows = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit scan --database \"$env:KURU_ADVISORY_DB\" --audit-bin \"$((Get-Command cargo-audit).Source)\""
+run_windows = "$ErrorActionPreference = 'Stop'; cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit scan --database \"$env:KURU_ADVISORY_DB\" --audit-bin \"$((Get-Command cargo-audit).Source)\"; exit $LASTEXITCODE"
 
 [tasks."coverage:workspace"]
+shell = "{% if os() == 'windows' %}powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command{% else %}sh -e -c{% endif %}"
 depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
 description = "Combine all package coverage with the delivery fixture toolchain"
 dir = "{{config_root}}/../.."
@@ -41,12 +48,16 @@ test "$("$llvm_cov" llvm-cov --version)" = "cargo-llvm-cov 0.9.1"
 "$llvm_cov" llvm-cov --workspace --all-targets --all-features --locked --no-fail-fast --fail-under-lines 95 --lcov --output-path target/coverage.lcov
 '''
 run_windows = '''
+$ErrorActionPreference = 'Stop'
 $llvmCov = Join-Path ((mise bin-paths 'aqua:taiki-e/cargo-llvm-cov@0.9.1').Trim()) 'cargo-llvm-cov.exe'
 if ((& $llvmCov llvm-cov --version).Trim() -ne 'cargo-llvm-cov 0.9.1') { throw 'Wrong cargo-llvm-cov version' }
 & $llvmCov llvm-cov --workspace --all-targets --all-features --locked --no-fail-fast --fail-under-lines 95 --lcov --output-path target/coverage.lcov
+exit $LASTEXITCODE
 '''
 
 [tasks."coverage:workspace".env]
+# This owned stock PowerShell launch reconstructs its standard module paths.
+PSModulePath = false
 RUST_TEST_THREADS = "2"
 KURU_TEST_SUPERVISOR_PREPARED = false
 

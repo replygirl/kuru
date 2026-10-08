@@ -17,6 +17,9 @@ run = "cargo clippy -p kuru-archive --all-targets --all-features --locked -- -D 
 run = "cargo generate-lockfile"
 
 [tasks.coverage]
+shell = "{% if os() == 'windows' %}powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command{% else %}sh -e -c{% endif %}"
+# This owned stock PowerShell launch reconstructs its standard module paths.
+env.PSModulePath = false
 description = "Require 95% meaningful archive codec line coverage"
 dir = "{{config_root}}/../.."
 run = '''
@@ -26,7 +29,9 @@ test "$("$llvm_cov" llvm-cov --version)" = "cargo-llvm-cov 0.9.1"
 "$llvm_cov" llvm-cov -p kuru-archive --all-targets --all-features --locked --fail-under-lines 95 --lcov --output-path target/kuru-archive-coverage.lcov
 '''
 run_windows = '''
+$ErrorActionPreference = 'Stop'
 $llvmCov = Join-Path ((mise bin-paths 'aqua:taiki-e/cargo-llvm-cov@0.9.1').Trim()) 'cargo-llvm-cov.exe'
 if ((& $llvmCov llvm-cov --version).Trim() -ne 'cargo-llvm-cov 0.9.1') { throw 'Wrong cargo-llvm-cov version' }
 & $llvmCov llvm-cov -p kuru-archive --all-targets --all-features --locked --fail-under-lines 95 --lcov --output-path target/kuru-archive-coverage.lcov
+exit $LASTEXITCODE
 '''
