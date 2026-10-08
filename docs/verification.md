@@ -1,5 +1,38 @@
 # Verification record
 
+## Native tool permissions (2026-10-08)
+
+One bounded direct ChatGPT subscription run with `gpt-5.6-luna` / low exercised
+the public interactive TUI in cmux. A single ordinary Freudian turn produced
+three deliberation and three speaking completions. Both native `file_write`
+calls displayed inline permission prompts with no effect while pending.
+Approve-once wrote the exact synthetic bytes to `approved.txt`; deny left
+`denied.txt` absent. The next requests carried the matching successful-write
+and permission-denied tool-result receipts, and the final answer settled
+normally. Public `/quit`, owned memory cleanup and exact terminal-setting
+restoration passed. The project and memory were isolated synthetic fixtures;
+fresh login was not repeated and no development tool inspected credentials.
+
+Reported usage was 6817 input, 418 output and 230 reasoning tokens, with zero
+cached input. Client estimates totaled 11,539 input tokens and observed output
+payload totaled 988 bytes. The fixture caps dispatch at eight streams, input
+estimates at 16,000 per request / 64,000 total, observed payload at 16 KiB and
+the child at 180 seconds. These are client bounds, not a server output-token or
+billing cap. An initial pane launch failed memory-template preparation because
+of its inherited file-descriptor limit; it dispatched zero inference streams.
+The successful launch used the same task-local 4096 limit as local tests.
+
+The paid case in `apps/kuru-tui/tests/native_live_tools_acceptance.rs` remains
+ignored by default. Its shared offline PTY flow and four guard cases passed,
+as did the complete local app suite, lint and typechecking. Explicit paid
+reproduction uses `mise run //apps/kuru-tui:test -- --test
+native_live_tools_acceptance native_live_tools_acceptance -- --exact --ignored
+--nocapture`. This run establishes the two native file-write decisions and
+continuations for this model and route; it does not establish other tools,
+API-key inference, every permission choice or future live behavior. Approved
+shell's same-user filesystem authority remains the documented
+[separate limitation](protocols.md#built-in-tools), including access to owner-only state.
+
 ## Phase 1 foundation checks (2026-09-16)
 
 The local regression suite covers typed content and durable migration,
