@@ -360,6 +360,10 @@ bytes causes undo to conflict instead of overwriting it.
 authorization. `auth` prints redacted local authentication status as JSON, and
 `logout` clears Kuru's ChatGPT credentials. These commands manage Kuru's own
 private auth store without a Codex executable or another application's tokens.
+After successful sign-in, Kuru lists available subscription models. A listing
+failure preserves sign-in and offers `kuru --provider codex models` retry guidance. Every ordinary
+startup and `kuru models` fetches the current provider catalog, including newly
+advertised models; no application update is needed to discover them.
 See [authentication configuration](configuration.md#authentication) for storage
 and API-key provider selection.
 `config` prints configured values and CLI overrides, redacting MCP environment

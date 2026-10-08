@@ -1,6 +1,6 @@
 use kuru_core::{
-    FactProvenance, ModelCatalog, ModelInfo, ModelMetadata, ModelRoute, PriceBasis, Sourced,
-    TokenizerEncoding, advertised_metadata,
+    CacheWriteTerms, FactProvenance, ModelCatalog, ModelInfo, ModelMetadata, ModelRoute,
+    PriceBasis, Sourced, TokenizerEncoding, advertised_metadata,
 };
 
 fn model(id: &str) -> ModelInfo {
@@ -10,6 +10,87 @@ fn model(id: &str) -> ModelInfo {
         efforts: vec!["unfamiliar-effort".into()],
         default_effort: Some("unfamiliar-effort".into()),
         metadata: ModelMetadata::default(),
+    }
+}
+
+#[test]
+fn current_sol_and_luna_have_verified_route_scoped_facts() {
+    let catalog = ModelCatalog::embedded().unwrap();
+    for (id, input, cached, output, writes) in [
+        ("gpt-6.1-sol", "2.00", "0.10", "10.00", "2.50"),
+        ("gpt-6-luna", "0.10", "0.01", "0.50", "0.125"),
+    ] {
+        for route in [ModelRoute::OpenAiResponses, ModelRoute::CodexSubscription] {
+            let enriched = catalog.enrich(route, model(id));
+            assert_eq!(enriched.id, id);
+            assert_eq!(enriched.efforts, ["unfamiliar-effort"]);
+            assert_eq!(
+                enriched.default_effort.as_deref(),
+                Some("unfamiliar-effort")
+            );
+            let prices = enriched.metadata.prices.unwrap();
+            assert_eq!(prices.input_per_million_usd, input);
+            assert_eq!(prices.cached_input_per_million_usd.as_deref(), Some(cached));
+            assert_eq!(prices.output_per_million_usd, output);
+            assert_eq!(prices.source.checked_on, "2026-10-08");
+            assert!(prices.source.url.ends_with(id));
+            assert_eq!(
+                prices.cache_write,
+                Some(CacheWriteTerms::PerMillionUsd {
+                    value: writes.into()
+                })
+            );
+            let tier = prices.long_context_tier.unwrap();
+            assert_eq!(tier.input_tokens_over, 272_000);
+            assert_eq!(tier.input_multiplier, "2");
+            assert_eq!(tier.cached_input_multiplier, "2");
+            assert_eq!(tier.output_multiplier, "1.5");
+            if route == ModelRoute::OpenAiResponses {
+                assert_eq!(
+                    enriched.metadata.context_window_tokens.unwrap().value,
+                    1_050_000
+                );
+                assert_eq!(enriched.metadata.max_output_tokens.unwrap().value, 128_000);
+                assert_eq!(
+                    prices.basis,
+                    PriceBasis::ApiStandard {
+                        api_model: id.into()
+                    }
+                );
+            } else {
+                assert!(enriched.metadata.context_window_tokens.is_none());
+                assert!(enriched.metadata.extended_context_window_tokens.is_none());
+                assert!(enriched.metadata.max_output_tokens.is_none());
+                assert_eq!(
+                    prices.basis,
+                    PriceBasis::ApiEquivalent {
+                        api_model: id.into()
+                    }
+                );
+            }
+            assert!(catalog.tokenizer(route, id).is_none());
+            let mut live = model(id);
+            live.metadata.context_window_tokens = Some(Sourced::advertised(64_000));
+            let live = catalog.enrich(route, live);
+            assert_eq!(
+                live.metadata.context_window_tokens.unwrap(),
+                Sourced::advertised(64_000)
+            );
+            assert!(live.metadata.max_output_tokens.is_none());
+        }
+        assert_eq!(
+            catalog.enrich(ModelRoute::CustomResponses, model(id)),
+            model(id)
+        );
+        // Family shorthand is not a supported alias or metadata match.
+        let family = id.rsplit('-').next().unwrap();
+        assert!(
+            catalog
+                .enrich(ModelRoute::OpenAiResponses, model(family))
+                .metadata
+                .prices
+                .is_none()
+        );
     }
 }
 

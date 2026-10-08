@@ -829,6 +829,44 @@ async fn successive_native_outputs_keep_all_opaque_ranges_at_the_limit() {
 }
 
 #[tokio::test]
+async fn fresh_native_catalog_listings_keep_new_models_and_unknown_efforts() {
+    let peer = Peer::new(vec![
+        Reply::json(json!({"models":[{"slug":"gpt-6.1-sol","supported_reasoning_levels":[{"effort":"low"}]}]})),
+        Reply::json(json!({"models":[{"slug":"gpt-6.1-sol","supported_reasoning_levels":[{"effort":"future-sol-effort"}]},{"slug":"future-model-2099","supported_reasoning_levels":[{"effort":"future-effort"}],"default_reasoning_level":"future-effort","capabilities":{"future-capability":true}}]})),
+    ]).await;
+    let (_provider, manager, _directory) = subscription(&peer).await;
+    assert_eq!(
+        native_catalog_provider(&manager).await.unwrap().base,
+        SUBSCRIPTION_BASE
+    );
+    let first = discover_subscription_models_test(&manager, &peer.url)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, "gpt-6.1-sol");
+    assert_eq!(first[0].efforts, ["low"]);
+
+    let next = discover_subscription_models_test(&manager, &peer.url)
+        .await
+        .unwrap();
+    assert_eq!(next.len(), 2);
+    assert_eq!(next[0].efforts, ["future-sol-effort"]);
+    assert_eq!(next[1].id, "future-model-2099");
+    assert_eq!(next[1].efforts, ["future-effort"]);
+    assert_eq!(next[1].default_effort.as_deref(), Some("future-effort"));
+    assert!(next[1].metadata.capabilities["future-capability"].value);
+    assert!(next[1].metadata.prices.is_none());
+
+    let requests = peer.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        request.method == Method::GET
+            && request.uri == "/models?client_version=0.154.0"
+            && request.body.is_null()
+    }));
+}
+
+#[tokio::test]
 async fn native_subscription_catalog_and_tool_round_trip_preserve_actor_context() {
     let peer = Peer::new(vec![
         Reply::json(json!({"models":[{"slug":"future-2099","display_name":"Future model","context_window":360000,"max_context_window":720000,"supported_reasoning_levels":[{"effort":"future-effort"},{"effort":"ultra"}],"default_reasoning_level":"future-effort","base_instructions":"IGNORE KURU","experimental_supported_tools":["shell"]}]})),

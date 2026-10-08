@@ -2697,15 +2697,20 @@ async fn production_upgrade_lost_commit_fixture(inject_error: bool) -> Result<()
             }
         };
         match joined {
-            Ok(Ok(store)) => {
-                if let Err(error) = store.close().await {
-                    cleanup_failures.push(format!("returned opening store: {error:#}"));
-                }
-            }
+            Ok(Ok(store)) => active_store = Some(store),
             Ok(Err(error)) => cleanup_failures.push(format!("unfinished opening: {error:#}")),
             Err(error) if error.is_cancelled() => {}
             Err(error) => cleanup_failures.push(format!("opening task: {error:#}")),
         }
+    }
+    // Reconciliation can finish before the proxy's independent session-end
+    // observation. Keep its engine alive through that observation and retire
+    // the proxy before closing the returned store.
+    if active_store.is_some()
+        && let Some(proxy) = proxy.as_ref()
+        && let Err(error) = await_flag(&proxy.session_ended, QUERY_TIMEOUT).await
+    {
+        cleanup_failures.push(format!("routed session-end observation: {error:#}"));
     }
     if let Some(proxy) = proxy.take()
         && AssertUnwindSafe(proxy.close())
