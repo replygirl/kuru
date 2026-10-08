@@ -103,6 +103,130 @@ fn report_login_catalog(
     }
 }
 
+pub(crate) async fn canary(model: &str, data: &Path, cwd: &Path) -> CanaryReport {
+    #[cfg(feature = "test-support")]
+    if let Some(endpoint) = std::env::var_os("KURU_TEST_CHATGPT_BASE") {
+        let Some(endpoint) = endpoint.to_str() else {
+            return CanaryReport {
+                schema_version: 1,
+                state: kuru_connectors::CanaryState::Unverified,
+                reason: Some("test_endpoint_rejected"),
+                incompatibility: None,
+                action: Some("Use a numeric loopback endpoint in the test fixture."),
+                observed: Vec::new(),
+                unobserved: vec![
+                    kuru_connectors::CanaryStage::Credentials,
+                    kuru_connectors::CanaryStage::Catalog,
+                    kuru_connectors::CanaryStage::Completion,
+                    kuru_connectors::CanaryStage::Usage,
+                    kuru_connectors::CanaryStage::Refresh,
+                    kuru_connectors::CanaryStage::ToolCall,
+                    kuru_connectors::CanaryStage::Reasoning,
+                ],
+            };
+        };
+        return kuru_connectors::subscription_canary_test_endpoint(data, cwd, model, endpoint)
+            .await;
+    }
+    subscription_canary(data, cwd, model).await
+}
+
+async fn finish(login: impl Future<Output = Result<AuthStatus>>) -> Result<AuthStatus> {
+    tokio::select! {
+        result = login => result,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("listen for login cancellation")?;
+            bail!("login cancelled");
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) async fn open_browser(url: &str) -> Result<()> {
+    use std::process::Stdio;
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let child = tokio::process::Command::new(program)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    browser_handoff(child, Duration::from_secs(3)).await
+}
+
+#[cfg(unix)]
+async fn browser_handoff(mut child: tokio::process::Child, deadline: Duration) -> Result<()> {
+    // Desktop launchers may wait for the browser session itself. Reap the
+    // launcher when it exits, but never terminate the user's browser lifetime.
+    let completion = tokio::spawn(async move { child.wait().await });
+    if let Ok(result) = tokio::time::timeout(deadline, completion).await {
+        ensure!(result??.success(), "browser opener failed");
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn desktop_handoff_reports_failure_and_keeps_a_running_browser_alive() {
+        kuru_memory::test_support::closing(async {
+            // Held across each spawn; see `crate::spawn_gate`.
+            let failed = {
+                let _gate = crate::spawn_gate::spawning().await;
+                tokio::process::Command::new("/bin/sh")
+                    .args(["-c", "exit 7"])
+                    .spawn()
+                    .unwrap()
+            };
+            assert!(
+                browser_handoff(failed, Duration::from_secs(2))
+                    .await
+                    .is_err()
+            );
+
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("browser-alive");
+            let running = {
+                let _gate = crate::spawn_gate::spawning().await;
+                tokio::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "sleep 0.1; printf desktop > \"$1\"",
+                        "browser-fixture",
+                    ])
+                    .arg(&marker)
+                    .spawn()
+                    .unwrap()
+            };
+            browser_handoff(running, Duration::from_millis(5))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while std::fs::read_to_string(&marker).ok().as_deref() != Some("desktop") {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), "desktop");
+        })
+        .await
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn open_browser(url: &str) -> Result<()> {
+    kuru_platform::windows::browser::open_http_url(url)
+        .await
+        .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
@@ -233,128 +357,4 @@ mod catalog_tests {
             "Signed-in model listing is unavailable. Retry with kuru --provider codex models.\n"
         );
     }
-}
-
-pub(crate) async fn canary(model: &str, data: &Path, cwd: &Path) -> CanaryReport {
-    #[cfg(feature = "test-support")]
-    if let Some(endpoint) = std::env::var_os("KURU_TEST_CHATGPT_BASE") {
-        let Some(endpoint) = endpoint.to_str() else {
-            return CanaryReport {
-                schema_version: 1,
-                state: kuru_connectors::CanaryState::Unverified,
-                reason: Some("test_endpoint_rejected"),
-                incompatibility: None,
-                action: Some("Use a numeric loopback endpoint in the test fixture."),
-                observed: Vec::new(),
-                unobserved: vec![
-                    kuru_connectors::CanaryStage::Credentials,
-                    kuru_connectors::CanaryStage::Catalog,
-                    kuru_connectors::CanaryStage::Completion,
-                    kuru_connectors::CanaryStage::Usage,
-                    kuru_connectors::CanaryStage::Refresh,
-                    kuru_connectors::CanaryStage::ToolCall,
-                    kuru_connectors::CanaryStage::Reasoning,
-                ],
-            };
-        };
-        return kuru_connectors::subscription_canary_test_endpoint(data, cwd, model, endpoint)
-            .await;
-    }
-    subscription_canary(data, cwd, model).await
-}
-
-async fn finish(login: impl Future<Output = Result<AuthStatus>>) -> Result<AuthStatus> {
-    tokio::select! {
-        result = login => result,
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("listen for login cancellation")?;
-            bail!("login cancelled");
-        }
-    }
-}
-
-#[cfg(unix)]
-pub(crate) async fn open_browser(url: &str) -> Result<()> {
-    use std::process::Stdio;
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let child = tokio::process::Command::new(program)
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    browser_handoff(child, Duration::from_secs(3)).await
-}
-
-#[cfg(unix)]
-async fn browser_handoff(mut child: tokio::process::Child, deadline: Duration) -> Result<()> {
-    // Desktop launchers may wait for the browser session itself. Reap the
-    // launcher when it exits, but never terminate the user's browser lifetime.
-    let completion = tokio::spawn(async move { child.wait().await });
-    if let Ok(result) = tokio::time::timeout(deadline, completion).await {
-        ensure!(result??.success(), "browser opener failed");
-    }
-    Ok(())
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn desktop_handoff_reports_failure_and_keeps_a_running_browser_alive() {
-        kuru_memory::test_support::closing(async {
-            // Held across each spawn; see `crate::spawn_gate`.
-            let failed = {
-                let _gate = crate::spawn_gate::spawning().await;
-                tokio::process::Command::new("/bin/sh")
-                    .args(["-c", "exit 7"])
-                    .spawn()
-                    .unwrap()
-            };
-            assert!(
-                browser_handoff(failed, Duration::from_secs(2))
-                    .await
-                    .is_err()
-            );
-
-            let directory = tempfile::tempdir().unwrap();
-            let marker = directory.path().join("browser-alive");
-            let running = {
-                let _gate = crate::spawn_gate::spawning().await;
-                tokio::process::Command::new("/bin/sh")
-                    .args([
-                        "-c",
-                        "sleep 0.1; printf desktop > \"$1\"",
-                        "browser-fixture",
-                    ])
-                    .arg(&marker)
-                    .spawn()
-                    .unwrap()
-            };
-            browser_handoff(running, Duration::from_millis(5))
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while std::fs::read_to_string(&marker).ok().as_deref() != Some("desktop") {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(std::fs::read_to_string(marker).unwrap(), "desktop");
-        })
-        .await
-    }
-}
-
-#[cfg(windows)]
-pub(crate) async fn open_browser(url: &str) -> Result<()> {
-    kuru_platform::windows::browser::open_http_url(url)
-        .await
-        .map_err(Into::into)
 }

@@ -14,3 +14,9 @@
 ## 3. Repository checks
 
 - [x] 3.1 @regression (agent) affected package tests, formatting, lint, typecheck, docs and normal hooks -> core 104/104, connectors 329/329, app authentication 5/5; public docs build/content/link checks passed; normal hk pre-push checks passed all seven categories after correcting one fixture cmp_owned lint. No paid inference. The known invalid default Dolt test cache was preserved; package-owned preparation used the existing healthy isolated cache.
+
+PR CI at `c2d908f2` exposed Windows-target `items_after_test_module` lint in
+the new login tests. Moving that test module after production/platform items
+changes no logic or assertions. The package-owned `lint:windows` task then
+passed locally for `x86_64-pc-windows-msvc`; full final-head PR CI remains the
+merge gate.
