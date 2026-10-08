@@ -148,3 +148,69 @@ pub fn current_image() -> io::Result<CurrentImage> {
         _parent: parent,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_name_preserves_exact_native_utf16_spelling_and_ignores_spare_tail() {
+        let spelling = r"\Device\HarddiskVolume3\MiXeD 日本語\Kuru.EXE";
+        let expected: Vec<u16> = spelling.encode_utf16().collect();
+        let mut buffer = expected.clone();
+        buffer.extend([0, b'X' as u16, 0, b'Y' as u16]);
+        let actual = checked_name(buffer, expected.len() as u32).unwrap();
+        assert_eq!(actual, expected);
+
+        // The native namespace prefix remains exact, while filename case is
+        // retained for the current-image comparison in case-sensitive folders.
+        let different_case: Vec<u16> = r"\Device\HarddiskVolume3\mixed 日本語\kuru.exe"
+            .encode_utf16()
+            .collect();
+        let mut buffer = different_case.clone();
+        buffer.push(0);
+        let actual_case = checked_name(buffer, different_case.len() as u32).unwrap();
+        assert_eq!(actual_case, different_case);
+        assert_ne!(actual_case, actual);
+    }
+
+    #[test]
+    fn checked_name_refuses_truncated_unterminated_and_ambiguous_native_names() {
+        let native: Vec<u16> = r"\Device\HarddiskVolume3\Kuru.EXE".encode_utf16().collect();
+        let length = native.len() as u32;
+        let mut unterminated = native.clone();
+        unterminated.push(b'X' as u16);
+        let mut interior_nul = native.clone();
+        interior_nul[9] = 0;
+        interior_nul.push(0);
+        let mut cases = vec![
+            ("length equals capacity", native.clone(), length),
+            ("length exceeds capacity", native.clone(), length + 1),
+            ("claimed terminator is nonzero", unterminated, length),
+            ("native name contains interior NUL", interior_nul, length),
+        ];
+        for spelling in [
+            r"C:\Kuru.EXE",
+            r"\??\C:\Kuru.EXE",
+            r"\\?\C:\Kuru.EXE",
+            r"\device\HarddiskVolume3\Kuru.EXE",
+        ] {
+            let mut buffer: Vec<u16> = spelling.encode_utf16().collect();
+            let length = buffer.len() as u32;
+            buffer.push(0);
+            cases.push((spelling, buffer, length));
+        }
+        for (label, buffer, length) in cases {
+            let error = checked_name(buffer, length).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert_eq!(
+                error.to_string(),
+                "current-image native name is truncated or ambiguous",
+                "{label}"
+            );
+        }
+        let mut accepted = native.clone();
+        accepted.push(0);
+        assert_eq!(checked_name(accepted, length).unwrap(), native);
+    }
+}

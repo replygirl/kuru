@@ -2070,4 +2070,190 @@ mod tests {
         assert_eq!((after.0.unwrap(), after.1.unwrap()), before);
         assert_eq!(bytes.unwrap(), b"readonly seal evidence");
     }
+
+    #[test]
+    fn installed_conditional_ace_refuses_private_admission_and_sealing_without_repair() {
+        use crate::fs::{regular_file_info, seal_private};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut file = private.create_new(OsStr::new("payload")).unwrap();
+        file.write_all(b"conditional ACL evidence").unwrap();
+        let original = descriptor(&security_text(&file));
+        let original_access = file_access_token(file.as_handle()).unwrap();
+        let original_info = regular_file_info(&file).unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        // Native SDDL constructs a valid callback ACE. The unconditional owner
+        // grant remains; private admission may not assume what its condition
+        // means or discard it while repairing the object's access policy.
+        let conditional = descriptor(&format!(
+            "O:{sid}D:P(A;;FA;;;{sid})(XA;;FR;;;WD;(@User.Title==\"KuruFixture\"))"
+        ));
+        let set_fixture_dacl = |handle: BorrowedHandle<'_>, dacl| {
+            // SAFETY: this isolated file and the supplied fixture descriptor
+            // remain retained through this synchronous DACL-only update.
+            let status = unsafe {
+                SetSecurityInfo(
+                    handle.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    dacl,
+                    null(),
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status as i32))
+            }
+        };
+        let installation = set_fixture_dacl(file.as_handle(), conditional.dacl().unwrap());
+        let installed = file_access_token(file.as_handle());
+        let admitted = crate::fs::require_private(&file);
+        let sealed = seal_private(&file, false);
+        let opened = private.read(OsStr::new("payload")).map(drop);
+        let after = file_access_token(file.as_handle());
+        let after_info = regular_file_info(&file);
+        let bytes = std::fs::read(private.path().join("payload"));
+        // Restore the exact captured native DACL before any outcome assertion
+        // or checked tree removal, including an unexpectedly accepted result.
+        let restoration = set_fixture_dacl(file.as_handle(), original.dacl().unwrap());
+        let restored = file_access_token(file.as_handle());
+        let binding = private.verify(OsStr::new("payload"), &file);
+        drop(file);
+        private.remove_tree().unwrap();
+
+        installation.expect("native conditional ACL installation must succeed");
+        restoration.expect("native original ACL restoration must succeed");
+        let installed = installed.unwrap();
+        assert_ne!(
+            installed, original_access,
+            "conditional ACE was not installed"
+        );
+        for (operation, result) in [
+            ("private admission", admitted),
+            ("private sealing", sealed),
+            ("owner-only opening", opened),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{operation}");
+            assert_eq!(
+                error.to_string(),
+                "unmodeled private ACL entry",
+                "{operation}"
+            );
+        }
+        assert_eq!(
+            after.unwrap(),
+            installed,
+            "refusal repaired or lost the conditional ACE"
+        );
+        assert_eq!(after_info.unwrap(), original_info);
+        assert_eq!(bytes.unwrap(), b"conditional ACL evidence");
+        assert_eq!(
+            restored.unwrap(),
+            original_access,
+            "original ACL was not restored exactly"
+        );
+        binding.unwrap();
+    }
+
+    #[test]
+    fn malformed_policy_extents_cannot_supply_retirement_authority_even_to_themselves() {
+        let owner = [1, 1, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0];
+        let dacl = [
+            2,
+            0,
+            28,
+            0,
+            1,
+            0,
+            0,
+            0,
+            ACCESS_ALLOWED_ACE_TYPE as u8,
+            INHERITED_ACE as u8,
+            20,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            5,
+            21,
+            0,
+            0,
+            0,
+        ];
+        let original_dacl = dacl;
+        for (allocation, used) in [(&dacl[..7], 7), (&dacl[..], 7), (&dacl[..], 29)] {
+            let error = canonical_access_token(false, &owner, allocation, used, 1).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "file DACL used extent is invalid");
+        }
+        assert_eq!(
+            dacl, original_dacl,
+            "encoder changed caller-owned ACL storage"
+        );
+        let valid = canonical_access_token(false, &owner, &dacl, dacl.len(), 1).unwrap();
+        assert!(same_retired_file_access(&valid, &valid));
+        for length in 0..valid.len() {
+            let truncated = &valid[..length];
+            assert!(
+                !same_retired_file_access(truncated, truncated),
+                "truncated extent {length}"
+            );
+        }
+        let owner_end = 5 + owner.len();
+        let ace_start = owner_end + 9;
+        let mut malformed = Vec::new();
+        let mut oversized_owner = valid.clone();
+        oversized_owner[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed.push(("owner extent", oversized_owner));
+        let mut excessive_count = valid.clone();
+        excessive_count[owner_end + 1..owner_end + 5].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed.push(("ACE count", excessive_count));
+        let mut excessive_extent = valid.clone();
+        excessive_extent[owner_end + 5..owner_end + 9].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed.push(("ACE allocation", excessive_extent));
+        let mut unaccounted_payload = valid.clone();
+        unaccounted_payload[owner_end + 1..owner_end + 5].copy_from_slice(&0_u32.to_le_bytes());
+        malformed.push(("unaccounted ACE payload", unaccounted_payload));
+        for (label, size) in [
+            ("short ACE", 3_u16),
+            ("oversized ACE", 21),
+            ("unused ACE extent", 4),
+        ] {
+            let mut record = valid.clone();
+            record[ace_start + 2..ace_start + 4].copy_from_slice(&size.to_le_bytes());
+            malformed.push((label, record));
+        }
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        malformed.push(("trailing allocation", trailing));
+        for (label, record) in malformed {
+            let untouched = record.clone();
+            assert!(
+                !same_retired_file_access(&record, &record),
+                "{label} accepted itself"
+            );
+            assert!(
+                !same_retired_file_access(&record, &valid),
+                "{label} accepted valid authority"
+            );
+            assert!(
+                !same_retired_file_access(&valid, &record),
+                "valid authority accepted {label}"
+            );
+            assert_eq!(record, untouched, "decoder mutated {label}");
+        }
+    }
 }

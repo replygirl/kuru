@@ -2185,4 +2185,66 @@ mod tests {
         assert_eq!(bytes[0].as_ref().unwrap(), b"named removal evidence");
         assert_eq!(bytes[1].as_ref().unwrap(), b"other retained evidence");
     }
+
+    #[test]
+    fn native_replacement_refuses_a_missing_leaf_under_the_exact_existing_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_dir = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+        let destination_dir =
+            Directory::ensure_private(&temporary.path().join("destination")).unwrap();
+        let mut candidate = source_dir.create_new(OsStr::new("candidate")).unwrap();
+        candidate
+            .write_all(b"unpublished candidate evidence")
+            .unwrap();
+        let mut adjacent = destination_dir.create_new(OsStr::new("adjacent")).unwrap();
+        adjacent.write_all(b"untouched adjacent evidence").unwrap();
+        let before = [
+            refusal_object_state(&candidate).unwrap(),
+            refusal_object_state(&adjacent).unwrap(),
+            refusal_object_state(&destination_dir.anchor().file).unwrap(),
+        ];
+        // `..` has an existing, retained parent but no publication filename.
+        // The guard must reject it before constructing a native rename record.
+        let destination = destination_dir.path().join("..");
+        let result = replace_open_destination(
+            &destination_dir.anchor().file,
+            &candidate,
+            None,
+            &destination,
+        );
+        let after = [
+            refusal_object_state(&candidate),
+            refusal_object_state(&adjacent),
+            refusal_object_state(&destination_dir.anchor().file),
+        ];
+        let names = [
+            source_dir.verify(OsStr::new("candidate"), &candidate),
+            destination_dir.verify(OsStr::new("adjacent"), &adjacent),
+        ];
+        let bytes = [
+            fs::read(source_dir.path().join("candidate")),
+            fs::read(destination_dir.path().join("adjacent")),
+        ];
+        drop((candidate, adjacent));
+        let removed_source = source_dir.remove_tree();
+        let removed_destination = destination_dir.remove_tree();
+        removed_source.unwrap();
+        removed_destination.unwrap();
+
+        let (phase, error) = result.unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "missing publication filename");
+        for (actual, expected) in after.into_iter().zip(before) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        for name in names {
+            name.unwrap();
+        }
+        assert_eq!(
+            bytes[0].as_ref().unwrap(),
+            b"unpublished candidate evidence"
+        );
+        assert_eq!(bytes[1].as_ref().unwrap(), b"untouched adjacent evidence");
+    }
 }
