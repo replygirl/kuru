@@ -20,3 +20,9 @@ the new login tests. Moving that test module after production/platform items
 changes no logic or assertions. The package-owned `lint:windows` task then
 passed locally for `x86_64-pc-windows-msvc`; full final-head PR CI remains the
 merge gate.
+
+At `d53324b8`, Ubuntu coverage partition 5 caught three new async tests outside
+the file's required memory closing scope. Their unchanged assertions now run
+inside `kuru_memory::test_support::closing`. The exact source guard and all
+five authentication tests passed locally (6/6), followed by Windows target
+lint. No cleanup guard or coverage requirement was weakened.

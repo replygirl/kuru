@@ -242,84 +242,93 @@ mod catalog_tests {
 
     #[tokio::test]
     async fn successful_login_reports_success_before_polling_catalog_and_lists_models() {
-        use std::{cell::RefCell, rc::Rc};
+        kuru_memory::test_support::closing(async {
+            use std::{cell::RefCell, rc::Rc};
 
-        struct CapturedOutput(Rc<RefCell<Vec<u8>>>);
-        impl Write for CapturedOutput {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.borrow_mut().extend_from_slice(bytes);
-                Ok(bytes.len())
+            struct CapturedOutput(Rc<RefCell<Vec<u8>>>);
+            impl Write for CapturedOutput {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.borrow_mut().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
             }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
 
-        let captured = Rc::new(RefCell::new(Vec::new()));
-        let mut output = CapturedOutput(captured.clone());
-        let mut errors = Vec::new();
-        complete_login(
-            async { Ok(authenticated()) },
-            async {
-                assert_eq!(captured.borrow().as_slice(), b"Signed in to ChatGPT.\n");
-                Ok(vec![ModelInfo {
-                    id: "future-model".into(),
-                    name: "Future model".into(),
-                    efforts: vec![],
-                    default_effort: None,
-                    metadata: Default::default(),
-                }])
-            },
-            &mut output,
-            &mut errors,
-        )
+            let captured = Rc::new(RefCell::new(Vec::new()));
+            let mut output = CapturedOutput(captured.clone());
+            let mut errors = Vec::new();
+            complete_login(
+                async { Ok(authenticated()) },
+                async {
+                    assert_eq!(captured.borrow().as_slice(), b"Signed in to ChatGPT.\n");
+                    Ok(vec![ModelInfo {
+                        id: "future-model".into(),
+                        name: "Future model".into(),
+                        efforts: vec![],
+                        default_effort: None,
+                        metadata: Default::default(),
+                    }])
+                },
+                &mut output,
+                &mut errors,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                captured.borrow().as_slice(),
+                b"Signed in to ChatGPT.\nAvailable ChatGPT models:\n  future-model\n"
+            );
+            assert!(errors.is_empty());
+        })
         .await
-        .unwrap();
-        assert_eq!(
-            captured.borrow().as_slice(),
-            b"Signed in to ChatGPT.\nAvailable ChatGPT models:\n  future-model\n"
-        );
-        assert!(errors.is_empty());
     }
 
     #[tokio::test]
     async fn failed_catalog_keeps_successful_login_and_reports_safe_retry_guidance() {
-        let mut output = Vec::new();
-        let mut errors = Vec::new();
-        complete_login(
-            async { Ok(authenticated()) },
-            async { Err(anyhow::anyhow!("provider-body-secret-sentinel")) },
-            &mut output,
-            &mut errors,
-        )
-        .await
-        .unwrap();
-        assert_eq!(output, b"Signed in to ChatGPT.\n");
-        assert_eq!(
+        kuru_memory::test_support::closing(async {
+            let mut output = Vec::new();
+            let mut errors = Vec::new();
+            complete_login(
+                async { Ok(authenticated()) },
+                async { Err(anyhow::anyhow!("provider-body-secret-sentinel")) },
+                &mut output,
+                &mut errors,
+            )
+            .await
+            .unwrap();
+            assert_eq!(output, b"Signed in to ChatGPT.\n");
+            assert_eq!(
             errors,
             b"Signed-in model listing is unavailable. Retry with kuru --provider codex models.\n"
         );
+        })
+        .await
     }
 
     #[tokio::test]
     async fn failed_login_never_polls_catalog_or_reports_success() {
-        let polled = std::cell::Cell::new(false);
-        let mut output = Vec::new();
-        let mut errors = Vec::new();
-        let result = complete_login(
-            async { Err(anyhow::anyhow!("synthetic login rejected")) },
-            async {
-                polled.set(true);
-                Ok(vec![])
-            },
-            &mut output,
-            &mut errors,
-        )
-        .await;
-        assert!(result.is_err());
-        assert!(!polled.get());
-        assert!(output.is_empty());
-        assert!(errors.is_empty());
+        kuru_memory::test_support::closing(async {
+            let polled = std::cell::Cell::new(false);
+            let mut output = Vec::new();
+            let mut errors = Vec::new();
+            let result = complete_login(
+                async { Err(anyhow::anyhow!("synthetic login rejected")) },
+                async {
+                    polled.set(true);
+                    Ok(vec![])
+                },
+                &mut output,
+                &mut errors,
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(!polled.get());
+            assert!(output.is_empty());
+            assert!(errors.is_empty());
+        })
+        .await
     }
 
     #[test]
