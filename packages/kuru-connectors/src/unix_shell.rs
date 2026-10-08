@@ -816,7 +816,7 @@ struct WorkerRequest {
 fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request: WorkerRequest) {
     let WorkerRequest {
         root_guard,
-        hold: _hold,
+        hold,
         root,
         command,
         environment,
@@ -838,6 +838,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         confirmed: AtomicBool::new(false),
         spawned: AtomicBool::new(false),
         admission: Mutex::new(Some(admission)),
+        hold: Mutex::new(hold),
     };
     #[cfg(test)]
     test_hooks.await_start();
@@ -1040,6 +1041,7 @@ struct WorkerFinish {
     confirmed: AtomicBool,
     spawned: AtomicBool,
     admission: Mutex<Option<ShellAdmissionPermit>>,
+    hold: Mutex<Option<crate::InvocationHold>>,
 }
 
 impl WorkerFinish {
@@ -1056,8 +1058,7 @@ impl WorkerFinish {
     }
 
     fn complete(&self, result: Result<String>) {
-        self.confirmed.store(true, Ordering::Release);
-        self.release_admission();
+        self.confirm();
         if let Some(registry) = self.registry.upgrade() {
             remove(&registry, self.id);
         }
@@ -1065,6 +1066,12 @@ impl WorkerFinish {
     }
 
     fn confirm(&self) {
+        let hold = self
+            .hold
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(hold);
         self.confirmed.store(true, Ordering::Release);
         self.release_admission();
     }
@@ -1548,6 +1555,63 @@ mod tests {
     struct RegistryWake {
         registry: Arc<RegistryInner>,
         owner_count: AtomicUsize,
+        released: Arc<AtomicBool>,
+        hold_released: AtomicBool,
+    }
+
+    #[tokio::test]
+    async fn confirmed_shell_operation_releases_hold_before_returning() {
+        struct Hold(Arc<AtomicBool>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        for fails_before_launch in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = retained_root(root.path());
+            let path = root.path().to_owned();
+            let released = Arc::new(AtomicBool::new(false));
+            let hold: crate::InvocationHold = Arc::new(Hold(released.clone()));
+            let registry = ShellRegistry::new();
+            crate::test_support::completion_on_wake(
+                async move {
+                    let result = registry
+                        .execute_with_progress_and_lifetime(
+                            directory,
+                            path,
+                            "printf complete".into(),
+                            crate::IO_TIMEOUT,
+                            move || {
+                                assert!(
+                                    !fails_before_launch,
+                                    "injected environment projection failure"
+                                );
+                                Vec::new()
+                            },
+                            None,
+                            Some(hold),
+                        )
+                        .await;
+                    ensure!(
+                        result.is_err() == fails_before_launch,
+                        "unexpected native shell result: {result:?}"
+                    );
+                    ensure!(
+                        released.load(Ordering::Acquire),
+                        "shell returned before hold release"
+                    );
+                    ensure!(
+                        registry.owner_count() == 0,
+                        "shell returned before registration release"
+                    );
+                    Ok(())
+                },
+                crate::IO_TIMEOUT + CLEANUP_ALLOWANCE,
+            )
+            .await
+            .unwrap();
+        }
     }
 
     impl Wake for RegistryWake {
@@ -1559,6 +1623,8 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .owners
                 .len();
+            self.hold_released
+                .store(self.released.load(Ordering::Acquire), Ordering::Release);
             assert_eq!(
                 self.owner_count.swap(count, Ordering::AcqRel),
                 usize::MAX,
@@ -1569,6 +1635,13 @@ mod tests {
 
     #[test]
     fn confirmed_completion_removes_only_its_reservation_before_waking_receiver() {
+        struct Hold(Arc<AtomicBool>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let released = Arc::new(AtomicBool::new(false));
         let registry = ShellRegistry::new();
         let (sender, mut receiver) = oneshot::channel();
         let control = Arc::new(Control {
@@ -1597,6 +1670,8 @@ mod tests {
         let wake = Arc::new(RegistryWake {
             registry: registry.inner.clone(),
             owner_count: AtomicUsize::new(usize::MAX),
+            released: released.clone(),
+            hold_released: AtomicBool::new(false),
         });
         let waker = Waker::from(wake.clone());
         let mut context = Context::from_waker(&waker);
@@ -1612,10 +1687,15 @@ mod tests {
             confirmed: AtomicBool::new(false),
             spawned: AtomicBool::new(true),
             admission: Mutex::new(registry.inner.admission.try_acquire()),
+            hold: Mutex::new(Some(Arc::new(Hold(released)))),
         };
         finish.complete(Ok("completed".into()));
 
         assert_eq!(wake.owner_count.load(Ordering::Acquire), 1);
+        assert!(
+            wake.hold_released.load(Ordering::Acquire),
+            "completed reservation outlived its hold"
+        );
         let received = match Pin::new(&mut receiver).poll(&mut context) {
             Poll::Ready(Ok(result)) => result,
             state => panic!("completion receiver did not resolve after wake: {state:?}"),

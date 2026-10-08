@@ -50,22 +50,44 @@ const CLEANUP: Duration = Duration::from_secs(5);
 const GRACE: Duration = Duration::from_millis(300);
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
 
+/// Transfer confirmed operation ownership with its reply. The receiver releases
+/// it before exposing completion; failed delivery keeps it through owner cleanup.
+struct HeldReply<T> {
+    result: Result<T>,
+    hold: Option<crate::InvocationHold>,
+}
+
+impl<T> HeldReply<T> {
+    fn new(result: Result<T>, hold: Option<crate::InvocationHold>) -> Self {
+        Self { result, hold }
+    }
+
+    fn finish(self) -> Result<T> {
+        let Self { result, hold } = self;
+        drop(hold);
+        result
+    }
+}
+
 enum Command {
     Send(
         Value,
-        oneshot::Sender<Result<()>>,
+        oneshot::Sender<HeldReply<()>>,
         Option<crate::InvocationHold>,
     ),
     #[cfg(test)]
-    Read(oneshot::Sender<Result<Value>>),
+    Read(oneshot::Sender<HeldReply<Value>>),
     Request(
         String,
         Value,
         Duration,
-        oneshot::Sender<Result<Value>>,
+        oneshot::Sender<HeldReply<Value>>,
         Option<crate::InvocationHold>,
     ),
-    Close(oneshot::Sender<Result<()>>, Option<crate::InvocationHold>),
+    Close(
+        oneshot::Sender<HeldReply<()>>,
+        Option<crate::InvocationHold>,
+    ),
 }
 
 /// Handle for one serial session whose worker owns the process and pipes.
@@ -73,7 +95,7 @@ pub(crate) struct Rpc {
     commands: mpsc::UnboundedSender<Command>,
     stderr: Arc<StdMutex<StderrTail>>,
     completion: Arc<Completion>,
-    started: Option<oneshot::Receiver<Result<()>>>,
+    started: Option<oneshot::Receiver<HeldReply<()>>>,
 }
 
 impl Rpc {
@@ -129,9 +151,13 @@ impl Rpc {
                     .enable_all()
                     .build()
                 else {
+                    drop(hold);
                     worker_completion.confirmed.store(true, Ordering::Release);
                     worker_completion.finished.store(true, Ordering::Release);
-                    let _ = ready.send(Err(anyhow::anyhow!("MCP worker runtime failed")));
+                    let _ = ready.send(HeldReply::new(
+                        Err(anyhow::anyhow!("MCP worker runtime failed")),
+                        None,
+                    ));
                     return;
                 };
                 runtime.block_on(worker(
@@ -161,7 +187,10 @@ impl Rpc {
         let Some(started) = self.started.take() else {
             return Ok(());
         };
-        started.await.context("MCP worker stopped during startup")?
+        started
+            .await
+            .context("MCP worker stopped during startup")?
+            .finish()
     }
 
     pub async fn send(&mut self, message: Value) -> Result<()> {
@@ -177,7 +206,7 @@ impl Rpc {
         self.commands
             .send(Command::Send(message, tx, hold))
             .map_err(|_| anyhow::anyhow!("JSON-RPC session is closed"))?;
-        rx.await.context("JSON-RPC send was cancelled")?
+        rx.await.context("JSON-RPC send was cancelled")?.finish()
     }
 
     #[cfg(test)]
@@ -186,7 +215,7 @@ impl Rpc {
         self.commands
             .send(Command::Read(tx))
             .map_err(|_| anyhow::anyhow!("JSON-RPC session is closed"))?;
-        rx.await.context("JSON-RPC read was cancelled")?
+        rx.await.context("JSON-RPC read was cancelled")?.finish()
     }
 
     pub async fn request(
@@ -209,7 +238,7 @@ impl Rpc {
         self.commands
             .send(Command::Request(method.into(), params, duration, tx, hold))
             .map_err(|_| anyhow::anyhow!("JSON-RPC session is closed"))?;
-        rx.await.context("JSON-RPC request was cancelled")?
+        rx.await.context("JSON-RPC request was cancelled")?.finish()
     }
 
     pub(crate) fn stderr_diagnostic(&self) -> Option<String> {
@@ -228,7 +257,7 @@ impl Rpc {
         match tokio::time::timeout(CLEANUP + GRACE + STDERR_DRAIN + Duration::from_secs(1), rx)
             .await
         {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => result.finish(),
             Ok(Err(_)) => self.completion.result(),
             Err(_) => self.completion.result(),
         }
@@ -256,7 +285,7 @@ struct Session {
 #[allow(clippy::too_many_arguments)]
 async fn worker(
     mut commands: mpsc::UnboundedReceiver<Command>,
-    ready: oneshot::Sender<Result<()>>,
+    ready: oneshot::Sender<HeldReply<()>>,
     program: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
@@ -282,47 +311,45 @@ async fn worker(
     {
         Startup::Ready(session) => session,
         Startup::Rejected => {
+            drop(hold);
             completion.confirmed.store(true, Ordering::Release);
-            let _ = ready.send(Err(anyhow::anyhow!(
-                "configured MCP process failed to start"
-            )));
+            let _ = ready.send(HeldReply::new(
+                Err(anyhow::anyhow!("configured MCP process failed to start")),
+                None,
+            ));
             return;
         }
         Startup::Retaining(mut owner) => {
-            let _ = ready.send(Err(anyhow::anyhow!(
-                "configured MCP process failed to start"
-            )));
+            let _ = ready.send(HeldReply::new(
+                Err(anyhow::anyhow!("configured MCP process failed to start")),
+                None,
+            ));
             owner.retain().await;
+            drop(hold);
             return;
         }
     };
-    if ready.send(Ok(())).is_err() {
+    if let Err(undelivered) = ready.send(HeldReply::new(Ok(()), hold)) {
         session.finish(false).await;
+        drop(undelivered);
         return;
     }
     // Native startup is complete. Idle reusable transport ownership does not
     // retain a prior session's drain barrier; each outstanding call owns its own.
-    drop(hold);
     while let Some(command) = commands.recv().await {
-        let keep_running = match command {
+        let next = match command {
             Command::Send(value, mut reply, hold) => {
                 let result = session.dispatch(value, &mut reply).await;
-                let keep_running = settle(&mut session, reply, result).await;
-                drop(hold);
-                keep_running
+                settle(session, reply, result, hold).await
             }
             #[cfg(test)]
             Command::Read(mut reply) => {
                 let result = session.receive(&mut reply).await;
-                settle(&mut session, reply, result).await
+                settle(session, reply, result, None).await
             }
             Command::Request(method, params, duration, mut reply, hold) => {
                 let result = session.request(&method, params, duration, &mut reply).await;
-                let keep_running = settle(&mut session, reply, result).await;
-                // Caller loss and unconfirmed cleanup retain the same worker
-                // through actual cleanup before releasing this exact hold.
-                drop(hold);
-                keep_running
+                settle(session, reply, result, hold).await
             }
             Command::Close(reply, hold) => {
                 commands.close();
@@ -330,17 +357,23 @@ async fn worker(
                 let result = confirmed
                     .then_some(())
                     .ok_or_else(|| anyhow::anyhow!("MCP cleanup remains unconfirmed"));
-                let _ = reply.send(result);
-                if !confirmed {
+                if confirmed {
+                    drop(session);
+                    drop(_finished);
+                    let _ = reply.send(HeldReply::new(result, hold));
+                } else {
+                    let _ = reply.send(HeldReply::new(result, None));
                     session.retain().await;
+                    drop(session);
+                    drop(hold);
                 }
-                drop(hold);
-                false
+                return;
             }
         };
-        if !keep_running {
+        let Some(next) = next else {
             return;
-        }
+        };
+        session = next;
     }
     session.finish(false).await;
 }
@@ -380,30 +413,39 @@ impl StartupOwner {
 }
 
 async fn settle<T>(
-    session: &mut Session,
-    reply: oneshot::Sender<Result<T>>,
+    mut session: Session,
+    reply: oneshot::Sender<HeldReply<T>>,
     operation: Operation<T>,
-) -> bool {
+    hold: Option<crate::InvocationHold>,
+) -> Option<Session> {
     match operation {
-        Operation::Complete(result) => {
-            if reply.send(result).is_ok() {
-                true
-            } else {
+        Operation::Complete(result) => match reply.send(HeldReply::new(result, hold)) {
+            Ok(()) => Some(session),
+            Err(undelivered) => {
                 session.finish(false).await;
-                false
+                drop(session);
+                drop(undelivered);
+                None
             }
-        }
+        },
         Operation::CallerLost => {
             session.finish(false).await;
-            false
+            drop(session);
+            drop(hold);
+            None
         }
         Operation::Stop(result) => {
             let confirmed = session.cleanup(false).await;
-            let _ = reply.send(result);
-            if !confirmed {
+            if confirmed {
+                drop(session);
+                let _ = reply.send(HeldReply::new(result, hold));
+            } else {
+                let _ = reply.send(HeldReply::new(result, None));
                 session.retain().await;
+                drop(session);
+                drop(hold);
             }
-            false
+            None
         }
     }
 }
@@ -549,7 +591,7 @@ impl Session {
     async fn dispatch(
         &mut self,
         message: Value,
-        reply: &mut oneshot::Sender<Result<()>>,
+        reply: &mut oneshot::Sender<HeldReply<()>>,
     ) -> Operation<()> {
         let operation = self.send_wire(message);
         tokio::pin!(operation);
@@ -564,7 +606,7 @@ impl Session {
     }
 
     #[cfg(test)]
-    async fn receive(&mut self, reply: &mut oneshot::Sender<Result<Value>>) -> Operation<Value> {
+    async fn receive(&mut self, reply: &mut oneshot::Sender<HeldReply<Value>>) -> Operation<Value> {
         if let Some(event) = self.events.pop_front() {
             return Operation::Complete(Ok(event));
         }
@@ -585,7 +627,7 @@ impl Session {
         method: &str,
         params: Value,
         duration: Duration,
-        reply: &mut oneshot::Sender<Result<Value>>,
+        reply: &mut oneshot::Sender<HeldReply<Value>>,
     ) -> Operation<Value> {
         self.next_id = self.next_id.saturating_add(1);
         let operation = self.request_wire(json!(self.next_id), method, params);
@@ -930,6 +972,128 @@ mod tests {
         Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Pinned).unwrap())
     }
 
+    #[tokio::test]
+    async fn confirmed_rpc_operations_release_their_hold_before_returning() {
+        struct Hold(Arc<AtomicBool>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let mut failures = Vec::new();
+        for phase in 0..4 {
+            let released = Arc::new(AtomicBool::new(false));
+            let hold: crate::InvocationHold = Arc::new(Hold(released.clone()));
+            let script = StdioFixture::new([
+                Step::Read,
+                Step::Read,
+                Step::Write(json!({"id":1,"result":{"answer":42}})),
+                Step::Eof,
+            ]);
+            let mut hold = Some(hold);
+            let mut held = move |at| if at == phase { hold.take() } else { None };
+            let mut rpc = Rpc::spawn_held(
+                script.command(),
+                &[],
+                &BTreeMap::new(),
+                Path::new("."),
+                root_guard(),
+                Arc::new(Admission::new()),
+                held(0),
+            )
+            .unwrap();
+            let outcome = crate::test_support::completion_on_wake(
+                async move {
+                    rpc.ready().await?;
+                    ensure!(
+                        phase != 0 || released.load(Ordering::Acquire),
+                        "startup returned before hold release"
+                    );
+                    rpc.send_held(json!({"method":"notice"}), held(1)).await?;
+                    ensure!(
+                        phase != 1 || released.load(Ordering::Acquire),
+                        "send returned before hold release"
+                    );
+                    let response = rpc
+                        .request_held("test", json!({}), IO_TIMEOUT, held(2))
+                        .await?;
+                    ensure!(
+                        response == json!({"answer":42}),
+                        "unexpected native response"
+                    );
+                    ensure!(
+                        phase != 2 || released.load(Ordering::Acquire),
+                        "request returned before hold release"
+                    );
+                    rpc.close_held(held(3)).await?;
+                    ensure!(
+                        released.load(Ordering::Acquire),
+                        "close returned before hold release"
+                    );
+                    Ok(())
+                },
+                IO_TIMEOUT * 4,
+            )
+            .await;
+            match outcome {
+                Ok(()) => script.assert_completed(1),
+                Err(error) => failures.push(format!("phase {phase}: {error:#}")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    #[tokio::test]
+    async fn confirmed_rpc_failures_release_their_hold_before_returning() {
+        struct Hold(Arc<AtomicBool>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        for response in [
+            Step::Write(json!({"id":1,"error":{"code":-32000,"message":"fixture refusal"}})),
+            Step::Raw("invalid"),
+        ] {
+            let script = StdioFixture::new([Step::Read, response, Step::Eof]);
+            let mut rpc = Rpc::spawn(
+                script.command(),
+                &[],
+                &BTreeMap::new(),
+                Path::new("."),
+                root_guard(),
+                Arc::new(Admission::new()),
+            )
+            .unwrap();
+            rpc.ready().await.unwrap();
+            let released = Arc::new(AtomicBool::new(false));
+            let hold: crate::InvocationHold = Arc::new(Hold(released.clone()));
+            crate::test_support::completion_on_wake(
+                async move {
+                    let result = rpc
+                        .request_held("test", json!({}), IO_TIMEOUT, Some(hold))
+                        .await;
+                    ensure!(result.is_err(), "invalid response returned success");
+                    ensure!(
+                        released.load(Ordering::Acquire),
+                        "confirmed failure returned before hold release"
+                    );
+                    rpc.close().await?;
+                    Ok(())
+                },
+                IO_TIMEOUT + CLEANUP + GRACE + STDERR_DRAIN,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                script.conversations(),
+                vec![vec![
+                    json!({"jsonrpc":"2.0","id":1,"method":"test","params":{}})
+                ]]
+            );
+        }
+    }
+
     struct CloseReplyWake {
         commands: mpsc::UnboundedSender<Command>,
         completion: Arc<Completion>,
@@ -987,7 +1151,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*lock(&wake.observation), Some((true, true)));
-        result.await.unwrap().unwrap();
+        result.await.unwrap().finish().unwrap();
         rpc.close().await.unwrap();
         script.assert_completed(1);
     }
