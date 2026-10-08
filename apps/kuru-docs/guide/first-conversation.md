@@ -61,11 +61,15 @@ submitted prompts from this session. <kbd>Ctrl</kbd>+<kbd>R</kbd> searches those
 prompts; <kbd>Escape</kbd> restores the unsent draft. This bounded history is
 temporary in-memory state, separate from the saved conversation.
 
-Large or multiline pastes appear as compact chips while the provider still
+On Unix terminals that send bracketed-paste events, large or multiline pastes appear as compact chips while the provider still
 receives the exact pasted text. Put the cursor on a chip and press
 <kbd>Ctrl</kbd>+<kbd>G</kbd> to expand or compact it, or <kbd>Ctrl</kbd>+<kbd>X</kbd>
 to remove only that pasted span. Drafts are limited to 128 KiB; a paste that
 would exceed the limit is rejected as a whole.
+
+Windows currently receives pasted input as individual console keystrokes. It
+does not identify an atomic paste block, so paste chips and whole-block rejection
+are unavailable there; review multiline input before sending it.
 
 Cancellation waits for the active operation to settle and keeps your submitted
 prompt in the transcript. If an answer completed first, Kuru shows it. Otherwise

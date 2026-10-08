@@ -23,7 +23,7 @@ fn settled_turn(terminal: &mut Terminal, count: usize) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts() -> Result<()> {
+async fn native_conpty_recall_search_and_key_history_preserve_literal_prompts() -> Result<()> {
     let _serial = SERIAL.lock().await;
     for columns in [120, 80] {
         let sandbox = Sandbox::warmed().await?;
@@ -71,13 +71,6 @@ async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts(
             terminal.send(&[127; 6])?;
             terminal.send(b"NO_NATIVE_RECALL_MATCH")?;
             draft_frame(&mut terminal, draft, &["reverse search", "0/0"])?;
-            // Pasting during search must not replace the saved literal draft.
-            terminal.send(b"\x1b[200~ignored search paste\x1b[201~")?;
-            draft_frame(
-                &mut terminal,
-                draft,
-                &["Leave prompt search before pasting"],
-            )?;
             terminal.send(b"\x1b")?;
             draft_frame(&mut terminal, draft, &["enter send"])?;
             // Submit the restored decomposed draft so the durable byte check
@@ -92,51 +85,47 @@ async fn native_conpty_recall_search_and_paste_history_preserve_literal_prompts(
             terminal.send(b"\r")?;
             settled_turn(&mut terminal, 4)?;
 
-            let pasted = "日本語猫".repeat(50);
-            let chip = format!("[paste · {} bytes · 1 lines]", pasted.len());
             let prefix = "saved 猫pre";
-            let projected = format!("{prefix}{chip}post");
-            terminal.send(prefix.as_bytes())?;
-            terminal.send(format!("\x1b[200~{pasted}\x1b[201~").as_bytes())?;
-            terminal.send(b"post")?;
-            draft_frame(&mut terminal, &projected, &[&chip])?;
+            let insertion = "remove_me";
+            let edited_draft = format!("{prefix}{insertion}post");
+            // crossterm's native Windows backend reads console key records,
+            // not atomic bracketed-paste events. Exercise actual key transport;
+            // paste-chip controls remain covered by Unix PTYs and event tests.
+            terminal.send(edited_draft.as_bytes())?;
+            draft_frame(&mut terminal, &edited_draft, &["enter send"])?;
             terminal.send(b"\x1b[A")?;
             draft_frame(&mut terminal, oldest, &["history 1/4"])?;
             terminal.send(b"\x1b[B")?;
-            draft_frame(&mut terminal, &projected, &[&chip, "enter send"])?;
+            draft_frame(&mut terminal, &edited_draft, &["enter send"])?;
             terminal.send(b"\x12newest")?;
             draft_frame(&mut terminal, newest, &["reverse search", "1/1"])?;
             terminal.send(b"\x1b")?;
-            draft_frame(&mut terminal, &projected, &[&chip, "enter send"])?;
+            draft_frame(&mut terminal, &edited_draft, &["enter send"])?;
 
             terminal.send(b"\x1b[D\x1b[D\x1b[D\x1b[D")?;
             draft_frame(
                 &mut terminal,
-                &format!("{prefix}{chip}"),
-                &["Ctrl+G expand/compact", "post"],
+                &format!("{prefix}{insertion}"),
+                &[&edited_draft],
             )?;
-            terminal.send(b"\x18")?;
+            terminal.send(&vec![127; insertion.len()])?;
             let removed = format!("{prefix}post");
-            draft_frame(&mut terminal, prefix, &[&removed, "Selected paste removed"])?;
-            ensure!(!terminal.screen().contains(&chip));
+            draft_frame(&mut terminal, prefix, &[&removed])?;
             terminal.send(b"\x05")?;
             terminal.composer(&removed)?;
             terminal.send(b"\r")?;
             settled_turn(&mut terminal, 5)?;
 
-            let literal = format!("literal-paste:{pasted}:end");
-            let compact = format!("literal-paste:{chip}:end");
-            terminal.send(b"literal-paste:")?;
-            terminal.send(format!("\x1b[200~{pasted}\x1b[201~").as_bytes())?;
-            terminal.send(b":end")?;
-            draft_frame(&mut terminal, &compact, &[&chip])?;
+            let long_text = "日本語猫".repeat(50);
+            let literal = format!("literal-input:{long_text}:end");
+            terminal.send(literal.as_bytes())?;
+            draft_frame(&mut terminal, ":end", &["enter send"])?;
             terminal.send(b"\r")?;
             settled_turn(&mut terminal, 6)?;
-            // Submitted history carries canonical text, not chip labels or
-            // terminal control sequences. Its wrapped final row owns the cursor.
+            // Submitted history carries canonical Unicode text. Its wrapped
+            // final row owns the cursor, independently of logical-line joining.
             terminal.send(b"\x1b[A")?;
             draft_frame(&mut terminal, ":end", &["history 1/6"])?;
-            ensure!(!terminal.screen().contains(&chip));
             terminal.send(b":again")?;
             terminal.composer(":end:again")?;
             terminal.send(b"\r")?;

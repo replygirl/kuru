@@ -136,7 +136,55 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "console-check" => {
-            kuru_platform::windows::console::verify_private_console_fixture()?;
+            use kuru_platform::windows::{
+                console::{ConsoleModeGuard, virtual_terminal_output_enabled},
+                process::StandardStream,
+            };
+            // This hidden-console parent deliberately has NUL standard streams.
+            // Console allocation alone must not authorize ANSI on those streams.
+            if ConsoleModeGuard::capture().is_ok()
+                || [
+                    StandardStream::Input,
+                    StandardStream::Output,
+                    StandardStream::Error,
+                ]
+                .into_iter()
+                .any(virtual_terminal_output_enabled)
+            {
+                return Err("NUL standard streams were accepted as a console".into());
+            }
+            let input = File::options().read(true).write(true).open("CONIN$")?;
+            let output = File::options().read(true).write(true).open("CONOUT$")?;
+            let error = File::options().read(true).write(true).open("CONOUT$")?;
+            let receipt = std::env::current_dir()?.join("console-public-result");
+            let mut child = child_spec()?;
+            child.args = vec![
+                "console-inherited-check".into(),
+                receipt.as_os_str().to_owned(),
+            ];
+            child.console = Console::Inherit;
+            child.stdin = Stdio::Handle(input.into());
+            child.stdout = Stdio::Handle(output.into());
+            child.stderr = Stdio::Handle(error.into());
+            let mut child = child.spawn().await?;
+            let status = child.wait(Duration::from_secs(5)).await;
+            if status.is_err() {
+                child.terminate()?;
+                child.wait(Duration::from_secs(5)).await?;
+            }
+            let status = status?;
+            let report = fs::read_to_string(receipt)?;
+            if !status.success() || report != "ok" {
+                return Err(format!("inherited console public contracts failed: {report}").into());
+            }
+        }
+        "console-inherited-check" => {
+            let result = kuru_platform::windows::console::verify_private_console_fixture();
+            let report = result
+                .as_ref()
+                .map_or_else(|error| error.to_string(), |_| "ok".into());
+            fs::write(&args[1], report)?;
+            result?;
         }
         "capture" => {
             let mut input = String::new();

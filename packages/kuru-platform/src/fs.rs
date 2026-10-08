@@ -1889,3 +1889,52 @@ mod volume_failure_contracts {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_removal_authority_contracts {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn consuming_removal_rejects_a_substituted_private_root_without_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("private");
+        let original = Directory::ensure_private(&path).unwrap();
+        original
+            .create_new(OsStr::new("sentinel"))
+            .unwrap()
+            .write_all(b"original evidence")
+            .unwrap();
+        let identity = original.identity();
+        let retired = temporary.path().join("retired");
+        std::fs::rename(&path, &retired).unwrap();
+        let replacement = Directory::ensure_private(&path).unwrap();
+        replacement
+            .create_new(OsStr::new("sentinel"))
+            .unwrap()
+            .write_all(b"replacement evidence")
+            .unwrap();
+        let replacement_identity = replacement.identity();
+        let result = original.remove_tree();
+        let original_bytes = std::fs::read(retired.join("sentinel")).unwrap();
+        let replacement_bytes = std::fs::read(path.join("sentinel")).unwrap();
+        replacement.revalidate().unwrap();
+        let current_identity = replacement.identity();
+        replacement.remove_tree().unwrap();
+        Directory::open(&retired, Privacy::OwnerOnly, NameRetention::Movable)
+            .unwrap()
+            .remove_tree()
+            .unwrap();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(error.identity, Some(identity));
+        assert_eq!(error.path, path);
+        assert_eq!(error.descendant, None);
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
+        assert_ne!(replacement_identity, identity);
+        assert_eq!(current_identity, replacement_identity);
+        assert_eq!(original_bytes, b"original evidence");
+        assert_eq!(replacement_bytes, b"replacement evidence");
+    }
+}

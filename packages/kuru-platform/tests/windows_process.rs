@@ -1004,6 +1004,159 @@ async fn wrong_peer_and_nonlocal_names_are_rejected_without_payload() {
     expected.wait(LIMIT).await.unwrap();
 }
 
+#[tokio::test]
+async fn peer_exit_fails_a_queued_write_without_releasing_an_unrelated_child() {
+    let root = tempfile::tempdir().unwrap();
+    // Accept/read, the pending flush probe, and peer reap are the waits before
+    // this parked peer is ended. Later error observations do not need it alive.
+    // Its readiness, accept/read, peer reap, flush/EOF, two closes and final
+    // peer wait precede unrelated termination; one LIMIT covers child creation.
+    let mut unrelated = idle(root.path(), series(10, 1)).await;
+    let listener = PrivateListener::bind().unwrap();
+    let mut spawn = spec(
+        root.path(),
+        &[OsStr::new("rendezvous-stall"), listener.address()],
+    );
+    spawn.args.push(budget_arg(series(3, 1)));
+    let mut child = spawn.spawn().await.unwrap();
+    let mut channel = listener.accept(&child, LIMIT).await.unwrap();
+    let observed: io::Result<_> = async {
+        let mut hello = [0; 9];
+        tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+            .await
+            .map_err(io::Error::other)??;
+        let queued = channel.write(&vec![b'x'; 8 * 1024 * 1024]).await?;
+        let pending = tokio::time::timeout(SHORT, channel.flush()).await.is_err();
+        child.terminate()?;
+        let status = child.wait(LIMIT).await?;
+        let flush = tokio::time::timeout(LIMIT, channel.flush())
+            .await
+            .map_err(io::Error::other)?;
+        let mut byte = [0];
+        let eof = tokio::time::timeout(LIMIT, channel.read(&mut byte))
+            .await
+            .map_err(io::Error::other)??;
+        Ok((
+            hello,
+            queued,
+            pending,
+            status,
+            flush,
+            eof,
+            unrelated.try_wait()?.is_none(),
+        ))
+    }
+    .await;
+    let closed = channel.close(LIMIT).await;
+    let closed_again = channel.close(LIMIT).await;
+    let child_settled = async {
+        child.terminate()?;
+        child.wait(LIMIT).await
+    }
+    .await;
+    let unrelated_settled = async {
+        unrelated.terminate()?;
+        unrelated.wait(LIMIT).await
+    }
+    .await;
+    closed.unwrap();
+    closed_again.unwrap();
+    child_settled.unwrap();
+    unrelated_settled.unwrap();
+    let (hello, queued, pending, status, flush, eof, unrelated_live) = observed.unwrap();
+    assert_eq!(&hello, b"connected");
+    assert_eq!(queued, 8 * 1024 * 1024);
+    assert!(
+        pending,
+        "the live peer unexpectedly consumed the queued write"
+    );
+    assert!(!status.success());
+    assert_eq!(flush.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(eof, 0);
+    assert!(unrelated_live, "peer I/O failure changed an unrelated Job");
+    assert!(channel.is_closed());
+}
+
+#[test]
+fn dropping_pending_pipe_io_does_not_wait_for_peer_or_tokio_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().to_owned();
+    // Accept/read, the two pending probes, and one LIMIT for unbounded child
+    // creation and runtime construction/shutdown. budget_arg adds the gap
+    // through thread join and the parent's subsequent owned termination.
+    let budget = series(3, 2);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (child, observed) = runtime.block_on(async {
+            let listener = PrivateListener::bind().unwrap();
+            let mut spawn = spec(
+                &directory,
+                &[OsStr::new("rendezvous-stall"), listener.address()],
+            );
+            spawn.args.push(budget_arg(budget));
+            let mut child = spawn.spawn().await.unwrap();
+            let mut channel = listener.accept(&child, LIMIT).await.unwrap();
+            let observed: io::Result<_> = async {
+                let mut hello = [0; 9];
+                tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+                    .await
+                    .map_err(io::Error::other)??;
+                let queued = channel.write(&vec![b'x'; 8 * 1024 * 1024]).await?;
+                let write_pending = tokio::time::timeout(SHORT, channel.flush()).await.is_err();
+                let mut byte = [0];
+                let read_pending = tokio::time::timeout(SHORT, channel.read(&mut byte))
+                    .await
+                    .is_err();
+                Ok((
+                    hello,
+                    queued,
+                    write_pending,
+                    read_pending,
+                    child.try_wait()?.is_none(),
+                ))
+            }
+            .await;
+            // Deliberately exercise Drop, not close: native resources must stay
+            // owned until cancellation completes, independently of this runtime.
+            drop(channel);
+            (child, observed)
+        });
+        drop(runtime);
+        sender
+            .send((child, observed))
+            .unwrap_or_else(|_| panic!("pending-I/O cleanup receiver disappeared"));
+    });
+    let (mut child, observed) = receiver
+        .recv_timeout(budget)
+        .expect("pending pipe Drop stranded Tokio runtime shutdown");
+    thread.join().unwrap();
+    let live_after_shutdown = child.try_wait();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    child.terminate().unwrap();
+    let settled = runtime.block_on(child.wait(LIMIT));
+    drop(runtime);
+    settled.unwrap();
+    let (hello, queued, write_pending, read_pending, live_before_drop) = observed.unwrap();
+    assert_eq!(&hello, b"connected");
+    assert_eq!(queued, 8 * 1024 * 1024);
+    assert!(
+        write_pending && read_pending,
+        "both native I/O directions must be pending"
+    );
+    assert!(live_before_drop);
+    assert!(
+        live_after_shutdown.unwrap().is_none(),
+        "Drop relied on peer exit"
+    );
+}
+
 #[test]
 fn stalled_overlapped_write_closes_before_peer_exit_and_runtime_shutdown() {
     let root = tempfile::tempdir().unwrap();

@@ -155,8 +155,9 @@ fn queue_focus(input: &OwnedHandle, focused: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Called only by the native platform fixture, in its own newly allocated
-/// hidden console. It verifies actual restore/Drop and native record contents
+/// Called only by the native platform fixture, through explicit standard
+/// handles inherited from its isolated hidden-console owner. It verifies
+/// actual restore/Drop and native record contents
 /// without requiring the CI host itself to have terminal standard handles.
 #[cfg(feature = "test-support")]
 pub fn verify_private_console_fixture() -> io::Result<()> {
@@ -175,13 +176,33 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
         .write(true)
         .open("CONOUT$")?
         .into();
-    let baseline = configure_baseline(&input, &output)?;
-    let mut guard = ConsoleModeGuard::from_handles(input.try_clone()?, output.try_clone()?)?;
+    let baseline = configure_test_baseline()?;
+    if [
+        StandardStream::Input,
+        StandardStream::Output,
+        StandardStream::Error,
+    ]
+    .into_iter()
+    .any(virtual_terminal_output_enabled)
+    {
+        return Err(io::Error::other(
+            "baseline console unexpectedly admits ANSI",
+        ));
+    }
+    let mut guard = ConsoleModeGuard::capture()?;
     let before = guard.original();
     if before != baseline {
         return Err(io::Error::other("isolated console baseline differs"));
     }
     guard.enable_virtual_terminal_output()?;
+    if virtual_terminal_output_enabled(StandardStream::Input)
+        || !virtual_terminal_output_enabled(StandardStream::Output)
+        || !virtual_terminal_output_enabled(StandardStream::Error)
+    {
+        return Err(io::Error::other(
+            "console VT admission differs from its modes",
+        ));
+    }
     set(&input, before.input ^ ENABLE_INSERT_MODE)?;
     set(&output, before.output ^ ENABLE_WRAP_AT_EOL_OUTPUT)?;
     if guard.current()? == before {
@@ -192,16 +213,19 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
         return Err(io::Error::other("explicit console restore differs"));
     }
     set(&input, before.input ^ ENABLE_INSERT_MODE)?;
+    guard.enable_virtual_terminal_output()?;
     drop(guard);
-    if mode(&input)? != before.input {
-        return Err(io::Error::other("Drop failed to restore console input"));
+    if mode(&input)? != before.input || mode(&output)? != before.output {
+        return Err(io::Error::other(
+            "Drop failed to restore exact console modes",
+        ));
     }
     // SAFETY: this fixture owns its console input and has no concurrent reader.
     if unsafe { FlushConsoleInputBuffer(input.as_raw_handle()) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    queue_focus(&input, false)?;
-    queue_focus(&input, true)?;
+    inject_focus(false)?;
+    inject_focus(true)?;
     let mut records = [INPUT_RECORD::default(); 2];
     let mut count = 0;
     // SAFETY: two initialized writable records and count are retained; Peek is
