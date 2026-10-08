@@ -163,19 +163,33 @@ async fn native_conpty_recall_search_and_key_history_preserve_literal_prompts() 
                         .to_owned(),
                 );
             }
+            let expected = [
+                oldest.to_owned(),
+                newest.to_owned(),
+                draft.to_owned(),
+                oldest.to_owned(),
+                removed,
+                literal.clone(),
+                format!("{literal}:again"),
+            ];
             ensure!(
-                prompts
-                    == [
-                        oldest.to_owned(),
-                        newest.to_owned(),
-                        draft.to_owned(),
-                        oldest.to_owned(),
-                        removed,
-                        literal.clone(),
-                        format!("{literal}:again")
-                    ],
-                "native recall changed canonical prompt bytes at {columns} columns"
+                prompts.len() == expected.len(),
+                "native recall prompt count: {}",
+                prompts.len()
             );
+            for (index, (actual, expected)) in prompts.iter().zip(&expected).enumerate() {
+                ensure!(
+                    actual == expected,
+                    "native recall changed canonical prompt bytes at {columns} columns, turn {}: \
+                     expected={expected:?} ({} bytes, scalars {:?}); \
+                     actual={actual:?} ({} bytes, scalars {:?})",
+                    index + 1,
+                    expected.len(),
+                    expected.chars().map(u32::from).collect::<Vec<_>>(),
+                    actual.len(),
+                    actual.chars().map(u32::from).collect::<Vec<_>>()
+                );
+            }
             Ok(())
         }
         .await;
