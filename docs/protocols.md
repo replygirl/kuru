@@ -56,6 +56,25 @@ own runtime. Subscription service compatibility and account access are separate
 from the public API-key interface; deterministic protocol fixtures do not prove
 live account access.
 
+After browser or device sign-in succeeds, Kuru lists the current subscription
+model IDs. If listing is unavailable, sign-in remains successful and Kuru shows
+`kuru --provider codex models` retry guidance. Listing sends no inference request. Kuru also
+fetches the selected provider's live catalog on every ordinary startup and each
+`kuru models` invocation, so newly advertised models appear without updating
+Kuru. It does not keep a daily disk cache or filter discovery through its pinned
+metadata.
+
+Select exact IDs such as `gpt-6-astra`, `gpt-6.1-sol`, `gpt-5.6-terra`, and
+`gpt-6-luna` when your account advertises them. Kuru has no family shorthand
+aliases named `astra`, `sol`, `terra`, or `luna`; explicit IDs remain unchanged.
+The pinned catalog includes verified API context, output and pricing facts for
+[GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) and
+[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna). Matching
+subscription slugs receive labelled API-equivalent prices, while subscription
+limits come from their own advertisements. Undocumented tokenizer mappings stay
+absent and use the labelled fallback estimate. New IDs can be discovered and
+selected even when no pinned prices or tokenizer facts exist.
+
 Each `ResponsesProvider` owns one `reqwest::Client`, so its requests can reuse
 that client's keep-alive pool while the provider instance remains alive. A
 counted loopback fixture proves reuse for two completed HTTP/1.1 SSE requests

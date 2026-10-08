@@ -256,6 +256,135 @@ async fn native_auth_status_and_api_key_have_no_fresh_store_effects() {
 }
 
 #[tokio::test]
+async fn native_login_catalog_follows_persistence_and_failure_preserves_authentication() {
+    for device in [false, true] {
+        for catalog_available in [true, false] {
+            let mut replies = if device {
+                vec![
+                    Reply::json(
+                        json!({"device_auth_id":"catalog-device","user_code":"CATALOG","interval":1,"expires_in":30}),
+                    ),
+                    Reply::json(
+                        json!({"authorization_code":"catalog-code","code_verifier":"catalog-verifier"}),
+                    ),
+                    Reply::json(tokens("catalog-account")),
+                ]
+            } else {
+                vec![Reply::json(tokens("catalog-account"))]
+            };
+            replies.push(if catalog_available {
+                Reply::json(json!({"models":[{"slug":"gpt-6.1-sol"},{"slug":"gpt-6-luna"}]}))
+            } else {
+                Reply {
+                    status: StatusCode::BAD_REQUEST,
+                    ..Reply::json(json!({"error":{"message":"provider-body-secret-sentinel"}}))
+                }
+            });
+            let mut fixture = Fixture::new(replies).await;
+            // Even with an API key present, this account operation must use
+            // the persisted subscription session exclusively.
+            Arc::get_mut(&mut fixture.manager.inner).unwrap().api_key =
+                Some("unused-api-key-secret-sentinel".into());
+            let login_status = if device {
+                fixture
+                    .manager
+                    .begin_device()
+                    .await
+                    .unwrap()
+                    .finish()
+                    .await
+                    .unwrap()
+            } else {
+                let login = fixture.manager.begin_browser().await.unwrap();
+                let (port, state, _) = callback(&login);
+                let task = tokio::spawn(login.finish());
+                let response = callback_request(
+                    port,
+                    &format!("/auth/callback?code=catalog-code&state={state}"),
+                    "GET",
+                    &format!("localhost:{port}"),
+                )
+                .await;
+                assert!(response.starts_with("HTTP/1.1 200"));
+                task.await.unwrap().unwrap()
+            };
+            assert!(login_status.authenticated);
+            assert!(fixture.manager.status().await.unwrap().authenticated);
+            let persisted = fixture.manager.credentials_snapshot().await.unwrap();
+            let before_catalog = if device { 3 } else { 1 };
+            assert_eq!(
+                fixture.count(),
+                before_catalog,
+                "login must finish before listing"
+            );
+
+            let catalog = crate::providers::discover_subscription_models_test(
+                &fixture.manager,
+                &fixture.manager.inner.issuer,
+            )
+            .await;
+            if catalog_available {
+                assert_eq!(
+                    catalog
+                        .unwrap()
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["gpt-6.1-sol", "gpt-6-luna"]
+                );
+            } else {
+                let error = format!("{:#}", catalog.unwrap_err());
+                assert!(!error.contains("provider-body-secret-sentinel"));
+                assert!(!error.contains("unused-api-key-secret-sentinel"));
+            }
+            assert!(fixture.manager.status().await.unwrap().authenticated);
+            let retained = fixture.manager.credentials_snapshot().await.unwrap();
+            assert_eq!(retained.session_id(), persisted.session_id());
+            assert_eq!(retained.generation(), persisted.generation());
+
+            let requests = fixture.state.requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                before_catalog + 1,
+                "no inference or API fallback"
+            );
+            let catalog_request = requests.last().unwrap();
+            assert_eq!(catalog_request.method, Method::GET);
+            assert_eq!(catalog_request.path, "/models?client_version=0.154.0");
+            assert!(catalog_request.body.is_empty());
+            assert_eq!(
+                catalog_request.headers["chatgpt-account-id"],
+                "catalog-account"
+            );
+            assert_eq!(
+                catalog_request.headers["authorization"],
+                format!("Bearer {}", persisted.bearer())
+            );
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request.path.contains("responses"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_subscription_listing_never_falls_back_to_an_api_key() {
+    let mut fixture = Fixture::new(vec![]).await;
+    Arc::get_mut(&mut fixture.manager.inner).unwrap().api_key =
+        Some("unused-api-key-secret-sentinel".into());
+    assert!(fixture.manager.status().await.unwrap().api_key_available);
+    assert!(
+        crate::discover_subscription_models(&fixture.manager)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.count(), 0);
+    assert!(!fixture.manager.status().await.unwrap().authenticated);
+}
+
+#[tokio::test]
 async fn native_auth_browser_exchanges_exact_pkce_and_publishes_private_session() {
     let fixture = Fixture::new(vec![Reply::json(tokens("account-one"))]).await;
     let login = fixture.manager.begin_browser().await.unwrap();

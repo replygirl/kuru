@@ -390,6 +390,29 @@ pub async fn provider(config: &Config, cwd: &Path, data_dir: &Path) -> Result<Ar
     }
 }
 
+/// List the fixed native ChatGPT catalog using Kuru's current subscription
+/// session. Account operations need no workspace provider configuration or
+/// Responses API key, and this operation sends no inference request.
+pub async fn discover_subscription_models(auth: &AuthManager) -> Result<Vec<ModelInfo>> {
+    native_catalog_provider(auth).await?.models().await
+}
+
+async fn native_catalog_provider(auth: &AuthManager) -> Result<ResponsesProvider> {
+    let initial = auth.credentials_snapshot().await?;
+    ResponsesProvider::subscription(auth.clone(), initial)
+}
+
+/// The endpoint override exists only inside deterministic connector tests.
+#[cfg(test)]
+pub(crate) async fn discover_subscription_models_test(
+    auth: &AuthManager,
+    base: &str,
+) -> Result<Vec<ModelInfo>> {
+    let mut provider = native_catalog_provider(auth).await?;
+    provider.base = base.to_owned();
+    provider.models().await
+}
+
 /// Offline transport for installation checks; never masquerades as inference.
 pub struct DemoProvider;
 
@@ -2367,6 +2390,47 @@ mod tests {
         assert_eq!(
             items.last().unwrap()["content"],
             "Peer reply: check the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_responses_catalog_listings_expose_new_ids_without_inventing_efforts() {
+        let peer = HttpFixture::new(vec![
+            Reply::json(json!({"data":[{"id":"gpt-6.1-sol"}]})),
+            Reply::json(json!({"data":[{"id":"gpt-6.1-sol"},{"id":"future-model-2099","capabilities":{"future-capability":true}}]})),
+        ]).await;
+        for (expected, count) in [
+            (vec!["gpt-6.1-sol"], 1),
+            (vec!["gpt-6.1-sol", "future-model-2099"], 2),
+        ] {
+            let models = ResponsesProvider::new(&peer.url, "")
+                .unwrap()
+                .models()
+                .await
+                .unwrap();
+            assert_eq!(
+                models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                models
+                    .iter()
+                    .all(|model| model.efforts.is_empty() && model.default_effort.is_none())
+            );
+            if count == 2 {
+                assert!(models[1].metadata.capabilities["future-capability"].value);
+                assert!(models[1].metadata.prices.is_none());
+            }
+        }
+        let requests = peer.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method == reqwest::Method::GET && request.body.is_null())
         );
     }
 

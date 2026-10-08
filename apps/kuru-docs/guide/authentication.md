@@ -38,6 +38,10 @@ For device authorization:
 kuru login --device
 ```
 
+After either sign-in flow succeeds, Kuru lists the available subscription model
+IDs. If that listing fails, sign-in remains successful; retry with
+`kuru --provider codex models`. Listing models sends no inference request.
+
 Kuru stores its session in the private `auth/openai` directory beneath its data
 directory. If you choose `--data-dir` or `KURU_DATA_DIR`, use that same location
 for login and chat. Keep it outside the project tool root. Kuru does not read
@@ -91,6 +95,19 @@ kuru --provider codex models
 ```
 
 Kuru reads the current provider catalog and preserves its advertised model IDs and reasoning effort values. Availability depends on the provider and your account. Use the catalog rather than a fixed list in documentation.
+
+Every ordinary startup and `kuru models` invocation fetches the live catalog,
+so newly advertised models appear without updating Kuru. There is no daily disk
+cache. Select exact IDs, such as `gpt-6.1-sol` or `gpt-6-luna`, when your account
+advertises them. Kuru has no `astra`, `sol`, `terra`, or `luna` shorthand aliases;
+explicit model IDs remain unchanged.
+
+The pinned catalog supplies verified API limits and prices for
+[GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) and
+[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna), with
+subscription prices labelled API-equivalent. Subscription limits come from the
+subscription catalog. New models remain selectable when pinned prices or
+tokenizer mappings are absent; context sizing then uses its labelled fallback.
 
 In the terminal, <kbd>F2</kbd> selects a model and <kbd>F3</kbd> selects effort. Both pickers accept a typed filter. Selecting `default` clears the explicit effort setting. To choose values for one invocation:
 

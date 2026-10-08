@@ -69,7 +69,7 @@ pub use providers::{
     COMPLETION_TIMEOUT, CanaryReport, CanaryStage, CanaryState, ContextPrefixEstimate,
     DemoProvider, Provider, ProviderEvent, ProviderFailureKind, ProviderReasoningSummary,
     ProviderSink, ResponsesProvider, TextDeltaSource, collect_completion,
-    largest_fitting_context_prefix, provider, subscription_canary,
+    discover_subscription_models, largest_fitting_context_prefix, provider, subscription_canary,
 };
 pub use redaction::{
     ProjectionError, json as project_json, text as project_text, truncate_tool_output,
