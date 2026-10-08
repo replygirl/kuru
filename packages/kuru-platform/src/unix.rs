@@ -1931,23 +1931,41 @@ mod tests {
     }
 
     #[test]
-    fn simple_exited_root_uses_one_job_and_running_root_uses_none() {
+    fn running_root_starts_no_jobs_and_consumed_readiness_starts_a_fresh_job() {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         let mut owner = OwnedProcessGroup::spawn(command, INHERITED).unwrap();
-        assert_eq!(owner.pre_reap_step(Instant::now()), PreReap::InvalidPhase);
+        let anchored = owner.pre_reap_step(Instant::now());
         // Represents a failed initial attempt against a still-running root.
         owner.phase = Phase::PostSignal;
         let limit = Instant::now() + TEST_BOUND;
-        assert_eq!(owner.pre_reap_step(limit), PreReap::Pending);
-        assert_eq!(owner.membership_jobs, 0);
+        let running = owner.pre_reap_step(limit);
+        let running_jobs = owner.membership_jobs;
         owner.resignal_before_reap(limit);
-        pre_reap_until_ready(&mut owner, limit).unwrap();
-        assert_eq!(owner.membership_jobs, 1);
+        let mut refused_attempts = 0;
+        let readiness = loop {
+            match owner.pre_reap_step(limit) {
+                PreReap::Ready => break Ok(()),
+                PreReap::Unobserved(io::ErrorKind::WouldBlock) => refused_attempts += 1,
+                PreReap::Pending => {}
+                result => break Err(format!("pre-reap readiness: {result:?}")),
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        let completed_jobs = owner.membership_jobs;
         // Readiness is consumed, not cached if a caller pauses before reap.
-        assert_eq!(owner.pre_reap_step(limit), PreReap::Pending);
-        assert_eq!(owner.membership_jobs, 2);
-        finish_test_owner(&mut owner).unwrap();
+        let resumed = owner.pre_reap_step(limit);
+        let resumed_jobs = owner.membership_jobs;
+        let cleanup = finish_test_owner(&mut owner);
+
+        assert_eq!(anchored, PreReap::InvalidPhase);
+        assert_eq!(running, PreReap::Pending);
+        assert_eq!(running_jobs, 0);
+        readiness.unwrap();
+        assert_eq!(completed_jobs, refused_attempts + 1);
+        assert_eq!(resumed, PreReap::Pending);
+        assert_eq!(resumed_jobs, completed_jobs + 1);
+        cleanup.unwrap();
     }
 
     fn close_on_exec(fd: &OwnedFd) -> bool {

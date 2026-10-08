@@ -56,6 +56,26 @@ async fn native_conpty_literal_combining_input_is_observed_before_composer() -> 
         filtered.len(),
         observed["keys"]
     );
+    let keys = observed["keys"].as_array().context("key receipt absent")?;
+    let accent: Vec<_> = keys.iter().filter(|key| key["scalar"] == 769).collect();
+    ensure!(
+        accent.len() == 1 && accent[0]["kind"] == "Press",
+        "Alt-code text did not commit exactly once: {accent:?}"
+    );
+    let ordinary_count = LITERAL_DRAFT
+        .chars()
+        .filter(|&character| character == 'e')
+        .count();
+    for kind in ["Press", "Release"] {
+        let count = keys
+            .iter()
+            .filter(|key| key["scalar"] == u32::from('e') && key["kind"] == kind)
+            .count();
+        ensure!(
+            count == ordinary_count,
+            "ordinary character {kind} changed: {count}, expected {ordinary_count}; keys={keys:?}"
+        );
+    }
     Ok(())
 }
 

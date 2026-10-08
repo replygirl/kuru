@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["apps/kuru-tui/vendor/crossterm-0.29.0"]
 members = [
   "apps/kuru-tui",
   "packages/kuru-core",
@@ -10,6 +11,11 @@ members = [
   "packages/kuru-platform",
   "packages/kuru-archive",
 ]
+
+[patch.crates-io]
+# Exact upstream 0.29.0 with the Windows Alt-code text-commit correction.
+# Source hash, license and minimal patch: apps/kuru-tui/vendor/README.md.
+crossterm = { path = "apps/kuru-tui/vendor/crossterm-0.29.0" }
 
 [workspace.package]
 version = "0.10.0"

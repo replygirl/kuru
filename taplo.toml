@@ -1,3 +1,9 @@
-exclude = ["target/**", "node_modules/**", "openspec/**"]
+# Preserve the published foreign manifest verbatim; Kuru manifests stay checked.
+exclude = [
+  "target/**",
+  "node_modules/**",
+  "openspec/**",
+  "apps/kuru-tui/vendor/crossterm-0.29.0/Cargo.toml",
+]
 [formatting]
 column_width = 100
