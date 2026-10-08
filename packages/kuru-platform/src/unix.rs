@@ -2601,15 +2601,10 @@ mod tests {
         });
         let written = input.write_all(b"ready\n");
         let ready = readback.recv_timeout(TEST_BOUND);
-        let observed: Result<(), Box<dyn std::error::Error>> = async {
+        let observed = async {
             written?;
             let bytes = ready??;
-            if bytes != *b"ready\n" || !matches!(owner.root_state(), RootState::Running) {
-                return Err(io::Error::other(
-                    "owned cat was not live after the completed roundtrip",
-                )
-                .into());
-            }
+            let before = owner.root_state();
             let original = listener.path();
             let stale = private.join("stale.sock");
             std::fs::rename(&original, &stale)?;
@@ -2619,40 +2614,33 @@ mod tests {
             let refused =
                 tokio::time::timeout(TEST_BOUND, connect(&directory, OsStr::new("stale.sock")))
                     .await?;
-            match refused {
-                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
-                result => {
-                    return Err(io::Error::other(format!(
-                        "closed listener was not refused: {result:?}"
-                    ))
-                    .into());
-                }
-            }
             let retained = std::fs::symlink_metadata(&stale)?;
-            if !retained.file_type().is_socket() || retained.ino() != identity {
-                return Err(io::Error::other("stale connect changed the retained endpoint").into());
-            }
-            if PrivateServiceListener::bind_at(directory, OsStr::new("stale.sock")).is_ok() {
-                return Err(
-                    io::Error::other("stale endpoint was adopted by a checked bind").into(),
-                );
-            }
-            if std::fs::read(private.join("adjacent"))? != b"unchanged"
-                || !matches!(owner.root_state(), RootState::Running)
-            {
-                return Err(io::Error::other(
-                    "adjacent state changed or the owned child exited during the probe",
-                )
-                .into());
-            }
-            Ok(())
+            let rebound =
+                PrivateServiceListener::bind_at(directory, OsStr::new("stale.sock")).is_ok();
+            let adjacent = std::fs::read(private.join("adjacent"))?;
+            let after = owner.root_state();
+            Ok::<_, Box<dyn std::error::Error>>((
+                bytes, before, identity, refused, retained, rebound, adjacent, after,
+            ))
         }
         .await;
         drop(input);
         let settled = settle_without_sleep(&mut owner, TEST_BOUND);
         reader.join().unwrap();
         settled.unwrap();
-        observed.unwrap();
+        let (bytes, before, identity, refused, retained, rebound, adjacent, after) =
+            observed.unwrap();
+        assert_eq!(bytes, *b"ready\n");
+        assert!(matches!(before, RootState::Running), "before={before:?}");
+        assert!(matches!(after, RootState::Running), "after={after:?}");
+        assert!(
+            matches!(refused, Err(ref error) if error.kind() == io::ErrorKind::ConnectionRefused),
+            "closed listener was not refused: {refused:?}"
+        );
+        assert!(retained.file_type().is_socket());
+        assert_eq!(retained.ino(), identity);
+        assert!(!rebound, "stale endpoint was adopted by a checked bind");
+        assert_eq!(adjacent, b"unchanged");
     }
 
     async fn private_ipc_operation_waits_for_descriptor_copy(accepting: bool) {

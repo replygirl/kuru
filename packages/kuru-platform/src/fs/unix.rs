@@ -452,6 +452,63 @@ mod native_refusal_contracts {
     use super::*;
 
     #[test]
+    fn native_unlink_refusal_preserves_exact_private_file_and_adjacent_state() {
+        use std::{io::Write as _, os::unix::fs::PermissionsExt};
+
+        // Root bypasses this native DAC boundary; ordinary native CI runs as
+        // a non-root account. A root run cannot establish this refusal.
+        if rustix::process::geteuid().as_raw() == 0 {
+            eprintln!("native unlink DAC refusal requires a non-root account");
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("parent")).unwrap();
+        let name = OsStr::new("record");
+        let mut held = parent.create_new(name).unwrap();
+        held.write_all(b"retained record bytes").unwrap();
+        parent
+            .create_new(OsStr::new("adjacent"))
+            .unwrap()
+            .write_all(b"adjacent bytes")
+            .unwrap();
+        let identity = checked_file(&held).unwrap().identity;
+        let parent_identity = parent.identity();
+        let original_mode = parent.anchor().file.metadata().unwrap().permissions();
+        parent
+            .anchor()
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let outcome = parent.remove_file(name, held);
+        // Restore the exact retained object before any assertion or cleanup.
+        parent.anchor().file.set_permissions(original_mode).unwrap();
+        let error = outcome.unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.identity, Some(identity));
+        assert_eq!(error.path, parent.path().join(name));
+        assert_eq!(error.descendant, None);
+        parent.revalidate().unwrap();
+        assert_eq!(parent.identity(), parent_identity);
+        let record = parent.read(name).unwrap();
+        assert_eq!(checked_file(&record).unwrap().identity, identity);
+        assert_eq!(
+            std::fs::read(parent.path().join(name)).unwrap(),
+            b"retained record bytes"
+        );
+        assert_eq!(
+            std::fs::read(parent.path().join("adjacent")).unwrap(),
+            b"adjacent bytes"
+        );
+        parent.remove_file(name, record).unwrap();
+        assert!(!parent.path().join(name).exists());
+        assert_eq!(
+            std::fs::read(parent.path().join("adjacent")).unwrap(),
+            b"adjacent bytes"
+        );
+    }
+
+    #[test]
     fn native_removal_accepts_exact_root_absence_without_touching_adjacent_state() {
         let temporary = tempfile::tempdir().unwrap();
         let parent = Directory::ensure_private(&temporary.path().join("parent")).unwrap();
