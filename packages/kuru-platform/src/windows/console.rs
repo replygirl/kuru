@@ -177,49 +177,33 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
         .open("CONOUT$")?
         .into();
     let baseline = configure_test_baseline()?;
-    if [
+    let vt_before = [
         StandardStream::Input,
         StandardStream::Output,
         StandardStream::Error,
     ]
-    .into_iter()
-    .any(virtual_terminal_output_enabled)
-    {
-        return Err(io::Error::other(
-            "baseline console unexpectedly admits ANSI",
-        ));
-    }
+    .map(virtual_terminal_output_enabled);
     let mut guard = ConsoleModeGuard::capture()?;
     let before = guard.original();
-    if before != baseline {
-        return Err(io::Error::other("isolated console baseline differs"));
-    }
     guard.enable_virtual_terminal_output()?;
-    if virtual_terminal_output_enabled(StandardStream::Input)
-        || !virtual_terminal_output_enabled(StandardStream::Output)
-        || !virtual_terminal_output_enabled(StandardStream::Error)
-    {
-        return Err(io::Error::other(
-            "console VT admission differs from its modes",
-        ));
-    }
+    let vt_enabled = [
+        StandardStream::Input,
+        StandardStream::Output,
+        StandardStream::Error,
+    ]
+    .map(virtual_terminal_output_enabled);
     set(&input, before.input ^ ENABLE_INSERT_MODE)?;
     set(&output, before.output ^ ENABLE_WRAP_AT_EOL_OUTPUT)?;
-    if guard.current()? == before {
-        return Err(io::Error::other("fixture modes did not change"));
-    }
+    let changed = guard.current()?;
     guard.restore()?;
-    if guard.current()? != before {
-        return Err(io::Error::other("explicit console restore differs"));
-    }
+    let restored = guard.current()?;
     set(&input, before.input ^ ENABLE_INSERT_MODE)?;
     guard.enable_virtual_terminal_output()?;
     drop(guard);
-    if mode(&input)? != before.input || mode(&output)? != before.output {
-        return Err(io::Error::other(
-            "Drop failed to restore exact console modes",
-        ));
-    }
+    let after_drop = ConsoleModes {
+        input: mode(&input)?,
+        output: mode(&output)?,
+    };
     // SAFETY: this fixture owns its console input and has no concurrent reader.
     if unsafe { FlushConsoleInputBuffer(input.as_raw_handle()) } == 0 {
         return Err(io::Error::last_os_error());
@@ -234,19 +218,30 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    if count != 2
-        || records
-            .iter()
-            .any(|record| record.EventType != FOCUS_EVENT as u16)
-    {
-        return Err(io::Error::other("native focus records are missing"));
-    }
-    // SAFETY: the preceding event tags establish both active union variants.
-    if unsafe {
-        records[0].Event.FocusEvent.bSetFocus != 0 || records[1].Event.FocusEvent.bSetFocus != 1
-    } {
-        return Err(io::Error::other("native focus state changed"));
-    }
+    // All observations are asserted after native mode restoration. Keep true
+    // native API failures above; a fixture mismatch is an assertion with its
+    // exact observed values, not a synthetic filesystem-style error.
+    assert_eq!(vt_before, [false; 3], "baseline VT admission");
+    assert_eq!(before, baseline, "captured console modes");
+    assert_eq!(vt_enabled, [false, true, true], "enabled VT admission");
+    assert_ne!(changed, before, "console modes did not change");
+    assert_eq!(restored, before, "explicit console restoration");
+    assert_eq!(after_drop, before, "Drop console restoration");
+    assert_eq!(count, 2, "native focus record count");
+    assert_eq!(
+        [records[0].EventType, records[1].EventType],
+        [FOCUS_EVENT as u16; 2],
+        "native focus record tags"
+    );
+    // SAFETY: the preceding exact count/tag assertions establish both active
+    // union variants before either FocusEvent is read.
+    let focus = unsafe {
+        [
+            records[0].Event.FocusEvent.bSetFocus,
+            records[1].Event.FocusEvent.bSetFocus,
+        ]
+    };
+    assert_eq!(focus, [0, 1], "native focus states");
     Ok(())
 }
 

@@ -258,6 +258,34 @@ async fn command_resolution_and_representability_fail_before_execution() {
     let spec =
         configured_command(OsStr::new("bad%name.cmd"), &[], root.path(), env.clone()).unwrap();
     assert!(spec.spawn().await.is_err());
+    let marker = root.path().join("source-must-not-execute");
+    let mut source_refusals = Vec::new();
+    for separator in ['\0', '\n', '\r'] {
+        let source = format!("echo reached> \"{}\"{separator}", marker.display());
+        let spec = configured_command(
+            OsStr::new("cmd"),
+            &["/c".into(), source.into()],
+            root.path(),
+            env.clone(),
+        )
+        .unwrap();
+        let refusal = match spec.spawn().await {
+            Err(error) => Some(error),
+            Ok(mut child) => {
+                child.terminate().unwrap();
+                child.wait(Duration::from_secs(5)).await.unwrap();
+                None
+            }
+        };
+        source_refusals.push(refusal);
+    }
+    for refusal in source_refusals {
+        assert_eq!(
+            refusal.expect("unrepresentable cmd source executed").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+    assert!(!marker.exists(), "rejected source executed its marker");
     let mut oversized = env.clone();
     oversized.push(("BIG".into(), "x".repeat(8192).into()));
     let spec = configured_command(
@@ -586,6 +614,18 @@ async fn process_capabilities_and_case_equivalent_environment_are_checked() {
     );
     assert!(merge_environment([("bad=key".into(), "no".into())], []).is_err());
     assert!(merge_environment([("=C:".into(), "C:\\fixture".into())], []).is_ok());
+    assert!(merge_environment([("=c:".into(), "C:\\fixture".into())], []).is_ok());
+    let duplicate_drive = merge_environment(
+        [
+            ("=C:".into(), "C:\\private-first".into()),
+            ("=c:".into(), "C:\\private-second".into()),
+        ],
+        [],
+    )
+    .unwrap_err();
+    assert_eq!(duplicate_drive.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!duplicate_drive.to_string().contains("private-first"));
+    assert!(!duplicate_drive.to_string().contains("private-second"));
     assert!(
         merge_environment([(OsString::from_wide(&[b'A' as u16, 0]), "no".into())], []).is_err()
     );

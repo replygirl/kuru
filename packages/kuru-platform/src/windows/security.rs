@@ -1967,4 +1967,107 @@ mod tests {
         assert_eq!(bytes, b"published evidence");
         settled.unwrap();
     }
+
+    #[test]
+    fn metadata_only_source_refuses_public_security_operations_without_read_control() {
+        use crate::fs::{copy_file_access, finalize_file_access, regular_file_info};
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut source = private.create_new(OsStr::new("source")).unwrap();
+        source.write_all(b"metadata-only source evidence").unwrap();
+        let mut candidate = private.create_new(OsStr::new("candidate")).unwrap();
+        candidate
+            .write_all(b"untouched candidate evidence")
+            .unwrap();
+        // A real, valid file handle can inspect identity but carries neither
+        // READ_CONTROL nor WRITE_DAC. The private ACL itself remains unchanged.
+        let metadata = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(private.path().join("source"))
+            .unwrap();
+        let before = [
+            (
+                regular_file_info(&source).unwrap(),
+                file_access_token(source.as_handle()).unwrap(),
+            ),
+            (
+                regular_file_info(&candidate).unwrap(),
+                file_access_token(candidate.as_handle()).unwrap(),
+            ),
+        ];
+        let metadata_identity = regular_file_info(&metadata);
+        let private_check = crate::fs::require_private(&metadata);
+        let copied = copy_file_access(&metadata, &candidate).map(drop);
+        let finalized = finalize_file_access(&metadata, &candidate);
+        let owner = file_owner(metadata.as_handle()).map(|(allocation, _)| drop(allocation));
+        let after = [
+            (
+                regular_file_info(&source),
+                file_access_token(source.as_handle()),
+            ),
+            (
+                regular_file_info(&candidate),
+                file_access_token(candidate.as_handle()),
+            ),
+        ];
+        let bytes = [
+            std::fs::read(private.path().join("source")),
+            std::fs::read(private.path().join("candidate")),
+        ];
+        drop((metadata, source, candidate));
+        private.remove_tree().unwrap();
+
+        assert_eq!(metadata_identity.unwrap(), before[0].0);
+        for (operation, result) in [
+            ("private admission", private_check),
+            ("access copy", copied),
+            ("inheritance finalization", finalized),
+            ("owner read", owner),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(5), "{operation}: {error}");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{operation}");
+        }
+        for ((metadata, acl), expected) in after.into_iter().zip(before) {
+            assert_eq!((metadata.unwrap(), acl.unwrap()), expected);
+        }
+        assert_eq!(bytes[0].as_ref().unwrap(), b"metadata-only source evidence");
+        assert_eq!(bytes[1].as_ref().unwrap(), b"untouched candidate evidence");
+    }
+
+    #[test]
+    fn readonly_private_handle_cannot_seal_without_write_dac() {
+        use crate::fs::{regular_file_info, seal_private};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut writable = private.create_new(OsStr::new("payload")).unwrap();
+        writable.write_all(b"readonly seal evidence").unwrap();
+        let readonly = private.read(OsStr::new("payload")).unwrap();
+        let before = (
+            regular_file_info(&writable).unwrap(),
+            file_access_token(writable.as_handle()).unwrap(),
+        );
+        let readable_private = crate::fs::require_private(&readonly);
+        let result = seal_private(&readonly, false);
+        let after = (
+            regular_file_info(&writable),
+            file_access_token(writable.as_handle()),
+        );
+        let bytes = std::fs::read(private.path().join("payload"));
+        drop((readonly, writable));
+        private.remove_tree().unwrap();
+
+        readable_private.unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!((after.0.unwrap(), after.1.unwrap()), before);
+        assert_eq!(bytes.unwrap(), b"readonly seal evidence");
+    }
 }

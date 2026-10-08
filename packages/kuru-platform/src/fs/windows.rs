@@ -1995,4 +1995,194 @@ mod tests {
         }
         assert_eq!(completed.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
+
+    fn refusal_object_state(file: &File) -> io::Result<(FileInfo, bool, Vec<u8>)> {
+        let metadata = info(file)?;
+        Ok((
+            metadata.file,
+            metadata.directory,
+            security::file_access_token(file.as_handle())?,
+        ))
+    }
+
+    #[test]
+    fn public_object_admission_refuses_actual_file_directory_type_mismatches() {
+        use crate::fs::regular_file_info;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut file = parent.create_new(OsStr::new("file")).unwrap();
+        file.write_all(b"file admission evidence").unwrap();
+        let child = parent
+            .create_private_directory(OsStr::new("child"))
+            .unwrap();
+        let mut payload = child.create_new(OsStr::new("payload")).unwrap();
+        payload.write_all(b"directory admission evidence").unwrap();
+        let directory_file = open_directory(None, child.path(), NameRetention::Movable).unwrap();
+        let before = [
+            refusal_object_state(&file).unwrap(),
+            refusal_object_state(&directory_file).unwrap(),
+            refusal_object_state(&payload).unwrap(),
+        ];
+        let file_admission = regular_file_info(&directory_file);
+        let directory_admission = Directory::open(
+            &parent.path().join("file"),
+            Privacy::Inherited,
+            NameRetention::Movable,
+        );
+        let after = [
+            refusal_object_state(&file),
+            refusal_object_state(&directory_file),
+            refusal_object_state(&payload),
+        ];
+        let bytes = [
+            fs::read(parent.path().join("file")),
+            fs::read(child.path().join("payload")),
+        ];
+        // Even an unexpectedly admitted object must release its fixture handles
+        // before cleanup. Keep only its success/error observation.
+        let directory_admission = directory_admission.map(drop);
+        drop((file, payload, directory_file, child));
+        parent.remove_tree().unwrap();
+
+        let error = file_admission.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "expected a regular disk file");
+        let error = directory_admission.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "expected a regular directory");
+        for (actual, expected) in after.into_iter().zip(before) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        assert_eq!(bytes[0].as_ref().unwrap(), b"file admission evidence");
+        assert_eq!(bytes[1].as_ref().unwrap(), b"directory admission evidence");
+    }
+
+    #[test]
+    fn native_removal_refuses_real_wrong_types_and_retained_expected_identities() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut first = parent.create_new(OsStr::new("first")).unwrap();
+        first.write_all(b"first retained evidence").unwrap();
+        let mut second = parent.create_new(OsStr::new("second")).unwrap();
+        second.write_all(b"second retained evidence").unwrap();
+        let directory = parent
+            .create_private_directory(OsStr::new("directory"))
+            .unwrap();
+        let other_directory = parent
+            .create_private_directory(OsStr::new("other-directory"))
+            .unwrap();
+        let held_directory =
+            open_directory(None, directory.path(), NameRetention::Movable).unwrap();
+        let before = [
+            refusal_object_state(&first).unwrap(),
+            refusal_object_state(&second).unwrap(),
+            refusal_object_state(&held_directory).unwrap(),
+            refusal_object_state(&other_directory.anchor().file).unwrap(),
+        ];
+        let outcomes = [
+            remove_regular(
+                &parent.path().join("first"),
+                held_directory.try_clone().unwrap(),
+                directory.identity(),
+            ),
+            remove_regular(
+                &parent.path().join("first"),
+                first.try_clone().unwrap(),
+                before[1].0.identity,
+            ),
+            remove_empty_directory(
+                directory.path(),
+                first.try_clone().unwrap(),
+                before[0].0.identity,
+            ),
+            remove_empty_directory(
+                directory.path(),
+                held_directory.try_clone().unwrap(),
+                other_directory.identity(),
+            ),
+        ];
+        let after = [
+            refusal_object_state(&first),
+            refusal_object_state(&second),
+            refusal_object_state(&held_directory),
+            refusal_object_state(&other_directory.anchor().file),
+        ];
+        let bytes = [
+            fs::read(parent.path().join("first")),
+            fs::read(parent.path().join("second")),
+        ];
+        let directory_names = [
+            fs::symlink_metadata(directory.path()),
+            fs::symlink_metadata(other_directory.path()),
+        ];
+        drop((first, second, held_directory, directory, other_directory));
+        parent.remove_tree().unwrap();
+
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let (phase, error) = outcome.unwrap_err();
+            assert_eq!(phase, PublicationPhase::Rejected, "guard {index}");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "guard {index}"
+            );
+            assert_eq!(
+                error.to_string(),
+                if index < 2 {
+                    "retained file no longer has the expected identity"
+                } else {
+                    "retained directory no longer has the expected identity"
+                },
+                "guard {index}"
+            );
+        }
+        for (actual, expected) in after.into_iter().zip(before) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        for metadata in directory_names {
+            assert!(metadata.unwrap().is_dir());
+        }
+        assert_eq!(bytes[0].as_ref().unwrap(), b"first retained evidence");
+        assert_eq!(bytes[1].as_ref().unwrap(), b"second retained evidence");
+    }
+
+    #[test]
+    fn native_named_removal_refuses_a_different_real_retained_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut named = parent.create_new(OsStr::new("named")).unwrap();
+        named.write_all(b"named removal evidence").unwrap();
+        let mut other = parent.create_new(OsStr::new("other")).unwrap();
+        other.write_all(b"other retained evidence").unwrap();
+        let before = [
+            refusal_object_state(&named).unwrap(),
+            refusal_object_state(&other).unwrap(),
+        ];
+        let result = remove(
+            &parent.anchor().file,
+            &parent.path().join("named"),
+            other.try_clone().unwrap(),
+        );
+        let after = [refusal_object_state(&named), refusal_object_state(&other)];
+        let bytes = [
+            fs::read(parent.path().join("named")),
+            fs::read(parent.path().join("other")),
+        ];
+        drop((named, other));
+        parent.remove_tree().unwrap();
+
+        let (phase, error) = result.unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "removal name no longer identifies the held object"
+        );
+        for (actual, expected) in after.into_iter().zip(before) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        assert_eq!(bytes[0].as_ref().unwrap(), b"named removal evidence");
+        assert_eq!(bytes[1].as_ref().unwrap(), b"other retained evidence");
+    }
 }

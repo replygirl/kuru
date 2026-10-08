@@ -842,8 +842,14 @@ async fn trusted_child_survives_its_creator_until_private_lifetime_eof() {
     spawn.stdout = Stdio::Pipe;
     let mut owner = spawn.spawn().await.unwrap();
     ready(&mut owner).await;
+    let expected_id = owner.id();
+    let running = owner.diagnostic_snapshot();
+    let running_text = running.to_string();
+    let live_after_observation = owner.try_wait();
     owner.terminate().unwrap();
-    owner.wait(LIMIT).await.unwrap();
+    let status = owner.wait(LIMIT).await.unwrap();
+    let exited = owner.diagnostic_snapshot();
+    let exited_text = exited.to_string();
     tokio::time::timeout(LIMIT, async {
         while !receipt.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -852,6 +858,25 @@ async fn trusted_child_survives_its_creator_until_private_lifetime_eof() {
     .await
     .expect("trusted child did not finish after creator EOF");
     assert_eq!(fs::read(receipt).unwrap(), b"parent-lifetime");
+    assert_eq!(running.root_id, expected_id, "{running_text}");
+    assert!(
+        matches!(running.root, Ok(RootObservation::Running)),
+        "{running_text}"
+    );
+    assert!(running.job.is_none(), "{running_text}");
+    assert!(running_text.contains("state=running") && running_text.contains("job=none"));
+    assert!(
+        live_after_observation.unwrap().is_none(),
+        "diagnostics ended the owner"
+    );
+    assert!(!status.success());
+    assert_eq!(exited.root_id, expected_id, "{exited_text}");
+    assert!(
+        matches!(exited.root, Ok(RootObservation::Exited(1))),
+        "{exited_text}"
+    );
+    assert!(exited.job.is_none(), "{exited_text}");
+    assert!(exited_text.contains("state=exited(1)") && exited_text.contains("job=none"));
 }
 
 #[tokio::test]
@@ -1075,6 +1100,90 @@ async fn peer_exit_fails_a_queued_write_without_releasing_an_unrelated_child() {
     assert_eq!(eof, 0);
     assert!(unrelated_live, "peer I/O failure changed an unrelated Job");
     assert!(channel.is_closed());
+}
+
+#[tokio::test]
+async fn queued_peer_loss_is_propagated_by_second_write_and_shutdown() {
+    for route in ["second-write", "shutdown"] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = PrivateListener::bind().unwrap();
+        let mut spawn = spec(
+            root.path(),
+            &[OsStr::new("rendezvous-stall"), listener.address()],
+        );
+        // Accept, readiness read and reap enclose one pending-I/O probe. The
+        // later error and close observations do not require the peer alive.
+        spawn.args.push(budget_arg(series(3, 1)));
+        let mut child = spawn.spawn().await.unwrap();
+        let mut channel = listener.accept(&child, LIMIT).await.unwrap();
+        let observed: io::Result<_> = async {
+            let mut hello = [0; 9];
+            tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+                .await
+                .map_err(io::Error::other)??;
+            let queued = channel.write(&vec![b'x'; 8 * 1024 * 1024]).await?;
+            let pending = if route == "second-write" {
+                tokio::time::timeout(SHORT, channel.write(b"not accepted"))
+                    .await
+                    .is_err()
+            } else {
+                tokio::time::timeout(SHORT, channel.shutdown())
+                    .await
+                    .is_err()
+            };
+            let live = child.try_wait()?.is_none();
+            child.terminate()?;
+            let status = child.wait(LIMIT).await?;
+            // Do not consume the native write failure with flush first: each
+            // public operation must propagate that original queued failure.
+            let refusal = if route == "second-write" {
+                tokio::time::timeout(LIMIT, channel.write(b"not accepted"))
+                    .await
+                    .map_err(io::Error::other)?
+                    .map(|_| ())
+            } else {
+                tokio::time::timeout(LIMIT, channel.shutdown())
+                    .await
+                    .map_err(io::Error::other)?
+            };
+            Ok((
+                hello,
+                queued,
+                pending,
+                live,
+                status,
+                refusal,
+                channel.is_closed(),
+            ))
+        }
+        .await;
+        let closed = channel.close(LIMIT).await;
+        let settled = async {
+            child.terminate()?;
+            child.wait(LIMIT).await
+        }
+        .await;
+        closed.unwrap();
+        settled.unwrap();
+        let (hello, queued, pending, live, status, refusal, prematurely_closed) = observed.unwrap();
+        assert_eq!(&hello, b"connected", "{route}");
+        assert_eq!(queued, 8 * 1024 * 1024, "{route}");
+        assert!(
+            pending && live,
+            "{route}: queued work must wait for the live peer"
+        );
+        assert!(!status.success(), "{route}");
+        assert_eq!(
+            refusal.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe,
+            "{route}"
+        );
+        assert!(
+            !prematurely_closed,
+            "{route}: write failure must retain pipe cleanup ownership"
+        );
+        assert!(channel.is_closed(), "{route}");
+    }
 }
 
 #[test]
