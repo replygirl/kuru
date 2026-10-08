@@ -5,6 +5,60 @@ use super::*;
 const LITERAL_DRAFT: &str = "literal draft e\u{301} 猫";
 const NATIVE_DRAFT_PROJECTION: &str = "literal draft e 猫";
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_literal_combining_input_is_observed_before_composer() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let temporary = tempfile::tempdir()?;
+    let directory = temporary.path().join("input-events");
+    let mut terminal = Terminal::spawn(
+        &directory,
+        json!({
+            "mode":"input-events", "binary":env!("CARGO_BIN_EXE_kuru"),
+            "args":[], "environment":{}, "cwd":temporary.path(),
+        }),
+        30,
+        120,
+    )?;
+    let outcome = async {
+        terminal.wait("native raw input initialization", READY, |_| {
+            directory.join("ready.json").is_file()
+        })?;
+        terminal.send(LITERAL_DRAFT.as_bytes())?;
+        terminal.send(b"\r")?;
+        terminal.finish(EXIT)
+    }
+    .await;
+    // Finish joins the real console/output cleanup. Even an error drops the
+    // retained native fixture before any event-byte comparison is evaluated.
+    drop(terminal);
+    let removed = temporary.close();
+    let report = outcome?;
+    removed.context("settle native input fixture directory")?;
+    ensure!(
+        report["status"] == 0,
+        "native input fixture failed: {report}"
+    );
+    let observed = &report["input_events"];
+    let raw_characters = observed["all_characters"]
+        .as_str()
+        .context("raw character receipt absent")?;
+    let filtered = observed["filtered_text"]
+        .as_str()
+        .context("filtered character receipt absent")?;
+    let expected_scalars: Vec<u32> = LITERAL_DRAFT.chars().map(u32::from).collect();
+    let raw_scalars: Vec<u32> = raw_characters.chars().map(u32::from).collect();
+    let filtered_scalars: Vec<u32> = filtered.chars().map(u32::from).collect();
+    ensure!(
+        filtered == LITERAL_DRAFT,
+        "native pre-composer input differs: expected={LITERAL_DRAFT:?}/{} bytes/scalars={expected_scalars:?}; raw={raw_characters:?}/{} bytes/scalars={raw_scalars:?}; filtered={filtered:?}/{} bytes/scalars={filtered_scalars:?}; keys={}",
+        LITERAL_DRAFT.len(),
+        raw_characters.len(),
+        filtered.len(),
+        observed["keys"]
+    );
+    Ok(())
+}
+
 fn draft_frame(terminal: &mut Terminal, cursor_after: &str, labels: &[&str]) -> Result<()> {
     terminal.text(labels, READY)?;
     // The text can precede the final cursor update. Search and paste states
