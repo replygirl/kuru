@@ -3613,7 +3613,7 @@ impl AckDropProxy {
         assert!(
             result.as_ref().is_ok_and(|value| value.is_ok())
                 || result.as_ref().is_err_and(|error| error.is_cancelled()),
-            "packet proxy failed before expected shutdown"
+            "packet proxy failed before expected shutdown: {result:#?}"
         );
     }
 }
@@ -3691,116 +3691,226 @@ struct WireState {
     session_id: Option<u64>,
 }
 
-async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault>) -> Result<()> {
-    let (mut client_read, mut client_write) = client.into_split();
-    let (mut server_read, mut server_write) = server.into_split();
-    let state = Arc::new(StdMutex::new(WireState::default()));
-    let requests = state.clone();
-    let statement = fault.statement;
-    let request_fault = fault.clone();
-    let client_to_server = async move {
-        while let Some(packet) = read_packet(&mut client_read).await? {
-            let (discard, session_id) = {
-                let mut state = requests.lock().unwrap();
-                let payload = &packet[4..];
-                if state.authenticated && !payload.is_empty() {
-                    match payload[0] {
-                        0x16 => state.preparing = payload[1..].starts_with(statement.as_bytes()),
-                        0x03 => state.discard_next = payload[1..].starts_with(statement.as_bytes()),
-                        0x17 if payload.len() >= 5 => {
-                            let id = u32::from_le_bytes(payload[1..5].try_into().unwrap());
-                            state.discard_next = state.prepared == Some(id);
+async fn proxy_connection(
+    mut client: TcpStream,
+    mut server: TcpStream,
+    fault: Arc<Fault>,
+) -> Result<()> {
+    let intercepted = {
+        let fault = fault.clone();
+        let (mut client_read, mut client_write) = client.split();
+        let (mut server_read, mut server_write) = server.split();
+        let state = Arc::new(StdMutex::new(WireState::default()));
+        let requests = state.clone();
+        let statement = fault.statement;
+        let request_fault = fault.clone();
+        let client_to_server = async move {
+            while let Some(packet) = read_packet(&mut client_read).await? {
+                let (discard, session_id) = {
+                    let mut state = requests.lock().unwrap();
+                    let payload = &packet[4..];
+                    if state.authenticated && !payload.is_empty() {
+                        match payload[0] {
+                            0x16 => {
+                                state.preparing = payload[1..].starts_with(statement.as_bytes())
+                            }
+                            0x03 => {
+                                state.discard_next = payload[1..].starts_with(statement.as_bytes())
+                            }
+                            0x17 if payload.len() >= 5 => {
+                                let id = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+                                state.discard_next = state.prepared == Some(id);
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                let discard = request_fault.drop_kind == DropKind::RequestBeforeDispatch
-                    && state.discard_next
-                    && request_fault
-                        .discarded
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok();
+                    let discard = request_fault.drop_kind == DropKind::RequestBeforeDispatch
+                        && state.discard_next
+                        && request_fault
+                            .discarded
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok();
+                    if discard {
+                        state.discard_next = false;
+                    }
+                    (discard, state.session_id)
+                };
                 if discard {
-                    state.discard_next = false;
+                    let id = session_id
+                        .context("fixture did not observe the routed MySQL session id")?;
+                    return Ok::<_, anyhow::Error>(Some(id));
                 }
-                (discard, state.session_id)
-            };
-            if discard {
-                server_write.shutdown().await?;
-                let id =
-                    session_id.context("fixture did not observe the routed MySQL session id")?;
-                await_session_end(&request_fault.observer, id, QUERY_TIMEOUT)
-                    .await
-                    .context("routed SQL session remained after the absent request")?;
-                request_fault.session_ended.store(true, Ordering::Release);
-                return Ok::<_, anyhow::Error>(());
+                server_write.write_all(&packet).await?;
             }
-            server_write.write_all(&packet).await?;
-        }
-        Ok::<_, anyhow::Error>(())
-    };
-    let server_to_client = async move {
-        while let Some(packet) = read_packet(&mut server_read).await? {
-            let (discard, session_id) = {
-                let mut state = state.lock().unwrap();
-                let payload = &packet[4..];
-                if !state.authenticated && payload.first() == Some(&0x0a) {
-                    let Some(version_end) = payload[1..].iter().position(|byte| *byte == 0) else {
-                        bail!("fixture received malformed MySQL handshake");
-                    };
-                    let id_start = version_end + 2;
-                    ensure!(
-                        payload.len() >= id_start + 4,
-                        "fixture received truncated MySQL handshake"
-                    );
-                    let id =
-                        u32::from_le_bytes(payload[id_start..id_start + 4].try_into().unwrap());
-                    state.session_id = Some(u64::from(id));
-                }
-                if !state.authenticated && packet[3] >= 2 && payload.first() == Some(&0) {
-                    state.authenticated = true;
-                }
-                if state.preparing && payload.len() >= 5 && payload[0] == 0 {
-                    state.prepared = Some(u32::from_le_bytes(payload[1..5].try_into().unwrap()));
-                    state.preparing = false;
-                }
-                let discard = fault.drop_kind == DropKind::ReplyAfterDurability
-                    && std::mem::take(&mut state.discard_next)
-                    && fault
-                        .discarded
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok();
-                (discard, state.session_id)
-            };
-            if discard {
-                // Receiving a packet alone may only mean result metadata is
-                // ready. Observe the durable branch revision directly before
-                // discarding the reply, so the injected fault is a lost ack.
-                tokio::time::timeout(QUERY_TIMEOUT, async {
-                    loop {
-                        if durable_observation(&fault.observer, &fault.observation).await? {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+            server_write.shutdown().await?;
+            Ok::<_, anyhow::Error>(None)
+        };
+        let server_to_client = async move {
+            while let Some(packet) = read_packet(&mut server_read).await? {
+                let (discard, session_id) = {
+                    let mut state = state.lock().unwrap();
+                    let payload = &packet[4..];
+                    if !state.authenticated && payload.first() == Some(&0x0a) {
+                        let Some(version_end) = payload[1..].iter().position(|byte| *byte == 0)
+                        else {
+                            bail!("fixture received malformed MySQL handshake");
+                        };
+                        let id_start = version_end + 2;
+                        ensure!(
+                            payload.len() >= id_start + 4,
+                            "fixture received truncated MySQL handshake"
+                        );
+                        let id =
+                            u32::from_le_bytes(payload[id_start..id_start + 4].try_into().unwrap());
+                        state.session_id = Some(u64::from(id));
                     }
-                    Ok::<_, anyhow::Error>(())
-                })
-                .await
-                .context("intercepted SQL did not become durable")??;
-                client_write.shutdown().await?;
-                let id =
-                    session_id.context("fixture did not observe the routed MySQL session id")?;
-                await_session_end(&fault.observer, id, QUERY_TIMEOUT)
+                    if !state.authenticated && packet[3] >= 2 && payload.first() == Some(&0) {
+                        state.authenticated = true;
+                    }
+                    if state.preparing && payload.len() >= 5 && payload[0] == 0 {
+                        state.prepared =
+                            Some(u32::from_le_bytes(payload[1..5].try_into().unwrap()));
+                        state.preparing = false;
+                    }
+                    let discard = fault.drop_kind == DropKind::ReplyAfterDurability
+                        && std::mem::take(&mut state.discard_next)
+                        && fault
+                            .discarded
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok();
+                    (discard, state.session_id)
+                };
+                if discard {
+                    // Receiving a packet alone may only mean result metadata is
+                    // ready. Observe the durable branch revision directly before
+                    // discarding the reply, so the injected fault is a lost ack.
+                    tokio::time::timeout(QUERY_TIMEOUT, async {
+                        loop {
+                            if durable_observation(&fault.observer, &fault.observation).await? {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })
                     .await
-                    .context("routed SQL session remained after the lost reply")?;
-                fault.session_ended.store(true, Ordering::Release);
-                return Ok::<_, anyhow::Error>(());
+                    .context("intercepted SQL did not become durable")??;
+                    let id = session_id
+                        .context("fixture did not observe the routed MySQL session id")?;
+                    return Ok::<_, anyhow::Error>(Some(id));
+                }
+                client_write.write_all(&packet).await?;
             }
-            client_write.write_all(&packet).await?;
+            client_write.shutdown().await?;
+            Ok(None)
+        };
+        // Ordinary EOF preserves the other direction's pending response;
+        // only an intercepted fault retires both forwarding futures at once.
+        tokio::pin!(client_to_server, server_to_client);
+        tokio::select! {
+            result = &mut client_to_server => match result.context("forward client packets to the SQL server")? {
+                Some(id) => Some(id),
+                None => server_to_client.await.context("forward SQL server packets to the client")?,
+            },
+            result = &mut server_to_client => match result.context("forward SQL server packets to the client")? {
+                Some(id) => Some(id),
+                None => client_to_server.await.context("forward client packets to the SQL server")?,
+            },
         }
-        Ok(())
     };
-    let ((), ()) = tokio::try_join!(client_to_server, server_to_client)?;
+    // The migration owns the observer's engine. End the intercepted upstream
+    // session and finish its observation before client EOF permits migration
+    // reconciliation to retire that engine. Dropping the forwarding futures
+    // cannot cancel this observation, which owns neither borrowed socket half.
+    drop(server);
+    if let Some(id) = intercepted {
+        await_session_end(&fault.observer, id, QUERY_TIMEOUT)
+            .await
+            .context(match fault.drop_kind {
+                DropKind::ReplyAfterDurability => {
+                    "routed SQL session remained after the lost reply"
+                }
+                DropKind::RequestBeforeDispatch => {
+                    "routed SQL session remained after the absent request"
+                }
+            })?;
+        fault.session_ended.store(true, Ordering::Release);
+    }
+    drop(client);
+    Ok(())
+}
+
+#[tokio::test]
+async fn packet_proxy_drains_response_after_client_half_close() -> Result<()> {
+    tokio::time::timeout(QUERY_TIMEOUT, async {
+        let client_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let (mut client, (proxy_client, _)) = tokio::try_join!(
+            TcpStream::connect(client_listener.local_addr()?),
+            client_listener.accept(),
+        )?;
+        let (proxy_server, (mut upstream, _)) = tokio::try_join!(
+            TcpStream::connect(upstream_listener.local_addr()?),
+            upstream_listener.accept(),
+        )?;
+        let observer = Arc::new(MemoryPool::fixture(
+            sqlx::mysql::MySqlPoolOptions::new()
+                .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new()),
+            "main",
+        ));
+        let fault = Arc::new(Fault {
+            observer: observer.clone(),
+            statement: "CALL DOLT_COMMIT",
+            observation: DurableObservation::MainAtTarget {
+                target: "unused".into(),
+            },
+            discarded: Arc::new(AtomicBool::new(false)),
+            session_ended: Arc::new(AtomicBool::new(false)),
+            drop_kind: DropKind::ReplyAfterDurability,
+        });
+        let request = b"\x04\x00\x00\x00ping";
+        let response = b"\x04\x00\x00\x00pong";
+        let drive_client = async {
+            client.write_all(request).await?;
+            client.shutdown().await?;
+            ensure!(
+                read_packet(&mut client).await?.as_deref() == Some(response.as_slice()),
+                "client half-close must retain the exact upstream response"
+            );
+            ensure!(
+                read_packet(&mut client).await?.is_none(),
+                "client must observe EOF after the response"
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        let drive_upstream = async {
+            ensure!(
+                read_packet(&mut upstream).await?.as_deref() == Some(request.as_slice()),
+                "proxy must forward the exact client request"
+            );
+            ensure!(
+                read_packet(&mut upstream).await?.is_none(),
+                "upstream must observe client EOF before replying"
+            );
+            upstream.write_all(response).await?;
+            upstream.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(
+            proxy_connection(proxy_client, proxy_server, fault.clone()),
+            drive_client,
+            drive_upstream,
+        )?;
+        ensure!(
+            !fault.discarded.load(Ordering::Acquire)
+                && !fault.session_ended.load(Ordering::Acquire),
+            "ordinary half-close must not activate the selected fault"
+        );
+        observer.close().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("packet proxy half-close exchange exceeded its observation deadline")??;
     Ok(())
 }
 
