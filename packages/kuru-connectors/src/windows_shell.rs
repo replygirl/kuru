@@ -137,6 +137,8 @@ impl ShellRegistry {
                 {
                     Ok(runtime) => runtime,
                     Err(_) => {
+                        drop(hold);
+                        drop(worker);
                         let _ =
                             reply.send(Err(anyhow::anyhow!("Windows shell worker runtime failed")));
                         return;
@@ -188,6 +190,17 @@ impl ShellRegistry {
                     }
                     Ok(result) => Ok(result),
                 };
+                let retaining = owner
+                    .as_mut()
+                    .is_some_and(|owner| !matches!(owner.try_wait(), Ok(Some(_))));
+                if !retaining {
+                    drop(owner);
+                    drop(runtime);
+                    drop(hold);
+                    drop(worker);
+                    let _ = reply.send(result);
+                    return;
+                }
                 // Existing result/refusal is available before a retained cleanup
                 // retry. This thread owns the actual child and immutable hold.
                 let _ = reply.send(result);
@@ -250,5 +263,68 @@ impl ShellRegistry {
             bail!("Windows shell cleanup remains unconfirmed; ownership is retained");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuru_platform::fs::{NameRetention, Privacy};
+
+    #[tokio::test]
+    async fn confirmed_shell_releases_hold_and_registration_before_returning() {
+        struct Hold(Arc<AtomicBool>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        crate::shell_warmup::warm_up_stock_powershell_engine()
+            .await
+            .unwrap();
+        for succeeds in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = Arc::new(
+                Directory::open(root.path(), Privacy::Inherited, NameRetention::Pinned).unwrap(),
+            );
+            let path = if succeeds {
+                root.path().to_owned()
+            } else {
+                root.path().join("absent")
+            };
+            let released = Arc::new(AtomicBool::new(false));
+            let hold: InvocationHold = Arc::new(Hold(released.clone()));
+            let registry = ShellRegistry::new();
+            crate::test_support::completion_on_wake(
+                async move {
+                    let result = registry
+                        .execute(
+                            directory,
+                            path,
+                            "[Console]::Write('complete')".into(),
+                            crate::IO_TIMEOUT,
+                            None,
+                            Some(hold),
+                        )
+                        .await;
+                    ensure!(
+                        result.is_ok() == succeeds,
+                        "unexpected native shell result: {result:?}"
+                    );
+                    ensure!(
+                        released.load(Ordering::Acquire),
+                        "shell returned before hold release"
+                    );
+                    ensure!(
+                        registry.inner.state.lock().unwrap().owners.is_empty(),
+                        "shell returned before registration release"
+                    );
+                    Ok(())
+                },
+                crate::IO_TIMEOUT + crate::process::CLEANUP * 2,
+            )
+            .await
+            .unwrap();
+        }
     }
 }

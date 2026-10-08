@@ -874,6 +874,15 @@ async fn invoke(
             }
             let outcome =
                 outcome.unwrap_or_else(|_| Err(anyhow::anyhow!("lifecycle hook worker panicked")));
+            if !retaining {
+                // A confirmed outcome must expose settled budget and tracking
+                // state, even when sending synchronously wakes its caller.
+                drop(runtime);
+                drop(lease);
+                drop(slot);
+                let _ = reply.send(outcome);
+                return;
+            }
             // Publish the existing bounded refusal before retained cleanup;
             // the same native worker and immutable HookLease remain owned.
             let _ = reply.send(outcome);
@@ -2174,6 +2183,77 @@ mod tests {
         assert!(fourth.outcome.is_err());
         assert_eq!(fourth.observations[0].outcome, HookOutcomeKind::Failed);
         assert_eq!(budget.snapshot().2, 3, "the fourth hook launched");
+    }
+
+    struct CompletionWake {
+        budget: Arc<HookBudget>,
+        workers: Arc<HookWorkers>,
+        observed: Mutex<Option<(usize, usize)>>,
+        changed: tokio::sync::Notify,
+    }
+
+    impl std::task::Wake for CompletionWake {
+        fn wake(self: Arc<Self>) {
+            *self.observed.lock().unwrap() =
+                Some((self.budget.snapshot().1, self.workers.state.borrow().active));
+            self.changed.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_hook_releases_lease_and_worker_before_result_wake() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+
+        #[cfg(windows)]
+        warm_hook_launch().await;
+        for (response, succeeds) in [(r#"{"decision":"allow"}"#, true), ("invalid", false)] {
+            let root = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            let hook = command(&format!(
+                "cat >/dev/null; while [ ! -e release ]; do sleep 0.01; done; printf '%s' '{response}'"
+            ));
+            #[cfg(windows)]
+            let hook = windows_command(&format!(
+                "$null = [Console]::In.ReadLine(); while (-not [IO.File]::Exists('release')) {{ [Threading.Thread]::Sleep(10) }}; [Console]::Write('{response}')"
+            ));
+            let bound = Duration::from_millis(hook.timeout_ms) + QUIESCE;
+            let host = host(root.path(), HookEvent::PreTurn, hook);
+            let budget = host.budget();
+            let wake = Arc::new(CompletionWake {
+                budget: budget.clone(),
+                workers: host.workers.clone(),
+                observed: Mutex::new(None),
+                changed: tokio::sync::Notify::new(),
+            });
+            let waker = Waker::from(wake.clone());
+            let mut context = Context::from_waker(&waker);
+            let mut run = Box::pin(host.run_pre(
+                &budget,
+                HookEvent::PreTurn,
+                "invocation",
+                "actor",
+                None,
+                None,
+                serde_json::json!({"input":"hello"}),
+            ));
+            assert!(matches!(run.as_mut().poll(&mut context), Poll::Pending));
+            std::fs::write(root.path().join("release"), b"").unwrap();
+            tokio::time::timeout(bound, wake.changed.notified())
+                .await
+                .unwrap();
+            let observed = *wake.observed.lock().unwrap();
+            let outcome = run.await;
+            host.quiesce().await.unwrap();
+            assert_eq!(outcome.outcome.is_ok(), succeeds, "{outcome:?}");
+            assert_eq!(
+                observed,
+                Some((0, 0)),
+                "completion woke before ownership settled"
+            );
+        }
     }
 
     #[cfg(unix)]

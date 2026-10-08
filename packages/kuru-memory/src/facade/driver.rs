@@ -745,7 +745,7 @@ async fn run_presence(
             )
         };
         drop(shared);
-        let (id, generation, selection, _native_hold, completed) = tuple;
+        let (id, generation, selection, native_hold, completed) = tuple;
         let was_lost = inner
             .upgrade()
             .is_none_or(|inner| inner.presence.lost.load(Ordering::Acquire));
@@ -779,6 +779,9 @@ async fn run_presence(
                 pending.completed = Some(result);
             }
         }
+        // Pending/current state owns publication and uncertain recovery. A
+        // completed caller must not inherit this worker's temporary clone.
+        drop(native_hold);
         let _ = reply.send(());
     }
     mark_lost(&inner);
@@ -929,6 +932,83 @@ mod tests {
                 .await?
                 .context("missing fixture session")?,
         )))
+    }
+
+    #[tokio::test]
+    async fn refused_selection_releases_worker_lease_before_caller_returns() -> Result<()> {
+        kuru_memory::test_support::closing(async {
+            use std::{
+                future::Future,
+                pin::Pin,
+                task::{Context, Poll, Wake, Waker},
+            };
+            type Selection = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+            struct ReplyWake {
+                future: Mutex<Option<Selection>>,
+                result: Mutex<Option<Result<()>>>,
+                done: Notify,
+            }
+            impl Wake for ReplyWake {
+                fn wake(self: Arc<Self>) {
+                    let mut future = self.future.lock().unwrap();
+                    let Some(pending) = future.as_mut() else {
+                        return;
+                    };
+                    let waker = Waker::from(self.clone());
+                    if let Poll::Ready(result) =
+                        pending.as_mut().poll(&mut Context::from_waker(&waker))
+                    {
+                        future.take();
+                        *self.result.lock().unwrap() = Some(result);
+                        self.done.notify_one();
+                    }
+                }
+            }
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let memory = MemoryStore::temporary().await?;
+            let Backend::Local(local) = &memory.backend else {
+                bail!("local fixture attached remotely")
+            };
+            let data = local.driver_data_root()?.to_owned();
+            memory
+                .create_session("existing", Mode::Ifs, "existing")
+                .await?;
+            let (bound, driver) = memory.bind_session_driver(&data, &project).await?;
+            let selected = driver.clone();
+            let future = async move {
+                let refused = selected
+                    .select(SessionDriverTarget::Absent("existing".into()))
+                    .await;
+                ensure!(refused.is_err(), "existing session was admitted as absent");
+                let reacquired = NativeSessionLease::acquire(&data, &project, "existing")
+                    .context("completed refusal still retains its worker's native lease")?;
+                drop(reacquired);
+                Ok(())
+            };
+            let wake = Arc::new(ReplyWake {
+                future: Mutex::new(Some(Box::pin(future))),
+                result: Mutex::new(None),
+                done: Notify::new(),
+            });
+            wake.clone().wake();
+            let settled = tokio::time::timeout(store::QUERY_TIMEOUT, wake.done.notified()).await;
+            if settled.is_err() {
+                let pending = wake.future.lock().unwrap().take();
+                drop(pending);
+            }
+            driver.close().await?;
+            bound.close().await?;
+            memory.close().await?;
+            settled.context("selection reply did not settle before its statement budget")?;
+            wake.result
+                .lock()
+                .unwrap()
+                .take()
+                .context("selection reply missing")?
+        })
+        .await
     }
 
     #[tokio::test]

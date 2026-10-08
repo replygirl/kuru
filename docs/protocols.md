@@ -225,6 +225,13 @@ observations back off from 100 milliseconds to a one-second maximum without
 abandoning ownership or using stale-PID signaling.
 Windows retains its existing Job-based cleanup.
 
+Confirmed hook completion releases its execution-budget lease and worker
+registration before returning. Confirmed shell completion also releases its
+invocation hold. MCP replies release the completed operation's hold before the
+calling operation returns. A refused operation whose
+cleanup remains unconfirmed retains its original ownership until checked cleanup;
+receiving that refusal does not establish quiescence.
+
 `grep` and `glob` use Kuru's bundled Rust search components; they never invoke
 an installed `rg` executable. They search only regular UTF-8 project files and
 exclude hidden and repository-ignored paths by default. Set

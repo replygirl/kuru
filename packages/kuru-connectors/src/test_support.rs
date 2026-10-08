@@ -18,6 +18,58 @@ use tokio::{
     sync::Mutex,
 };
 
+/// Poll the public caller synchronously inside its native result wake. This
+/// prevents the sender from finishing post-send drops before the caller checks
+/// ownership, making completion-order regressions independent of scheduling.
+#[cfg(test)]
+pub(crate) async fn completion_on_wake(
+    future: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    bound: std::time::Duration,
+) -> anyhow::Result<()> {
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll, Wake, Waker},
+    };
+    type CompletionFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+    struct Probe {
+        future: StdMutex<Option<CompletionFuture>>,
+        result: StdMutex<Option<anyhow::Result<()>>>,
+        done: tokio::sync::Notify,
+    }
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            let mut future = self.future.lock().unwrap();
+            let Some(pending) = future.as_mut() else {
+                return;
+            };
+            let waker = Waker::from(self.clone());
+            if let Poll::Ready(result) = pending.as_mut().poll(&mut Context::from_waker(&waker)) {
+                future.take();
+                *self.result.lock().unwrap() = Some(result);
+                self.done.notify_one();
+            }
+        }
+    }
+    let probe = Arc::new(Probe {
+        future: StdMutex::new(Some(Box::pin(future))),
+        result: StdMutex::new(None),
+        done: tokio::sync::Notify::new(),
+    });
+    probe.clone().wake();
+    if tokio::time::timeout(bound, probe.done.notified())
+        .await
+        .is_err()
+    {
+        let pending = probe.future.lock().unwrap().take();
+        drop(pending);
+        return Err(anyhow::anyhow!(
+            "native completion wake did not settle within {bound:?}"
+        ));
+    }
+    probe.result.lock().unwrap().take().unwrap()
+}
+
 /// Retain a bounded diagnostic prefix while continuing to drain an owned test
 /// child pipe. A fixture failure must not let a noisy child grow test memory or
 /// keep its parent waiting on a full pipe.
