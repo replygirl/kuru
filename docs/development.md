@@ -79,8 +79,8 @@ when two partitions' environments differ, names every differing key with both
 values. Any mismatch or missing receipt fails before any report exists, so
 there is never a partial LCOV.
 
-The per-OS gate is 90% by the metric `mise run coverage` holds to
-`--fail-under-lines 90`: cargo-llvm-cov reads `totals.lines` of
+The per-OS gate is 95% by the metric `mise run coverage` holds to
+`--fail-under-lines 95`: cargo-llvm-cov reads `totals.lines` of
 `llvm-cov export`, which counts, per source file, each function instantiation
 group once (the functions starting at one location, such as a generic's
 instantiations or a library built with and without `cfg(test)`), with the most
@@ -101,6 +101,10 @@ between means an instrumented process outlived the partition's tests; the
 partition fails naming those profiles instead of blaming the port. A test must
 therefore not leave an instrumented child running after it returns.
 
+Coverage tasks select mise's pinned executable directly and verify its version.
+Use these tasks for acceptance: Cargo can prefer a separately installed
+`cargo-llvm-cov` in `CARGO_HOME/bin` over the executable on mise's PATH.
+
 The std-only fake connector peer in `tests/fixtures/stdio_peer.rs` is compiled
 separately with the pinned Rust compiler and explicit `instrument-coverage=no`
 on Unix and Windows. MCP protocol-failure tests deliberately force-terminate
@@ -109,7 +113,7 @@ interrupt. Windows retains the compiler's full native Job through completion
 and checks an immutable snapshot before exposing fixture aliases. This is test
 scaffolding, already outside cargo-llvm-cov's default measured source scope.
 Real application children still inherit the runner's `LLVM_PROFILE_FILE`, and
-application instrumentation, strict profile export and the 90% gate are unchanged.
+application instrumentation, strict profile export and the 95% gate are unchanged.
 
 The failure also reports recorded writer candidates for each changed profile.
 A raw profile is named
@@ -263,14 +267,14 @@ x64, uninstrumented, as separately named behavioral evidence: `Behavior
 partition` 1..8 run `//packages/kuru-delivery:test:partition` over every
 workspace package, and `Behavior merge` checks receipt agreement, disjointness
 and completeness on Ubuntu without LCOV or a threshold. Their receipts record
-`mode: uninstrumented` with null coverage, and they never count toward the 90%
+`mode: uninstrumented` with null coverage, and they never count toward the 95%
 gate, which x64, macOS and Ubuntu keep enforcing. Instrumented Windows on Arm
 partitions are held until a pinned Rust toolchain carries the fix for
 [rust-lang/rust#150123](https://github.com/rust-lang/rust/issues/150123), whose
 `llvm-profdata merge` failure on `aarch64-pc-windows-msvc` the previous 1.98.1 toolchain
 reproduced; `coverage::PARTITIONS` rejects an instrumented `windows-11-arm` set.
 `native-platform` is a two-leg matrix: the x64 leg keeps
-`//packages/kuru-platform:coverage` and its 90% gate, and the arm64 leg,
+`//packages/kuru-platform:coverage` and its 95% gate, and the arm64 leg,
 `Native platform behavior (aarch64-pc-windows-msvc)`, runs
 `//packages/kuru-platform:test` with no coverage upload. The arm64 partitions
 and installation job import the source-built engine from the
@@ -336,11 +340,11 @@ behind the platform, not a timeout.
 | `mise run lint:windows` | The same Clippy for `x86_64-pc-windows-msvc`, so `cfg(windows)` code is linted ([details](#lint-configuration-and-windows-target-lint)) |
 | `mise run typecheck` | Rust compilation checks for all targets/features on the host |
 | `mise run test` | Workspace behavioral and protocol tests |
-| `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage |
+| `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 95% workspace line coverage |
 | `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
 | `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
 | `mise run //packages/kuru-delivery:coverage:shard` | One fail-closed CI coverage partition, configured by `KURU_COVERAGE_*` ([by hand](#running-a-coverage-partition-by-hand)) |
-| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the 90% gate by cargo-llvm-cov's line metric over its partitions' line exports |
+| `mise run //packages/kuru-delivery:coverage:merge` | Require agreeing receipts from every partition of one OS and, when instrumented, enforce the 95% gate by cargo-llvm-cov's line metric over its partitions' line exports |
 | `mise run //packages/kuru-delivery:test:partition` | One uninstrumented checked partition of the `KURU_COVERAGE_PACKAGES` test suite (CI arm64 memory) |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |

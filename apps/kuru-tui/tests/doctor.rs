@@ -62,6 +62,16 @@ fn doctor_reports_fixed_local_states_without_creating_data_or_leaking_values() -
     ensure!(check(&fresh, "embedded_engine")?["condition"] == "payload_consistent");
     ensure!(!data.exists(), "doctor created absent data state");
 
+    assert_private_human_report(
+        &launch(&project, &data, &config_home, &[])?,
+        3,
+        &[
+            "ChatGPT subscription: Problem — no Kuru sign-in is stored",
+            "Run `kuru login`",
+        ],
+    )?;
+    ensure!(!data.exists(), "human doctor created absent data state");
+
     fs::create_dir_all(config_home.join("kuru"))?;
     fs::write(
         config_home.join("kuru/config.toml"),
@@ -201,6 +211,15 @@ fn invalid_configuration_and_corrupt_activation_are_redacted_and_unchanged() -> 
     }
     ensure!(!data.exists(), "invalid config doctor created data state");
 
+    assert_private_human_report(
+        &launch(&project, &data, &config_home, &[])?,
+        3,
+        &[
+            "Configuration: Problem — configuration is invalid",
+            "Correct the local configuration",
+        ],
+    )?;
+
     fs::remove_file(project.join(".kuru/config.toml"))?;
     fs::create_dir(project.join(".kuru/config.toml"))?;
     let unreadable = launch(&project, &data, &config_home, &["--json"])?;
@@ -216,6 +235,15 @@ fn invalid_configuration_and_corrupt_activation_are_redacted_and_unchanged() -> 
         !data.exists(),
         "unreadable config doctor created data state"
     );
+
+    assert_private_human_report(
+        &launch(&project, &data, &config_home, &[])?,
+        2,
+        &[
+            "Configuration: Unverified — configuration could not be inspected reliably",
+            "Retry the local check",
+        ],
+    )?;
 
     fs::remove_dir(project.join(".kuru/config.toml"))?;
     fs::write(project.join(".kuru/config.toml"), "")?;
@@ -263,6 +291,16 @@ fn invalid_configuration_and_corrupt_activation_are_redacted_and_unchanged() -> 
     ensure!(!data.join("memory/services").exists());
     ensure!(!data.join("tools").exists());
 
+    assert_private_human_report(
+        &launch(&project, &data, &config_home, &[])?,
+        3,
+        &[
+            "Project memory: Unverified — project metadata is valid; cold database health was not checked",
+            "Open the project normally",
+        ],
+    )?;
+    ensure!(fs::read(memory.join("ready.json"))? == before);
+
     let directory = kuru_platform::fs::Directory::open(
         &memory,
         kuru_platform::fs::Privacy::OwnerOnly,
@@ -284,6 +322,15 @@ fn invalid_configuration_and_corrupt_activation_are_redacted_and_unchanged() -> 
     for output in [&corrupt.stdout, &corrupt.stderr] {
         ensure!(!String::from_utf8_lossy(output).contains("CORRUPT_MEMORY_SENTINEL"));
     }
+    assert_private_human_report(
+        &launch(&project, &data, &config_home, &[])?,
+        3,
+        &[
+            "Project memory: Problem — project activation metadata is invalid",
+            "See the troubleshooting guide",
+        ],
+    )?;
+    ensure!(fs::read(memory.join("ready.json"))? == before);
     Ok(())
 }
 
@@ -297,7 +344,18 @@ fn invocation_failure_uses_fixed_redacted_report() -> Result<()> {
     let report = report(&output, 1)?;
     ensure!(check(&report, "invocation")?["condition"] == "invocation_invalid");
     ensure!(!String::from_utf8(output.stdout)?.contains("missing-project"));
-    ensure!(!data.exists());
+    assert_private_human_report(
+        &launch(&missing_project, &data, &config_home, &[])?,
+        1,
+        &[
+            "Invocation: Problem — the workspace or data directory could not be resolved",
+            "Check `-C`, `--data-dir`",
+        ],
+    )?;
+    ensure!(
+        !data.exists(),
+        "human invocation failure created data state"
+    );
     Ok(())
 }
 
@@ -373,4 +431,143 @@ async fn doctor_closes_only_its_read_only_view_of_a_live_memory_owner() -> Resul
         Ok(())
     })
     .await
+}
+
+fn assert_private_human_report(output: &Output, exit: i32, expected: &[&str]) -> Result<()> {
+    ensure!(output.status.code() == Some(exit), "{output:?}");
+    let human = String::from_utf8_lossy(&output.stdout);
+    ensure!(human.contains("Kuru doctor (schema 1)"));
+    ensure!(human.contains(&format!("Exit code {exit}:")));
+    for fragment in expected {
+        ensure!(human.contains(fragment), "missing {fragment:?}: {human}");
+    }
+    for bytes in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        for private in [
+            "private-project",
+            "private-data",
+            "missing-project",
+            "config-home",
+            "CONFIG_SECRET_SENTINEL",
+            "CORRUPT_MEMORY_SENTINEL",
+            "DOCTOR_COLD_KEY_SENTINEL",
+            "APPROVAL_KEY_SENTINEL",
+            "CORRUPT_APPROVAL_SENTINEL",
+        ] {
+            ensure!(!text.contains(private), "doctor disclosed {private}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn doctor_rechecks_stored_approval_without_granting_changed_or_corrupt_authority() -> Result<()> {
+    let sandbox = tempfile::tempdir()?;
+    let project = sandbox.path().join("private-project");
+    let data = sandbox.path().join("private-data");
+    let config_home = sandbox.path().join("config-home");
+    fs::create_dir(&project)?;
+    fs::create_dir(project.join(".kuru"))?;
+    let config = project.join(".kuru/config.toml");
+    fs::write(
+        &config,
+        "provider = 'responses'\napi_key_env = 'KURU_DOCTOR_REPO_KEY'\n",
+    )?;
+    let run = |args: &[&str]| -> Result<Output> {
+        Ok(Command::new(env!("CARGO_BIN_EXE_kuru"))
+            .arg("-C")
+            .arg(&project)
+            .arg("--data-dir")
+            .arg(&data)
+            .args(args)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("KURU_DOCTOR_REPO_KEY", "APPROVAL_KEY_SENTINEL")
+            .env_remove("KURU_MANAGED_CONFIG")
+            .env_remove("OPENAI_API_KEY")
+            .output()?)
+    };
+    let approved = run(&["trust", "approve", "--yes"])?;
+    ensure!(approved.status.success(), "{approved:?}");
+    let records: Vec<_> = fs::read_dir(data.join("trust/workspaces"))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|value| value == "json"))
+        .collect();
+    ensure!(
+        records.len() == 1,
+        "approval must create exactly one private record"
+    );
+    let directory = kuru_platform::fs::Directory::open(
+        records[0].parent().expect("approval parent"),
+        kuru_platform::fs::Privacy::OwnerOnly,
+        kuru_platform::fs::NameRetention::Movable,
+    )?;
+    let name = records[0].file_name().expect("approval record name");
+    let before = fs::read(&records[0])?;
+    let approved_report = report(&run(&["doctor", "--json"])?, 0)?;
+    ensure!(!serde_json::to_string(&approved_report)?.contains("APPROVAL_KEY_SENTINEL"));
+    ensure!(check(&approved_report, "workspace_trust")?["condition"] == "approved");
+    ensure!(check(&approved_report, "responses_route")?["condition"] == "route_variable_present");
+    assert_private_human_report(
+        &run(&["doctor"])?,
+        0,
+        &["Workspace trust: OK — the captured workspace manifest is approved"],
+    )?;
+    ensure!(fs::read(&records[0])? == before);
+
+    fs::write(
+        &config,
+        "provider = 'responses'\napi_key_env = 'KURU_DOCTOR_REPO_KEY'\nallow_shell = true\n",
+    )?;
+    let stale = report(&run(&["doctor", "--json"])?, 2)?;
+    ensure!(!serde_json::to_string(&stale)?.contains("APPROVAL_KEY_SENTINEL"));
+    ensure!(check(&stale, "workspace_trust")?["condition"] == "approval_changed");
+    ensure!(check(&stale, "responses_route")?["condition"] == "route_unverified");
+    assert_private_human_report(
+        &run(&["doctor"])?,
+        2,
+        &[
+            "stored approval does not match the captured manifest",
+            "Review the exact workspace manifest",
+        ],
+    )?;
+    ensure!(
+        fs::read(&records[0])? == before,
+        "doctor rewrote stale approval"
+    );
+
+    directory.remove_file(name, directory.read(name)?)?;
+    let mut record = directory.create_new(name)?;
+    record.write_all(b"{CORRUPT_APPROVAL_SENTINEL")?;
+    kuru_platform::fs::seal_private(&record, false)?;
+    record.sync_all()?;
+    drop(record);
+    let corrupt_before = fs::read(&records[0])?;
+    let invalid_output = run(&["doctor", "--json"])?;
+    let invalid = report(&invalid_output, 3)?;
+    ensure!(check(&invalid, "workspace_trust")?["condition"] == "approval_invalid");
+    ensure!(check(&invalid, "workspace_trust")?["state"] == "problem");
+    ensure!(check(&invalid, "responses_route")?["condition"] == "route_unverified");
+    for bytes in [&invalid_output.stdout, &invalid_output.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        ensure!(!text.contains("APPROVAL_KEY_SENTINEL"));
+        ensure!(!text.contains("CORRUPT_APPROVAL_SENTINEL"));
+    }
+    assert_private_human_report(
+        &run(&["doctor"])?,
+        3,
+        &[
+            "Workspace trust: Problem — stored approval is invalid",
+            "Review the exact workspace manifest",
+        ],
+    )?;
+    ensure!(
+        fs::read(&records[0])? == corrupt_before,
+        "doctor repaired corrupt evidence"
+    );
+    ensure!(!data.join("memory").exists());
+    ensure!(!data.join("auth").exists());
+    ensure!(!data.join("tools").exists());
+    Ok(())
 }

@@ -165,7 +165,7 @@ and [development](docs/development.md) for boundaries and extension points.
 
 CI and hk run format, Clippy, typecheck, tooling, cospec and docs as independent
 checks; CI also runs behavioral coverage. `mise run coverage` runs the test suite
-with a 90% workspace line-coverage gate; `mise run check` is an optional local aggregate.
+with a 95% workspace line-coverage gate; `mise run check` is an optional local aggregate.
 Each app/package owns its mise tasks; root commands are aliases and
 aggregations. Releases use a manual workflow with conventional-commit versioning
 and Communiqué notes; nothing is published by local setup.

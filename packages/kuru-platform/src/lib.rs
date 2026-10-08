@@ -46,3 +46,20 @@ pub mod unix;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub mod windows;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn running_image_remains_a_readable_native_self_launch_input() {
+        let image = super::running_executable().unwrap();
+        assert!(image.is_absolute());
+        let retained = std::fs::File::open(&image).unwrap();
+        let metadata = retained.metadata().unwrap();
+        assert!(metadata.is_file());
+        assert!(metadata.len() > 0);
+        #[cfg(target_os = "linux")]
+        assert_eq!(image, std::path::Path::new("/proc/self/exe"));
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(image, std::env::current_exe().unwrap());
+    }
+}

@@ -1266,7 +1266,17 @@ mod tests {
         assert!(!selector.contains("http"));
         assert!(checked_run_url("https://github.com/replygirl/kuru/actions/runs/42").is_ok());
         assert!(checked_run_url("https://example.invalid/run").is_err());
-        let receipt = Receipt {
+        let receipt = receipt_fixture();
+        let text = serde_json::to_string(&receipt).unwrap();
+        assert!(text.len() < RECEIPT_LIMIT);
+        validate_receipt(text.as_bytes()).unwrap();
+        for forbidden in ["stdout", "stderr", "token", "oauth", "proxy"] {
+            assert!(!text.contains(forbidden));
+        }
+    }
+
+    fn receipt_fixture() -> Receipt {
+        Receipt {
             schema_version: RECEIPT_SCHEMA,
             runner_os: "windows",
             runner_arch: "x86_64",
@@ -1307,12 +1317,6 @@ mod tests {
                 }],
             },
             cleanup_confirmed: true,
-        };
-        let text = serde_json::to_string(&receipt).unwrap();
-        assert!(text.len() < RECEIPT_LIMIT);
-        validate_receipt(text.as_bytes()).unwrap();
-        for forbidden in ["stdout", "stderr", "token", "oauth", "proxy"] {
-            assert!(!text.contains(forbidden));
         }
     }
 
@@ -1323,6 +1327,57 @@ mod tests {
         image[0x80..0x84].copy_from_slice(b"PE\0\0");
         image[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
         image
+    }
+
+    #[test]
+    fn isolated_verification_settles_only_after_confirmed_cleanup() {
+        for verified in [true, false] {
+            for cleaned in [true, false] {
+                let temporary = tempfile::tempdir().unwrap();
+                let root = temporary.path().to_owned();
+                fs::write(root.join("sentinel"), b"private isolated evidence").unwrap();
+                let mut receipt = receipt_fixture();
+                receipt.cleanup_confirmed = false;
+                let result = finish_isolated_verification(
+                    temporary,
+                    if verified {
+                        Ok(receipt)
+                    } else {
+                        Err(anyhow::anyhow!("verification failed"))
+                    },
+                    if cleaned {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("native cleanup unresolved"))
+                    },
+                );
+                match (verified, cleaned) {
+                    (true, true) => {
+                        assert!(result.unwrap().cleanup_confirmed);
+                        assert!(!root.exists());
+                    }
+                    (false, true) => {
+                        assert_eq!(result.unwrap_err().to_string(), "verification failed");
+                        assert!(!root.exists());
+                    }
+                    (_, false) => {
+                        let error = format!("{:#}", result.unwrap_err());
+                        assert!(error.contains("native cleanup unresolved"), "{error}");
+                        assert!(error.contains("root retained"), "{error}");
+                        if !verified {
+                            assert!(error.contains("verification failed"), "{error}");
+                        }
+                        assert_eq!(
+                            fs::read(root.join("sentinel")).unwrap(),
+                            b"private isolated evidence"
+                        );
+                        // The test has now inspected the intentionally retained
+                        // root; no live process or memory owner was created.
+                        fs::remove_dir_all(root).unwrap();
+                    }
+                }
+            }
+        }
     }
 
     fn receipt_identity(target: &str, machine: &str) -> Vec<u8> {

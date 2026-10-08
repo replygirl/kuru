@@ -80,6 +80,260 @@ fn stage(fixture: &TempDir, name: &str) -> Result<Directory> {
     files::ensure_private_directory(&fixture.path().join(name))
 }
 
+/// A cache-shaped synthetic tree for refusal tests that must never start Dolt.
+fn synthetic_template(root: &Path) -> Result<FileIdentity> {
+    let root = files::ensure_private_directory(root)?;
+    let template = root.create_private_directory(OsStr::new(key()))?;
+    let data = template.create_private_directory(OsStr::new(DATA))?;
+    data.create_new(OsStr::new("payload"))?
+        .write_all(b"checked template payload")?;
+    let manifest = Manifest {
+        format: TEMPLATE_FORMAT,
+        key: key().into(),
+        entries: vec![Entry::File {
+            path: vec!["payload".into()],
+            bytes: 24,
+            sha256: hex(&Sha256::digest(b"checked template payload")),
+        }],
+    };
+    template
+        .create_new(OsStr::new(MANIFEST))?
+        .write_all(&serde_json::to_vec(&manifest)?)?;
+    Ok(template.identity())
+}
+
+#[tokio::test]
+async fn bounded_manifest_and_data_refusals_quarantine_exact_tree_before_copy() -> Result<()> {
+    type Damage = Box<dyn Fn(&Path) -> Result<()>>;
+    let cases: Vec<(&str, Damage)> = vec![
+        (
+            "empty-inventory",
+            Box::new(|template| {
+                let mut manifest = read_manifest(template)?;
+                manifest.entries.clear();
+                write_manifest(template, &manifest)
+            }),
+        ),
+        (
+            "oversized-inventory",
+            Box::new(|template| {
+                let mut manifest = read_manifest(template)?;
+                manifest.entries = vec![manifest.entries[0].clone(); MAX_ENTRIES + 1];
+                write_manifest(template, &manifest)
+            }),
+        ),
+        (
+            "oversized-manifest",
+            Box::new(|template| {
+                Ok(fs::write(
+                    template.join(MANIFEST),
+                    vec![b' '; MANIFEST_LIMIT as usize + 1],
+                )?)
+            }),
+        ),
+        (
+            "non-directory-data",
+            Box::new(|template| {
+                fs::remove_file(template.join(DATA).join("payload"))?;
+                fs::remove_dir(template.join(DATA))?;
+                files::directory(template)?
+                    .create_new(OsStr::new(DATA))?
+                    .write_all(b"not a directory")?;
+                Ok(())
+            }),
+        ),
+        (
+            "linked-manifest",
+            Box::new(|template| {
+                fs::hard_link(
+                    template.join(MANIFEST),
+                    template
+                        .parent()
+                        .context("template root missing")?
+                        .join("manifest-alias"),
+                )?;
+                Ok(())
+            }),
+        ),
+        (
+            "too-many-top-level-entries",
+            Box::new(|template| {
+                for index in 0..MAX_ENTRIES {
+                    files::directory(template)?
+                        .create_new(OsStr::new(&format!("extra-{index:04}")))?
+                        .write_all(b"extra")?;
+                }
+                Ok(())
+            }),
+        ),
+    ];
+    for (case, damage) in cases {
+        let fixture = fixture()?;
+        let root = fixture.path().join("templates");
+        let judged = synthetic_template(&root)?;
+        damage(&root.join(key()))?;
+        let destination = stage(&fixture, "destination")?;
+        let error = create_unspawned(&root, &destination)
+            .await
+            .expect_err("corrupt synthetic template was accepted");
+        ensure!(error.is_verdict(), "{case}: {error}");
+        ensure!(
+            published(&root).is_none(),
+            "{case}: invalid tree stayed published"
+        );
+        let quarantined = rejected(&root)?;
+        ensure!(
+            quarantined.len() == 1,
+            "{case}: quarantine inventory {quarantined:?}"
+        );
+        ensure!(
+            files::directory(&root.join(&quarantined[0]))?.identity() == judged,
+            "{case}: quarantine moved another identity"
+        );
+        ensure!(
+            fs::read_dir(destination.path())?.next().is_none(),
+            "{case}: copy started before structural refusal"
+        );
+        ensure!(
+            !entries_of(&root)?
+                .iter()
+                .any(|name| name.starts_with(".build-")),
+            "{case}: refusal launched a build"
+        );
+        if case == "linked-manifest" {
+            fs::remove_file(root.join("manifest-alias"))?;
+        }
+        fixture.release(Ok(()))?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn published_non_directory_template_is_refused_without_removal_or_build() -> Result<()> {
+    let fixture = fixture()?;
+    let root = fixture.path().join("templates");
+    files::private_dir(&root)?;
+    let published = root.join(key());
+    files::write(&published, b"adjacent retained bytes")?;
+    let directory = files::directory(&root)?;
+    let retained = directory.read(OsStr::new(key()))?;
+    let destination = stage(&fixture, "destination")?;
+    let error = create_unspawned(&root, &destination)
+        .await
+        .expect_err("a regular file was used as a template");
+    ensure!(error.is_verdict(), "{error}");
+    ensure!(fs::read(&published)? == b"adjacent retained bytes");
+    directory.verify(OsStr::new(key()), &retained)?;
+    ensure!(rejected(&root)?.is_empty());
+    ensure!(fs::read_dir(destination.path())?.next().is_none());
+    fixture.release(Ok(()))
+}
+
+#[tokio::test]
+async fn copied_template_inventory_must_match_complete_tree() -> Result<()> {
+    for case in ["unexpected-file", "missing-file", "different-path"] {
+        let fixture = fixture()?;
+        let root = fixture.path().join("templates");
+        let judged = synthetic_template(&root)?;
+        let template = root.join(key());
+        match case {
+            "unexpected-file" => files::directory(&template.join(DATA))?
+                .create_new(OsStr::new("zz-extra"))?
+                .write_all(b"extra")?,
+            "missing-file" => {
+                let mut manifest = read_manifest(&template)?;
+                manifest.entries.push(Entry::File {
+                    path: vec!["zz-missing".into()],
+                    bytes: 1,
+                    sha256: hex(&Sha256::digest(b"x")),
+                });
+                write_manifest(&template, &manifest)?;
+            }
+            _ => {
+                let mut manifest = read_manifest(&template)?;
+                let Entry::File { path, .. } = &mut manifest.entries[0] else {
+                    bail!("synthetic file missing")
+                };
+                *path = vec!["wrong-path".into()];
+                write_manifest(&template, &manifest)?;
+            }
+        }
+        let destination = stage(&fixture, "destination")?;
+        let error = create_unspawned(&root, &destination)
+            .await
+            .expect_err("incomplete inventory was copied");
+        ensure!(error.is_verdict(), "{case}: {error}");
+        ensure!(published(&root).is_none());
+        let quarantined = rejected(&root)?;
+        ensure!(quarantined.len() == 1);
+        ensure!(files::directory(&root.join(&quarantined[0]))?.identity() == judged);
+        ensure!(
+            destination.path().join(DATA).is_dir(),
+            "{case}: partial copy was discarded"
+        );
+        ensure!(
+            fs::read(destination.path().join(DATA).join("payload"))? == b"checked template payload"
+        );
+        fixture.release(Ok(()))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn template_walk_bounds_and_unclean_state_refuse_without_changing_source() -> Result<()> {
+    for mode in [Walk::Capture, Walk::Template] {
+        for name in [
+            "endpoint.json",
+            "migration.json",
+            "sql-server.info",
+            "owner.pid",
+            "owner.sock",
+        ] {
+            let fixture = fixture()?;
+            let source = stage(&fixture, "source")?;
+            source
+                .create_new(OsStr::new(name))?
+                .write_all(b"retained source")?;
+            let error = walk(source.path(), mode, None, false, &mut |_, _| Ok(()))
+                .expect_err("unclean runtime state entered a template");
+            ensure!(
+                error.is_verdict() == (mode == Walk::Template),
+                "{mode:?}: {error}"
+            );
+            ensure!(fs::read(source.path().join(name))? == b"retained source");
+            fixture.release(Ok(()))?;
+        }
+        let deep_fixture = fixture()?.with_depth_budget(MAX_DEPTH + 2);
+        let source = stage(&deep_fixture, "deep")?;
+        let mut nested = source.path().to_owned();
+        for _ in 0..MAX_DEPTH {
+            nested.push("nested");
+            files::private_dir(&nested)?;
+        }
+        let error = walk(source.path(), mode, None, false, &mut |_, _| Ok(()))
+            .expect_err("over-depth tree entered a template");
+        ensure!(error.is_verdict() == (mode == Walk::Template));
+        ensure!(error.to_string().contains("nested too deeply"));
+        ensure!(nested.is_dir());
+        deep_fixture.release(Ok(()))?;
+
+        let fixture = fixture()?;
+        let source = stage(&fixture, "too-many")?;
+        for index in 0..=MAX_ENTRIES {
+            source
+                .create_new(OsStr::new(&format!("entry-{index:04}")))?
+                .write_all(b"bounded")?;
+        }
+        let error = walk(source.path(), mode, None, false, &mut |_, _| Ok(()))
+            .expect_err("over-cardinality tree entered a template");
+        ensure!(error.is_verdict() == (mode == Walk::Template));
+        ensure!(error.to_string().contains("too many entries"));
+        ensure!(fs::read_dir(source.path())?.count() == MAX_ENTRIES + 1);
+        fixture.release(Ok(()))?;
+    }
+    Ok(())
+}
+
 /// The sorted top-level names of a template root, without the Windows
 /// lifecycle leases.
 pub(super) fn entries_of(root: &Path) -> Result<Vec<String>> {
@@ -235,7 +489,13 @@ pub(super) fn read_manifest(template: &Path) -> Result<Manifest> {
 
 /// Rewrite the manifest of the template directory `template`.
 pub(super) fn write_manifest(template: &Path, manifest: &Manifest) -> Result<()> {
-    files::write(&template.join(MANIFEST), &serde_json::to_vec(manifest)?)
+    // Mutate only this existing fixture file. The product record publisher
+    // creates a sibling staging directory, which would change the structural
+    // verdict before the damaged manifest itself is checked.
+    Ok(fs::write(
+        template.join(MANIFEST),
+        serde_json::to_vec(manifest)?,
+    )?)
 }
 
 /// The largest data file of a template, by its manifest.

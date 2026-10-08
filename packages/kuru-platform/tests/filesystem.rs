@@ -25,6 +25,199 @@ fn contents(mut file: File) -> Vec<u8> {
 }
 
 #[test]
+fn copied_access_rejects_other_source_aliases_and_other_stage_before_publication() {
+    use kuru_platform::fs::{copy_file_access, finalize_file_access, verify_file_access};
+
+    let (_temporary, directory) = fixture();
+    let mut source = directory.create_new(OsStr::new("source")).unwrap();
+    source.write_all(b"original policy source").unwrap();
+    let mut unrelated = directory.create_new(OsStr::new("unrelated")).unwrap();
+    unrelated.write_all(b"unrelated sentinel").unwrap();
+    let stage = directory
+        .create_private_directory(OsStr::new("stage"))
+        .unwrap();
+    let mut first = stage.create_new(OsStr::new("first")).unwrap();
+    first.write_all(b"first candidate").unwrap();
+    let mut second = stage.create_new(OsStr::new("second")).unwrap();
+    second.write_all(b"second candidate").unwrap();
+    let token = copy_file_access(&source, &first).unwrap();
+    assert_eq!(
+        verify_file_access(&unrelated, &token)
+            .unwrap_err()
+            .to_string(),
+        "access source identity changed during publication"
+    );
+    let error = directory
+        .publish_file_with_access(
+            &stage,
+            OsStr::new("second"),
+            &second,
+            &token,
+            OsStr::new("source"),
+            Publication::ReplaceRegular,
+        )
+        .unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert_eq!(
+        error.error().to_string(),
+        "copied access token belongs to another staged file"
+    );
+    let alias = directory.path().join("alias");
+    fs::hard_link(directory.path().join("source"), &alias).unwrap();
+    assert_eq!(
+        verify_file_access(&source, &token).unwrap_err().to_string(),
+        "access source gained another hardlink"
+    );
+    assert_eq!(
+        finalize_file_access(&source, &first)
+            .unwrap_err()
+            .to_string(),
+        "access source gained another hardlink"
+    );
+    assert_eq!(fs::read(&alias).unwrap(), b"original policy source");
+    assert_eq!(
+        fs::read(directory.path().join("source")).unwrap(),
+        b"original policy source"
+    );
+    assert_eq!(
+        fs::read(directory.path().join("unrelated")).unwrap(),
+        b"unrelated sentinel"
+    );
+    assert_eq!(
+        fs::read(stage.path().join("first")).unwrap(),
+        b"first candidate"
+    );
+    assert_eq!(
+        fs::read(stage.path().join("second")).unwrap(),
+        b"second candidate"
+    );
+}
+
+#[test]
+fn filesystem_root_and_same_file_publications_refuse_without_namespace_effects() {
+    let (temporary, directory) = fixture();
+    let filesystem_root = temporary.path().ancestors().last().unwrap();
+    let root =
+        Directory::open(filesystem_root, Privacy::Inherited, NameRetention::Movable).unwrap();
+    let identity = root.identity();
+    let error = root.remove_tree().unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert_eq!(error.identity, Some(identity));
+    assert_eq!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let root =
+        Directory::open(filesystem_root, Privacy::Inherited, NameRetention::Movable).unwrap();
+    let ordinary =
+        Directory::open(directory.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+    let error = ordinary
+        .move_new_directory(&root, OsStr::new("root-move"))
+        .unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert!(error.to_string().contains("filesystem root"));
+    let mut file = directory.create_new(OsStr::new("same")).unwrap();
+    file.write_all(b"same retained bytes").unwrap();
+    let identity = regular_file_info(&file).unwrap().identity;
+    let error = directory
+        .publish_file(
+            &directory,
+            OsStr::new("same"),
+            &file,
+            OsStr::new("same"),
+            Publication::ReplaceRegular,
+        )
+        .unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert!(error.to_string().contains("same file"));
+    directory.verify(OsStr::new("same"), &file).unwrap();
+    assert_eq!(regular_file_info(&file).unwrap().identity, identity);
+    assert_eq!(
+        fs::read(directory.path().join("same")).unwrap(),
+        b"same retained bytes"
+    );
+    assert!(!directory.path().join("root-move").exists());
+}
+
+#[test]
+fn checked_tree_removal_refuses_ordinary_or_pinned_roots_and_excessive_depth() {
+    let temporary = tempfile::tempdir().unwrap();
+    let ordinary_path = temporary.path().join("ordinary");
+    fs::create_dir(&ordinary_path).unwrap();
+    fs::write(ordinary_path.join("sentinel"), b"ordinary sentinel").unwrap();
+    let ordinary =
+        Directory::open(&ordinary_path, Privacy::Inherited, NameRetention::Movable).unwrap();
+    let ordinary_path = ordinary.path().to_owned();
+    let error = ordinary.remove_tree().unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert_eq!(error.path, ordinary_path);
+    assert_eq!(error.descendant, None);
+    assert_eq!(
+        fs::read(ordinary_path.join("sentinel")).unwrap(),
+        b"ordinary sentinel"
+    );
+
+    let pinned_path = temporary.path().join("pinned");
+    let private = Directory::ensure_private(&pinned_path).unwrap();
+    private
+        .create_new(OsStr::new("sentinel"))
+        .unwrap()
+        .write_all(b"pinned sentinel")
+        .unwrap();
+    let identity = private.identity();
+    let pinned =
+        Directory::open(private.path(), Privacy::OwnerOnly, NameRetention::Pinned).unwrap();
+    let error = pinned.remove_tree().unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert_eq!(error.identity, Some(identity));
+    assert_eq!(error.descendant, None);
+    assert!(error.to_string().contains("movable root handle"));
+    private.revalidate().unwrap();
+    assert_eq!(private.identity(), identity);
+    assert_eq!(
+        contents(private.read(OsStr::new("sentinel")).unwrap()),
+        b"pinned sentinel"
+    );
+
+    let root_path = temporary.path().join("deep");
+    let root = Directory::ensure_private(&root_path).unwrap();
+    let root_path = root.path().to_owned();
+    let mut path = root_path.clone();
+    // Native removal deliberately bounds recursion at 128. Short components
+    // keep the fixture below the supported native path-size bound.
+    for _ in 0..128 {
+        path.push("d");
+        fs::create_dir(&path).unwrap();
+    }
+    fs::write(path.join("sentinel"), b"deep sentinel").unwrap();
+    let error = root.remove_tree().unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected, "{error}");
+    assert_eq!(error.path, root_path);
+    let refused = error
+        .descendant
+        .as_ref()
+        .expect("the refusing directory must be named");
+    assert!(path.starts_with(error.path.join(refused)), "{error}");
+    #[cfg(windows)]
+    {
+        assert_eq!(refused, path.strip_prefix(&error.path).unwrap());
+        assert!(error.to_string().contains("depth exceeded"));
+    }
+    // Some Unix runners exhaust their lower native descriptor allowance before
+    // recursion reaches 128. That admission failure has the same no-mutation
+    // contract; the Unix unit fixture separately reaches the depth guard.
+    assert_eq!(fs::read(path.join("sentinel")).unwrap(), b"deep sentinel");
+    assert_eq!(
+        fs::read(ordinary_path.join("sentinel")).unwrap(),
+        b"ordinary sentinel"
+    );
+}
+
+#[test]
 fn consuming_removal_deletes_only_the_retained_regular_file() {
     let (_temporary, directory) = fixture();
     let name = OsStr::new("retired 日本語");
@@ -967,4 +1160,99 @@ mod windows {
         fs::rename(directory.path().join("source"), &destination).unwrap();
         assert_eq!(fs::read(destination).unwrap(), b"source bytes");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_move_refuses_an_unsearchable_destination_before_effects() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (temporary, destination) = fixture();
+    let source = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+    source
+        .create_new(OsStr::new("sentinel"))
+        .unwrap()
+        .write_all(b"source evidence")
+        .unwrap();
+    destination
+        .create_new(OsStr::new("adjacent"))
+        .unwrap()
+        .write_all(b"adjacent evidence")
+        .unwrap();
+    let source_identity = source.identity();
+    let destination_identity = destination.identity();
+    let retained = File::open(destination.path()).unwrap();
+    let original_mode = retained.metadata().unwrap().permissions();
+    retained
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    let result = destination.move_new_directory(&source, OsStr::new("published"));
+    // Restore the exact retained fixture object before any assertion or cleanup.
+    retained.set_permissions(original_mode).unwrap();
+    let error = result.unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert!(error.to_string().contains("preflight"));
+    assert_eq!(error.error().kind(), std::io::ErrorKind::PermissionDenied);
+    source.revalidate().unwrap();
+    destination.revalidate().unwrap();
+    assert_eq!(source.identity(), source_identity);
+    assert_eq!(destination.identity(), destination_identity);
+    assert_eq!(
+        contents(source.read(OsStr::new("sentinel")).unwrap()),
+        b"source evidence"
+    );
+    assert_eq!(
+        contents(destination.read(OsStr::new("adjacent")).unwrap()),
+        b"adjacent evidence"
+    );
+    assert!(!destination.path().join("published").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_tree_removal_refuses_an_unreadable_descendant_before_any_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (temporary, root) = fixture();
+    let path = root.path().to_owned();
+    let root_identity = root.identity();
+    let child = root
+        .create_private_directory(OsStr::new("unreadable"))
+        .unwrap();
+    child
+        .create_new(OsStr::new("sentinel"))
+        .unwrap()
+        .write_all(b"descendant evidence")
+        .unwrap();
+    let adjacent = temporary.path().join("adjacent");
+    fs::write(&adjacent, b"adjacent evidence").unwrap();
+    let child_identity = child.identity();
+    let retained = File::open(child.path()).unwrap();
+    let original_mode = retained.metadata().unwrap().permissions();
+    retained
+        .set_permissions(fs::Permissions::from_mode(0o000))
+        .unwrap();
+    let result = root.remove_tree();
+    retained.set_permissions(original_mode).unwrap();
+    let error = result.unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert_eq!(error.identity, Some(root_identity));
+    assert_eq!(error.path, path);
+    assert_eq!(error.descendant.as_deref(), Some(Path::new("unreadable")));
+    assert_eq!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    child.revalidate().unwrap();
+    assert_eq!(child.identity(), child_identity);
+    assert_eq!(
+        contents(child.read(OsStr::new("sentinel")).unwrap()),
+        b"descendant evidence"
+    );
+    assert_eq!(fs::read(adjacent).unwrap(), b"adjacent evidence");
+    assert!(path.is_dir());
 }

@@ -113,7 +113,7 @@ run = "taplo format"
 
 [tasks.coverage]
 depends = ["//packages/kuru-delivery:coverage:workspace"]
-description = "Require 90% combined Rust line coverage, including CLI and delivery tooling"
+description = "Require 95% combined Rust line coverage, including CLI and delivery tooling"
 # The instrumented suite provides both behavioral and coverage acceptance.
 # The owning package retains its exact bundle and supervisor prerequisites.
 
@@ -166,7 +166,7 @@ run = "mise run release:tool -- stamp"
 run = "mise run //packages/kuru-delivery:test"
 
 [tasks.check]
-description = "Full repository gate, including behavior, docs and 90% Rust coverage"
+description = "Full repository gate, including behavior, docs and 95% Rust coverage"
 depends = [
   "format:code",
   "lint:rust",

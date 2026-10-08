@@ -420,3 +420,183 @@ pub(super) fn require_known_entries(directory: &File, allowed: &[&OsStr]) -> io:
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removal_depth_admission_preserves_private_directory_and_descendant() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Directory::ensure_private(&temporary.path().join("root")).unwrap();
+        std::fs::write(root.path().join("sentinel"), b"private retained evidence").unwrap();
+        let mut removed = false;
+        let mut at = PathBuf::from("already/at/bound");
+        let (phase, error) =
+            remove_children(&root.anchor().file, &mut removed, MAX_TREE_DEPTH, &mut at)
+                .unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(at, Path::new("already/at/bound"));
+        assert!(!removed);
+        root.revalidate().unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("sentinel")).unwrap(),
+            b"private retained evidence"
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_refusal_contracts {
+    use super::*;
+
+    #[test]
+    fn native_removal_accepts_exact_root_absence_without_touching_adjacent_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("parent")).unwrap();
+        let root = parent.create_private_directory(OsStr::new("root")).unwrap();
+        parent.create_new(OsStr::new("adjacent")).unwrap();
+        let identity = root.identity();
+        let held = root.anchor().file.try_clone().unwrap();
+        std::fs::remove_dir(root.path()).unwrap();
+        let mut at = PathBuf::new();
+        remove_tree(
+            &parent.anchor().file,
+            &[],
+            root.path(),
+            OsStr::new("root"),
+            held,
+            identity,
+            &mut at,
+        )
+        .unwrap();
+        assert!(!root.path().exists());
+        assert!(at.as_os_str().is_empty());
+        parent
+            .verify(
+                OsStr::new("adjacent"),
+                &parent.read(OsStr::new("adjacent")).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn native_name_verification_keeps_substitutions_and_distinguishes_partial_removal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("parent")).unwrap();
+        let root = parent.create_private_directory(OsStr::new("root")).unwrap();
+        let identity = root.identity();
+        std::fs::rename(root.path(), parent.path().join("displaced")).unwrap();
+        let replacement = parent.create_private_directory(OsStr::new("root")).unwrap();
+        replacement.create_new(OsStr::new("sentinel")).unwrap();
+        for removed in [false, true] {
+            let mut removed = removed;
+            let (phase, error) = verify_named(
+                &parent.anchor().file,
+                OsStr::new("root"),
+                identity,
+                &mut removed,
+            )
+            .unwrap_err();
+            assert_eq!(
+                phase,
+                if removed {
+                    PublicationPhase::Uncertain
+                } else {
+                    PublicationPhase::Rejected
+                }
+            );
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        let (phase, error) =
+            verify_absent(&parent.anchor().file, OsStr::new("root"), &mut false).unwrap_err();
+        assert_eq!(phase, PublicationPhase::Uncertain);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        drop(replacement);
+        std::fs::rename(parent.path().join("root"), parent.path().join("substitute")).unwrap();
+        std::os::unix::fs::symlink(parent.path().join("substitute"), parent.path().join("root"))
+            .unwrap();
+        let (phase, _) =
+            verify_absent(&parent.anchor().file, OsStr::new("root"), &mut false).unwrap_err();
+        assert_eq!(phase, PublicationPhase::Uncertain);
+        assert!(parent.path().join("root").is_symlink());
+        assert!(parent.path().join("substitute/sentinel").exists());
+        assert_eq!(
+            Directory::open(
+                &parent.path().join("displaced"),
+                Privacy::OwnerOnly,
+                NameRetention::Movable
+            )
+            .unwrap()
+            .identity(),
+            identity
+        );
+    }
+
+    #[test]
+    fn native_ownership_checks_refuse_foreign_policy_without_changing_a_stage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("parent")).unwrap();
+        let stage = parent.create_new(OsStr::new("stage")).unwrap();
+        let policy = stage.metadata().unwrap().permissions().mode();
+        let system = File::open("/bin/sh").unwrap();
+        if system.metadata().unwrap().uid() != rustix::process::geteuid().as_raw() {
+            assert_eq!(
+                copy_file_access(&system, &stage).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                require_owned_replacement(&parent.anchor().file, &system)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        } else {
+            // Root-owned test runners legitimately own this system fixture.
+            require_owned_replacement(&parent.anchor().file, &system).unwrap();
+        }
+        assert_eq!(stage.metadata().unwrap().permissions().mode(), policy);
+        assert_eq!(
+            private_chain(&[]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            info(&File::open("/dev/null").unwrap())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn replacement_admission_refuses_a_nonwritable_retained_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("parent")).unwrap();
+        let held = parent.create_new(OsStr::new("record")).unwrap();
+        let original = parent.anchor().file.metadata().unwrap().permissions();
+        parent
+            .anchor()
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let outcome = require_owned_replacement(&parent.anchor().file, &held);
+        let creation = Directory::ensure_private(&parent.path().join("must-not-exist"));
+        parent.anchor().file.set_permissions(original).unwrap();
+        if rustix::process::geteuid().as_raw() != 0 {
+            assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                creation.unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert!(!parent.path().join("must-not-exist").exists());
+        }
+        assert_eq!(checked_file(&held).unwrap().len, 0);
+        parent.verify(OsStr::new("record"), &held).unwrap();
+    }
+}

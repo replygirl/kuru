@@ -10054,3 +10054,587 @@ mod legacy_import_tests {
         .await
     }
 }
+
+#[cfg(test)]
+mod managed_coverage_contract_tests {
+    struct DriverClaims(std::sync::Mutex<Vec<(super::MemoryStore, super::SessionDriver)>>);
+
+    async fn checked_owner_case(
+        label: &'static str,
+        check: impl std::ops::AsyncFnOnce(
+            &super::MemoryStore,
+            &super::MemoryStore,
+            &std::path::Path,
+            &DriverClaims,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use super::{MemoryStore, service};
+        use crate::test_support::{FixtureDeadline, fixture_deadline};
+        use sha2::{Digest as _, Sha256};
+        use std::sync::Mutex;
+
+        crate::test_support::warm_runtime_cache().await?;
+        let deadline = FixtureDeadline::start(fixture_deadline(1, 0), label);
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options =
+            crate::test_support::warmed_open_options(root.path().join("private"), scope).await?;
+        // Kept outside the cancellable stage, so deadline/error cleanup closes
+        // every attachment before asking its exact owner to reap.
+        let retained = Mutex::new(Vec::new());
+        let claims = DriverClaims(Mutex::new(Vec::new()));
+        let outcome = deadline
+            .serve(
+                async |served| {
+                    let _gate = crate::spawn_gate::spawning().await;
+                    let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                    served.serve(owner)?;
+                    let executable = std::env::current_exe()?;
+                    let memory = MemoryStore::open_managed_observed(
+                        options.clone(),
+                        project.clone(),
+                        executable.clone(),
+                    )
+                    .1
+                    .await?;
+                    retained.lock().unwrap().push(memory.clone());
+                    let mut inspection = options.clone();
+                    inspection.read_only = true;
+                    let reader =
+                        MemoryStore::open_managed_observed(inspection, project.clone(), executable)
+                            .1
+                            .await?;
+                    retained.lock().unwrap().push(reader.clone());
+                    check(&memory, &reader, &project, &claims).await
+                },
+                async |served| {
+                    let clients = std::mem::take(&mut *retained.lock().unwrap());
+                    let drivers = std::mem::take(&mut *claims.0.lock().unwrap());
+                    let mut failure = None;
+                    for (view, driver) in drivers {
+                        if let Err(error) = driver.close().await {
+                            failure = Some(error.context("close checked contract driver presence"));
+                        }
+                        if let Err(error) = view.close().await {
+                            failure = Some(error.context("close checked contract driver memory"));
+                        }
+                    }
+                    for client in clients {
+                        if let Err(error) = client.close().await {
+                            failure = Some(error);
+                        }
+                    }
+                    served
+                        .retire(
+                            &options,
+                            None,
+                            crate::server::close_budget(),
+                            "managed contract owner did not reap",
+                        )
+                        .await?;
+                    failure.map_or(Ok(()), |error| {
+                        Err(error.context("close managed contract clients"))
+                    })
+                },
+            )
+            .await;
+        root.release(outcome)
+    }
+
+    #[tokio::test]
+    async fn managed_atomic_checkpoints_preserve_history_views_and_readonly_refusals()
+    -> anyhow::Result<()> {
+        use super::*;
+        use anyhow::ensure;
+        use serde_json::json;
+
+        checked_owner_case(
+            "managed checkpoint and view contracts",
+            async |memory, reader, project, claims| {
+                let namespace = "checked/contracts/notes";
+                let rows = [
+                    Message::text("user", "first private note"),
+                    Message::text("assistant", "second private note"),
+                ];
+                memory
+                    .checkpoint(
+                        namespace,
+                        &rows,
+                        &[("checked-state".into(), json!({"version":1}))],
+                    )
+                    .await
+                    .context("publish atomic managed history/state checkpoint")?;
+                let committed = memory.revision().await?;
+                ensure!(memory.history(namespace, 1).await? == rows[1..]);
+                let window = memory.history_window(namespace, 1).await?;
+                ensure!(window.total_rows == 2 && window.messages == rows[1..]);
+                ensure!(memory.history_window(namespace, 0).await?.total_rows == 2);
+                ensure!(memory.history(namespace, 0).await?.is_empty());
+                let notes = memory.notes(namespace, 8).await?;
+                ensure!(
+                    notes.len() == 2
+                        && notes[0].content == "first private note"
+                        && notes[1].content == "second private note"
+                );
+                let keys = ["missing-state".into(), "checked-state".into()];
+                ensure!(
+                    memory.get_many(&keys).await?
+                        == [
+                            (keys[0].clone(), None),
+                            (keys[1].clone(), Some(json!({"version":1})))
+                        ]
+                );
+                let versions = memory.get_many_versioned(&keys).await?;
+                ensure!(
+                    versions.len() == keys.len(),
+                    "versioned batch omitted or added requested keys"
+                );
+                let version = versions[1]
+                    .1
+                    .as_ref()
+                    .context("checkpoint state has no CAS version")?
+                    .version;
+                ensure!(versions[0].1.is_none());
+                ensure!(
+                    memory
+                        .get_versioned("checked-state")
+                        .await?
+                        .context("version missing")?
+                        .version
+                        == version
+                );
+                ensure!(
+                    memory
+                        .revisions(8)
+                        .await?
+                        .iter()
+                        .any(|revision| revision.hash == committed)
+                );
+                let status = memory.status().await?;
+                ensure!(
+                    status.branch == "main" && !status.read_only && status.revision == committed
+                );
+                ensure!(reader.status().await?.read_only);
+                ensure!(reader.history_window(namespace, 8).await?.messages == rows);
+
+                // Every refusal must leave the complete checkpoint intact, and
+                // must not poison the writable sibling's subsequent admission.
+                ensure!(
+                    reader
+                        .checkpoint(
+                            namespace,
+                            &[Message::text("user", "forbidden")],
+                            &[("forbidden".into(), json!(true))]
+                        )
+                        .await
+                        .is_err()
+                );
+                ensure!(
+                    reader
+                        .append_message(namespace, &Message::text("user", "forbidden"))
+                        .await
+                        .is_err()
+                );
+                ensure!(reader.clear(namespace).await.is_err());
+                ensure!(
+                    reader
+                        .forget_note(namespace, notes[0].sequence)
+                        .await
+                        .is_err()
+                );
+                ensure!(reader.put("forbidden", &json!(true)).await.is_err());
+                ensure!(reader.begin_candidate("forbidden").await.is_err());
+                ensure!(
+                    memory.revision().await? == committed
+                        && memory.get("forbidden").await?.is_none()
+                );
+                ensure!(memory.history_window(namespace, 8).await?.messages == rows);
+
+                let mut selected = Vec::new();
+                for session in ["session-a", "session-b"] {
+                    memory
+                        .create_session(session, Mode::Ifs, session)
+                        .await
+                        .with_context(|| format!("persist checked fixture catalog {session}"))?;
+                    let (view, driver) = memory
+                        .bind_project_driver(project)
+                        .await
+                        .with_context(|| format!("bind native fixture driver {session}"))?;
+                    // Retain both the independent logical view and its native
+                    // presence before selection can fail or be cancelled.
+                    claims
+                        .0
+                        .lock()
+                        .unwrap()
+                        .push((view.clone(), driver.clone()));
+                    let catalog = view
+                        .session_catalog_record(session)
+                        .await?
+                        .with_context(|| format!("fixture catalog {session} absent"))?;
+                    let proof = driver
+                        .select(crate::SessionDriverTarget::Catalog(Box::new(catalog)))
+                        .await
+                        .with_context(|| {
+                            format!("select exact checked fixture session {session}")
+                        })?;
+                    ensure!(
+                        proof.session_id == session,
+                        "checked fixture driver selected another session"
+                    );
+                    selected.push(view);
+                }
+                let claimed_a = &selected[0];
+                let claimed_b = &selected[1];
+                ensure!(
+                    memory.live_session_drivers().await?.len() == 2,
+                    "independent fixture session claims were not retained"
+                );
+                claimed_a
+                    .checkpoint_session(
+                        namespace,
+                        "session-a",
+                        &[Message::text("user", "session a")],
+                        &[("session-checkpoint".into(), json!("a"))],
+                    )
+                    .await
+                    .context("owned session-a checkpoint publishes state and private history")?;
+                claimed_b
+                    .append_session_message(
+                        namespace,
+                        "session-b",
+                        &Message::text("user", "session b"),
+                    )
+                    .await
+                    .context("owned session-b append preserves separate private history")?;
+                let a = memory
+                    .session_history_window(namespace, "session-a", 8)
+                    .await?;
+                ensure!(a.total_rows == 1 && a.messages == [Message::text("user", "session a")]);
+                ensure!(
+                    memory
+                        .session_history_window(namespace, "session-b", 8)
+                        .await?
+                        .messages
+                        == [Message::text("user", "session b")]
+                );
+                let source = memory
+                    .session_source_snapshot(namespace, "session-a", namespace, 0, 8)
+                    .await
+                    .context("read exact owned session-a source snapshot")?;
+                ensure!(source.view == "main" && source.rows.len() == 1);
+                ensure!(
+                    memory
+                        .session_history_window_after(
+                            namespace,
+                            "session-a",
+                            source.through_inclusive.context("source boundary absent")?,
+                            8
+                        )
+                        .await?
+                        .rows
+                        .is_empty()
+                );
+
+                let candidate = memory.begin_candidate("atomic private checkpoint").await?;
+                let live = memory.revision().await?;
+                candidate
+                    .view()
+                    .checkpoint(
+                        namespace,
+                        &[Message::text("assistant", "candidate only")],
+                        &[("candidate-only".into(), json!("private"))],
+                    )
+                    .await?;
+                let head = candidate.view().revision().await?;
+                ensure!(candidate.view().get("candidate-only").await? == Some(json!("private")));
+                ensure!(
+                    memory.get("candidate-only").await?.is_none()
+                        && memory.revision().await? == live
+                );
+                ensure!(candidate.view().status().await?.branch == candidate.branch());
+                ensure!(
+                    candidate.reattach_checked(candidate.base()).await.is_err(),
+                    "stale candidate head was accepted"
+                );
+                ensure!(
+                    candidate.view().revision().await? == head && memory.revision().await? == live
+                );
+                ensure!(candidate.promote().await? == head);
+                ensure!(memory.get("candidate-only").await? == Some(json!("private")));
+                ensure!(
+                    candidate.reattach_checked(&head).await.is_err(),
+                    "resolved candidate was reattached"
+                );
+
+                memory.forget_note(namespace, notes[0].sequence).await?;
+                ensure!(
+                    !memory
+                        .notes(namespace, 8)
+                        .await?
+                        .iter()
+                        .any(|note| note.sequence == notes[0].sequence)
+                );
+                memory.clear(namespace).await?;
+                ensure!(memory.history(namespace, 8).await?.is_empty());
+                ensure!(
+                    memory
+                        .session_history_window(namespace, "session-a", 8)
+                        .await?
+                        .total_rows
+                        == 0
+                );
+                ensure!(
+                    memory.get("checked-state").await? == Some(json!({"version":1}))
+                        && memory.get("session-checkpoint").await? == Some(json!("a"))
+                );
+                ensure!(memory.reconcile().await?.is_none());
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn managed_receipt_replay_binds_payload_and_missing_evidence_stays_uncertain()
+    -> anyhow::Result<()> {
+        use super::*;
+        use anyhow::ensure;
+        use serde_json::json;
+
+        checked_owner_case(
+            "managed receipt identity and certainty contracts",
+            async |memory, _reader, _project, _claims| {
+                let Backend::Remote(remote) = &memory.backend else {
+                    bail!("fixture did not use native managed IPC")
+                };
+                let mut attachment = remote.session.factory.connect().await?;
+                let generation = attachment.generation().to_owned();
+                let request_id = Uuid::new_v4();
+                let checkpoint = |text: &str| ServiceCall::View {
+                    candidate: None,
+                    operation: Box::new(ViewOperation::Checkpoint {
+                        namespace: "checked-receipt".into(),
+                        messages: vec![Message::text("user", text)],
+                        values: vec![("receipt-state".into(), json!(text))],
+                    }),
+                };
+                let (method, digest) = checkpoint("accepted")
+                    .unit_receipt_fingerprint("main")?
+                    .context("checkpoint receipt absent")?;
+                ensure!(matches!(
+                    attachment
+                        .call_with_id(request_id, checkpoint("accepted"))
+                        .await?,
+                    ServiceValue::Unit
+                ));
+                let committed = memory.revision().await?;
+                ensure!(matches!(
+                    attachment
+                        .call_with_id(request_id, checkpoint("accepted"))
+                        .await?,
+                    ServiceValue::Unit
+                ));
+                ensure!(
+                    memory.revision().await? == committed
+                        && memory
+                            .history_window("checked-receipt", 8)
+                            .await?
+                            .total_rows
+                            == 1
+                );
+                let conflict = attachment
+                    .call_with_id(request_id, checkpoint("changed payload"))
+                    .await
+                    .err()
+                    .context("changed receipt payload was replayed")?;
+                ensure!(
+                    conflict
+                        .to_string()
+                        .contains("logical mutation ID conflicts")
+                        && attachment.has_definite_mutation_reply()
+                );
+                ensure!(
+                    memory.get("receipt-state").await? == Some(json!("accepted"))
+                        && memory.revision().await? == committed
+                );
+                let outcome = |id, original_generation: String, argument_digest: String| {
+                    ServiceCall::Outcome {
+                        original_id: id,
+                        original_generation,
+                        view: "main".into(),
+                        method: method.into(),
+                        argument_digest,
+                    }
+                };
+                ensure!(matches!(
+                    attachment
+                        .call(outcome(request_id, generation.clone(), digest.clone()))
+                        .await?,
+                    ServiceValue::Outcome(service::rpc::OutcomeStatus::Committed)
+                ));
+                let mismatch = attachment
+                    .call(outcome(request_id, generation.clone(), "0".repeat(64)))
+                    .await
+                    .err()
+                    .context("outcome accepted mismatched evidence")?;
+                ensure!(
+                    mismatch
+                        .to_string()
+                        .contains("logical mutation ID conflicts")
+                        && attachment.has_definite_mutation_reply()
+                );
+                let missing = Uuid::new_v4();
+                ensure!(matches!(
+                    attachment
+                        .call(outcome(missing, generation.clone(), digest.clone()))
+                        .await?,
+                    ServiceValue::Outcome(service::rpc::OutcomeStatus::StillUncertain)
+                ));
+                ensure!(matches!(
+                    attachment
+                        .call(outcome(missing, Uuid::new_v4().to_string(), digest))
+                        .await?,
+                    ServiceValue::Outcome(service::rpc::OutcomeStatus::Absent)
+                ));
+                ensure!(matches!(
+                    attachment
+                        .call(ServiceCall::CandidateOutcome {
+                            original_id: Uuid::new_v4(),
+                            original_generation: generation
+                        })
+                        .await?,
+                    ServiceValue::CandidateOutcome(
+                        service::rpc::CandidateCreationOutcome::StillUncertain
+                    )
+                ));
+                ensure!(
+                    attachment
+                        .call(ServiceCall::View {
+                            candidate: Some(Uuid::new_v4()),
+                            operation: Box::new(ViewOperation::Revision)
+                        })
+                        .await
+                        .is_err(),
+                    "unbound candidate handle accessed a view"
+                );
+                ensure!(
+                    memory.revision().await? == committed
+                        && memory
+                            .candidate_inventory(None, 8)
+                            .await?
+                            .candidates
+                            .is_empty()
+                );
+                memory.put("after-refusal", &json!(true)).await?;
+                ensure!(memory.get("after-refusal").await? == Some(json!(true)));
+                attachment.close();
+                Ok(())
+            },
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod facade_reconciliation_recovery_tests {
+    use crate as kuru_memory;
+
+    #[tokio::test]
+    async fn local_facade_recovery_preserves_exact_private_head_until_checked_promotion()
+    -> anyhow::Result<()> {
+        kuru_memory::test_support::closing(async {
+            use super::super::{CandidateReconciliationResolution, MemoryStore};
+            use anyhow::{Context as _, ensure};
+            use serde_json::json;
+
+            let memory = MemoryStore::temporary().await?;
+            memory.put("shared-base", &json!("BASE_PRIVATE")).await?;
+            let candidate = memory.begin_candidate("facade recovery proof").await?;
+            let base = candidate.base().to_owned();
+            candidate
+                .view()
+                .put("candidate-private", &json!("CANDIDATE_PRIVATE"))
+                .await?;
+            let from = candidate.view().revision().await?;
+            memory.put("live-private", &json!("LIVE_PRIVATE")).await?;
+            let live = memory.revision().await?;
+
+            // With no merge sent, the exact unchanged ref proves absence,
+            // while its fresh handle still cannot bypass the captured base.
+            let absent = candidate
+                .recover_reconciliation(&from, &live)
+                .await?
+                .context("unchanged exact candidate produced no recovery")?;
+            let CandidateReconciliationResolution::NotCommitted(status) = &absent.resolution else {
+                anyhow::bail!(
+                    "unsent reconciliation was classified as {:?}",
+                    absent.resolution
+                )
+            };
+            ensure!(
+                status.branch == candidate.branch()
+                    && status.head.as_deref() == Some(from.as_str())
+                    && status.base.as_deref() == Some(base.as_str())
+                    && status.state == crate::CandidateRefState::OpenConflict,
+                "uncommitted recovery changed the exact retained candidate"
+            );
+            ensure!(absent.candidate.base() == base);
+            ensure!(absent.candidate.view().revision().await? == from);
+            let refusal = absent
+                .candidate
+                .promote()
+                .await
+                .err()
+                .context("unreconciled recovered candidate bypassed its base")?;
+            ensure!(refusal.is::<crate::CandidateConflict>());
+            ensure!(memory.revision().await? == live);
+            ensure!(memory.get("candidate-private").await?.is_none());
+
+            // Settle one exact merge before querying its original tuple.
+            // Recovery returns evidence and a fresh base, never publication.
+            let reconciled = candidate.reconcile_with_live(&from, &live).await?;
+            let merged = reconciled
+                .candidate
+                .context("disjoint private reconciliation produced no fresh handle")?;
+            let head = merged.view().revision().await?;
+            ensure!(head != from && head != live);
+            let committed = candidate
+                .recover_reconciliation(&from, &live)
+                .await?
+                .context("settled exact merge produced no recovery")?;
+            ensure!(
+                committed.resolution == CandidateReconciliationResolution::Committed(head.clone()),
+                "settled exact merge was not proved committed"
+            );
+            ensure!(committed.candidate.branch() == candidate.branch());
+            ensure!(committed.candidate.base() == live);
+            ensure!(committed.candidate.view().revision().await? == head);
+            ensure!(
+                committed.candidate.view().get("candidate-private").await?
+                    == Some(json!("CANDIDATE_PRIVATE"))
+                    && committed.candidate.view().get("live-private").await?
+                        == Some(json!("LIVE_PRIVATE")),
+                "recovery lost one side of the isolated merged state"
+            );
+            ensure!(memory.revision().await? == live);
+            ensure!(memory.get("candidate-private").await?.is_none());
+            ensure!(committed.candidate.promote().await? == head);
+            ensure!(memory.revision().await? == head);
+            ensure!(memory.get("candidate-private").await? == Some(json!("CANDIDATE_PRIVATE")));
+            ensure!(memory.get("live-private").await? == Some(json!("LIVE_PRIVATE")));
+            memory.close().await?;
+            Ok(())
+        })
+        .await
+    }
+}

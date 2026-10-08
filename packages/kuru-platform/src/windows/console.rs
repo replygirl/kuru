@@ -175,8 +175,12 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
         .write(true)
         .open("CONOUT$")?
         .into();
+    let baseline = configure_baseline(&input, &output)?;
     let mut guard = ConsoleModeGuard::from_handles(input.try_clone()?, output.try_clone()?)?;
     let before = guard.original();
+    if before != baseline {
+        return Err(io::Error::other("isolated console baseline differs"));
+    }
     guard.enable_virtual_terminal_output()?;
     set(&input, before.input ^ ENABLE_INSERT_MODE)?;
     set(&output, before.output ^ ENABLE_WRAP_AT_EOL_OUTPUT)?;
@@ -226,19 +230,25 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
 /// distinguish exact restoration from crossterm's hard-coded default bits.
 #[cfg(feature = "test-support")]
 pub fn configure_test_baseline() -> io::Result<ConsoleModes> {
+    configure_baseline(
+        &stream(StandardStream::Input)?,
+        &stream(StandardStream::Output)?,
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn configure_baseline(input: &OwnedHandle, output: &OwnedHandle) -> io::Result<ConsoleModes> {
     use windows_sys::Win32::System::Console::{
         ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_LINE_INPUT,
         ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     };
-    let input = stream(StandardStream::Input)?;
-    let output = stream(StandardStream::Output)?;
     let input_mode =
-        (mode(&input)? | ENABLE_EXTENDED_FLAGS | ENABLE_LINE_INPUT | ENABLE_INSERT_MODE)
+        (mode(input)? | ENABLE_EXTENDED_FLAGS | ENABLE_LINE_INPUT | ENABLE_INSERT_MODE)
             & !(ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE);
     let output_mode =
-        (mode(&output)? | ENABLE_PROCESSED_OUTPUT) & !ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    set(&input, input_mode)?;
-    set(&output, output_mode)?;
+        (mode(output)? | ENABLE_PROCESSED_OUTPUT) & !ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    set(input, input_mode)?;
+    set(output, output_mode)?;
     Ok(ConsoleModes {
         input: input_mode,
         output: output_mode,

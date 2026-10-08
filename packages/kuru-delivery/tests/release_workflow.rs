@@ -2047,7 +2047,7 @@ fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence()
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let job = workflow_job(&ci, "native-platform", "usage-scan-scaling");
-    // One job, two legs: the x64 leg keeps the 90% platform gate and Windows
+    // One job, two legs: the x64 leg keeps the 95% platform gate and Windows
     // on Arm runs the distinct uninstrumented task under its own name.
     for required in [
         "    name: ${{ matrix.mode == 'coverage' && 'Native platform primitives' || 'Native platform behavior' }} (${{ matrix.target }})\n",
@@ -2066,11 +2066,11 @@ fn native_platform_runs_windows_on_arm_as_separately_named_behavioral_evidence()
     let steps = workflow_steps(job);
     let coverage = named_step(
         &steps,
-        "Test native platform primitives and require 90% coverage",
+        "Test native platform primitives and require 95% coverage",
     );
     assert_eq!(
         coverage,
-        "name: Test native platform primitives and require 90% coverage\n        if: matrix.mode == 'coverage'\n        run: mise run //packages/kuru-platform:coverage"
+        "name: Test native platform primitives and require 95% coverage\n        if: matrix.mode == 'coverage'\n        run: mise run //packages/kuru-platform:coverage"
     );
     // Never the coverage task with instrumentation quietly off.
     let behavior = named_step(
@@ -3887,4 +3887,113 @@ async fn bad_api_shapes_and_final_uploaded_digest_never_publish() {
     );
     assert!(GitHub::new("fixture/kuru", "").is_err());
     assert!(archives.temp.path().exists());
+}
+
+#[tokio::test]
+async fn standalone_coverage_tasks_select_the_pinned_tool_before_ambient_cargo() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for package in ["platform", "archive"] {
+        let manifest: toml::Value = toml::from_str(
+            &fs::read_to_string(repository.join(format!("packages/kuru-{package}/mise.toml")))
+                .unwrap(),
+        )
+        .unwrap();
+        let task = &manifest["tasks"]["coverage"];
+        let mut arguments =
+            format!("llvm-cov -p kuru-{package} --all-targets --all-features --locked");
+        if package == "platform" {
+            arguments.push_str(" --no-fail-fast");
+        }
+        arguments.push_str(&format!(
+            " --fail-under-lines 95 --lcov --output-path target/kuru-{package}-coverage.lcov"
+        ));
+        let windows = task["run_windows"].as_str().unwrap();
+        assert!(windows.contains("Join-Path ((mise bin-paths 'aqua:taiki-e/cargo-llvm-cov@0.9.1').Trim()) 'cargo-llvm-cov.exe'"));
+        assert!(windows.contains("if ((& $llvmCov llvm-cov --version).Trim() -ne 'cargo-llvm-cov 0.9.1') { throw 'Wrong cargo-llvm-cov version' }"));
+        let invocation = windows.trim().lines().last().unwrap();
+        assert_eq!(invocation, format!("& $llvmCov {arguments}"));
+        #[cfg(unix)]
+        {
+            let fixture = tempfile::tempdir().unwrap();
+            let ambient = fixture.path().join("ambient tools");
+            let pinned = fixture.path().join("pinned tools");
+            fs::create_dir(&ambient).unwrap();
+            fs::create_dir(&pinned).unwrap();
+            let refused = fixture.path().join("ambient-invoked");
+            let selected = fixture.path().join("selected-arguments");
+            let probed = fixture.path().join("version-probes");
+            let scripts = [
+                (
+                    ambient.join("cargo"),
+                    "#!/bin/sh\nprintf ambient > \"$KURU_REFUSED\"\nexit 97\n",
+                ),
+                (
+                    ambient.join("cargo-llvm-cov"),
+                    "#!/bin/sh\nprintf ambient > \"$KURU_REFUSED\"\nexit 97\n",
+                ),
+                (
+                    ambient.join("mise"),
+                    "#!/bin/sh\n[ \"$*\" = 'bin-paths aqua:taiki-e/cargo-llvm-cov@0.9.1' ] || exit 98\nprintf '%s\\n' \"$KURU_PINNED\"\n",
+                ),
+                (
+                    pinned.join("cargo-llvm-cov"),
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$KURU_PROBED\"\nif [ \"$*\" = 'llvm-cov --version' ]; then printf 'cargo-llvm-cov %s\\n' \"$KURU_TOOL_VERSION\"; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$KURU_SELECTED\"\n",
+                ),
+            ];
+            for (path, script) in scripts {
+                fs::write(&path, script).unwrap();
+                make_executable(&File::open(path).unwrap()).unwrap();
+            }
+            for version in ["0.9.1", "0.8.7"] {
+                let mut command = kuru_delivery::command::Command::new("/bin/sh");
+                command
+                    .args(["-c", task["run"].as_str().unwrap()])
+                    .current_dir(fixture.path())
+                    .env_clear()
+                    .env("PATH", &ambient)
+                    .env("KURU_PINNED", &pinned)
+                    .env("KURU_REFUSED", &refused)
+                    .env("KURU_SELECTED", &selected)
+                    .env("KURU_PROBED", &probed)
+                    .env("KURU_TOOL_VERSION", version);
+                if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+                    command.env("LLVM_PROFILE_FILE", profile);
+                }
+                let output = kuru_delivery::command::bounded_output(
+                    &mut command,
+                    launch_budget::until_job_deadline(),
+                    4096,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    output.status.success(),
+                    version == "0.9.1",
+                    "{package}: {output:?}"
+                );
+                assert!(
+                    !refused.exists(),
+                    "{package} selected an ambient coverage tool"
+                );
+                let probes = fs::read_to_string(&probed).unwrap();
+                assert_eq!(probes.lines().next(), Some("llvm-cov --version"));
+                if version == "0.9.1" {
+                    let recorded = fs::read_to_string(&selected).unwrap();
+                    assert_eq!(
+                        recorded.lines().collect::<Vec<_>>(),
+                        arguments.split_whitespace().collect::<Vec<_>>()
+                    );
+                    assert_eq!(probes.lines().count(), 2);
+                    fs::remove_file(&selected).unwrap();
+                } else {
+                    assert!(
+                        !selected.exists(),
+                        "wrong pinned version reached coverage invocation"
+                    );
+                    assert_eq!(probes.lines().count(), 1);
+                }
+                fs::remove_file(&probed).unwrap();
+            }
+        }
+    }
 }

@@ -32,7 +32,7 @@ All crates use workspace dependencies. Changes to public interfaces must be
 communicated before consumers are changed. No independent commits or external
 publication. Do not read/print credential files. Test using deterministic fake
 providers/protocol peers; optionally smoke test installed Codex without printing
-tokens. Aim for >=90% meaningful line coverage across the whole workspace.
+tokens. Aim for >=95% meaningful line coverage across the whole workspace.
 
 ## Shared Rust interfaces (`kuru_core`, root re-exports)
 

@@ -59,7 +59,7 @@ mise run //packages/kuru-platform:check:native
 ```
 
 This runs package formatting, strict lint, type checking, behavioral fixtures and
-coverage with the 90% line gate. Windows process/IPC fixtures execute on the required
+coverage with the 95% line gate. Windows process/IPC fixtures execute on the required
 native Windows CI jobs (x64 with the coverage gate, Windows on Arm as the
 uninstrumented `//packages/kuru-platform:test` behavior leg); Unix runs the shared filesystem checks. Tests use isolated
 paths and compiled Rust fixtures. Passing this package's checks establishes its

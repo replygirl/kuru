@@ -831,6 +831,43 @@ mod tests {
     }
 
     #[test]
+    fn sid_allocation_checks_reject_truncation_and_invalid_revisions_before_native_use() {
+        // The input buffer is synthetic public SID bytes, never credentials or
+        // a live token. Invalid pointers are bounds-checked before dereference.
+        let mut bytes = [0_u8; 16];
+        for length in [0, 7] {
+            // SAFETY: the entire supplied allocation remains live; bounded_sid
+            // must refuse the incomplete header before reading any SID field.
+            let error = unsafe { bounded_sid(bytes.as_mut_ptr().cast(), bytes.as_ptr(), length) }
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        bytes[0] = 1;
+        bytes[1] = 3;
+        // SAFETY: the fixed header is allocated; the declared subauthority
+        // extent is deliberately larger and must be refused before native use.
+        assert!(
+            unsafe { bounded_sid(bytes.as_mut_ptr().cast(), bytes.as_ptr(), bytes.len()) }
+                .unwrap_err()
+                .to_string()
+                .contains("extends outside")
+        );
+        bytes[0] = 255;
+        bytes[1] = 0;
+        // SAFETY: a complete fixed header with zero subauthorities is live;
+        // IsValidSid is allowed to inspect this bounded but invalid revision.
+        assert_eq!(
+            unsafe { bounded_sid(bytes.as_mut_ptr().cast(), bytes.as_ptr(), bytes.len()) }
+                .unwrap_err()
+                .to_string(),
+            "invalid SID"
+        );
+        // SAFETY: null is an intentionally invalid candidate pointer, whereas
+        // buffer is allocated. The extent check must never dereference null.
+        assert!(unsafe { bounded_sid(null_mut(), bytes.as_ptr(), bytes.len()) }.is_err());
+    }
+
+    #[test]
     fn retired_access_comparison_ignores_only_inherited_ace_provenance() {
         fn token(flags: u8, mask: u32, payload: [u8; 4]) -> Vec<u8> {
             let mut dacl = vec![2, 0, 0, 0, 0, 0, 1, 0];

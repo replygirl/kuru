@@ -1128,6 +1128,96 @@ mod cancellation_tests {
     }
 
     #[tokio::test]
+    async fn owner_loss_recovers_lost_candidate_write_without_live_publication() -> Result<()> {
+        kuru_memory::test_support::closing(async {
+            use futures::FutureExt as _;
+            let project_directory = tempfile::tempdir()?;
+            let project = project_directory.path().canonicalize()?;
+            let data = kuru_memory::test_support::tempdir()?;
+            let options = kuru_memory::test_support::warmed_open_options(data.path().to_owned(), crate::project_scope(&project)?).await?;
+            let executable = options.supervisor.clone().context("fixture supervisor absent")?;
+            let mut opened = Vec::new();
+            let mut retained_harness = None;
+            let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT.saturating_mul(4), async {
+                let open = || MemoryStore::open_managed_observed(options.clone(), project.clone(), executable.clone()).1;
+                let memory = open().await?;
+                opened.push(memory.clone());
+                let sibling = open().await?;
+                opened.push(sibling.clone());
+                retained_harness = Some(Harness::new(config(), &project, memory.clone(), Arc::new(DemoProvider), None).await?);
+                let harness = retained_harness.as_mut().context("fixture harness absent")?;
+                let original_proof = memory.live_session_drivers().await?.into_iter().next().context("original claim absent")?.proof;
+                let live = memory.revision().await?;
+                let topology = serde_json::to_value(&harness.topology)?;
+                let barrier = kuru_memory::test_support::ReplyBarrier::default();
+                let selected = {
+                    let candidate = harness.memory.begin_candidate("lost write owner proof").await?;
+                    harness.pending_candidate = Some(candidate.clone());
+                    let view = candidate.view();
+                    opened.push(view.clone());
+                    view.fixture_pause_next_service_reply(&barrier).await?;
+                    let private_value = json!("CANDIDATE_PRIVATE_SENTINEL");
+                    let mut writing = Box::pin(view.put("owner-loss-private", &private_value));
+                    tokio::select! {
+                        () = barrier.wait_sent() => {},
+                        result = &mut writing => anyhow::bail!("candidate write replied before its pause: {result:?}"),
+                    }
+                    let observed = tokio::time::timeout(kuru_memory::test_budgets::OPERATION_TIMEOUT, async {
+                        loop {
+                            let status = sibling.candidate_ref_status(candidate.branch()).await?;
+                            if status.head.as_deref().is_some_and(|head| head != candidate.base()) { break Ok::<_, anyhow::Error>(status); }
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                    }).await.context("owner did not accept candidate write")??;
+                    drop(writing);
+                    view.close_transport_for_test().await?;
+                    observed
+                };
+                ensure!(harness.memory.put("must-stay-fenced", &json!(true)).await.is_err());
+                harness.disconnect_driver_presence_for_test().await?;
+                harness.memory.close_transport_for_test().await?;
+                memory.close_transport_for_test().await?;
+                sibling.close_transport_for_test().await?;
+                kuru_memory::test_support::await_owner_release(&options).await?;
+                let recovered = harness.reopen_session_after_owner_loss().await;
+                let proof = harness.memory.live_session_drivers().await?.into_iter().next().context("recovered claim absent")?.proof;
+                ensure!(proof.session_id == original_proof.session_id && proof.service_generation != original_proof.service_generation);
+                ensure!(serde_json::to_value(&harness.topology)? == topology);
+                ensure!(harness.memory.revision().await? == live);
+                ensure!(harness.memory.get("owner-loss-private").await?.is_none());
+                ensure!(recovered.unwrap_err().is::<CandidateResolutionRequired>());
+                let candidate = harness.pending_candidate.as_ref().context("accepted candidate write was discarded")?;
+                ensure!(candidate.branch() == selected.branch && Some(candidate.base()) == selected.base.as_deref());
+                ensure!(Some(candidate.view().revision().await?) == selected.head);
+                ensure!(candidate.view().get("owner-loss-private").await? == Some(json!("CANDIDATE_PRIVATE_SENTINEL")));
+                harness.abandon_pending_dream_exact(&selected.branch, selected.base.as_deref().context("candidate base absent")?, selected.head.as_deref().context("candidate head absent")?).await?;
+                ensure!(harness.pending_candidate.is_none());
+                harness.reconcile().await?;
+                ensure!(harness.memory.get("owner-loss-private").await?.is_none());
+                ensure!(harness.memory.get("must-stay-fenced").await?.is_none());
+                harness.run("continue after checked candidate recovery").await?;
+                Ok::<(), anyhow::Error>(())
+            })).catch_unwind().await;
+            let mut cleanup = Vec::new();
+            if let Some(harness) = &mut retained_harness {
+                if let Err(error) = harness.shutdown(false).await { cleanup.push(format!("harness: {error:#}")); }
+                opened.push(harness.memory.clone());
+                if let Some(candidate) = &harness.pending_candidate { opened.push(candidate.view()); }
+            }
+            for memory in opened {
+                if let Err(error) = memory.close().await { cleanup.push(format!("memory: {error:#}")); }
+            }
+            if let Err(error) = kuru_memory::test_support::await_managed_quiescence(&options).await { cleanup.push(format!("reap: {error:#}")); }
+            let result = match outcome {
+                Ok(result) => result.context("candidate owner recovery exceeded its bounded operation allowance")?.with_context(|| format!("candidate owner recovery cleanup: {}", cleanup.join("; "))),
+                Err(panic) => { if !cleanup.is_empty() { eprintln!("candidate owner recovery cleanup: {}", cleanup.join("; ")); } std::panic::resume_unwind(panic) }
+            }.and_then(|()| { ensure!(cleanup.is_empty(), "{}", cleanup.join("; ")); Ok(()) });
+            data.release(result)?;
+            Ok(())
+        }).await
+    }
+
+    #[tokio::test]
     async fn reconciled_dream_retries_moved_promotion_and_retains_attempt_budget() -> Result<()> {
         kuru_memory::test_support::closing(async {
             let project = tempfile::tempdir()?;

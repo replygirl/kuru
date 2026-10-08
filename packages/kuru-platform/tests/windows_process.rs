@@ -4,14 +4,18 @@ use kuru_platform::windows::{
     pipe::{self, Pipe, PrivateListener, PrivateServiceListener},
     process::{
         Console, Lifetime, NativeChild, NativeSpawnSpec, ProcessStamp, RootObservation, Stdio,
-        current_process_handle, process_object_retained, process_stamp, sample_process,
+        current_process_handle, duplicate_inherited_process_handle, process_object_retained,
+        process_stamp, sample_process, wait_process_handle,
     },
 };
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, TryLockError},
     io,
-    os::windows::ffi::{OsStrExt, OsStringExt},
+    os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        io::{AsRawHandle, OwnedHandle},
+    },
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -50,6 +54,50 @@ const CHILD_START: Duration = Duration::from_secs(5);
 const LIMIT: Duration = NATIVE_BOUND.saturating_add(CHILD_START);
 const SHORT: Duration = Duration::from_millis(80);
 
+#[tokio::test]
+async fn process_queries_refuse_file_handles_and_mismatched_identity_without_closing_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("retained-file");
+    fs::write(&path, b"retained file bytes").unwrap();
+    let file: OwnedHandle = File::open(&path).unwrap().into();
+    assert!(sample_process(&file).is_err());
+    assert!(process_stamp(&file).is_err());
+    assert!(wait_process_handle(&file, SHORT).await.is_err());
+    assert!(
+        duplicate_inherited_process_handle(file.as_raw_handle() as usize, std::process::id())
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"retained file bytes");
+
+    let process = current_process_handle().unwrap();
+    let stamp = process_stamp(&process).unwrap();
+    for (value, expected_pid) in [
+        (0, stamp.id),
+        (usize::MAX, stamp.id),
+        (process.as_raw_handle() as usize, 0),
+        (process.as_raw_handle() as usize, stamp.id + 1),
+    ] {
+        assert_eq!(
+            duplicate_inherited_process_handle(value, expected_pid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let duplicate =
+        duplicate_inherited_process_handle(process.as_raw_handle() as usize, stamp.id).unwrap();
+    assert_eq!(process_stamp(&duplicate).unwrap(), stamp);
+    drop(duplicate);
+    assert_eq!(process_stamp(&process).unwrap(), stamp);
+    assert_eq!(
+        wait_process_handle(&process, Duration::ZERO)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
 /// The bound of an outer wait over `limits` inner waits bounded by [`LIMIT`]
 /// and `shorts` bounded by [`SHORT`], run in series, so each inner wait has its
 /// own bound first. A caller whose span has a step no inner wait bounds (child
@@ -67,6 +115,122 @@ fn series(limits: u32, shorts: u32) -> Duration {
 /// the parent's waits decide first, and the self-timeout only reaps an orphan.
 fn budget_arg(budget: Duration) -> OsString {
     budget.saturating_add(LIMIT).as_millis().to_string().into()
+}
+
+#[tokio::test]
+async fn pipe_direction_empty_io_and_closed_operations_preserve_child_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let mut spawn = spec(root.path(), &[OsStr::new("capture")]);
+    spawn.stdin = Stdio::Pipe;
+    spawn.stdout = Stdio::Pipe;
+    let mut child = spawn.spawn().await.unwrap();
+    let mut input = child.take_stdin().unwrap();
+    let mut output = child.take_stdout().unwrap();
+    assert_eq!(input.write(&[]).await.unwrap(), 0);
+    assert_eq!(output.read(&mut []).await.unwrap(), 0);
+    assert_eq!(
+        input.read(&mut [0]).await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        output.write(b"wrong direction").await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert!(child.interrupt().is_err(), "no console group was requested");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "refused operations ended the child"
+    );
+    input.write_all(b"owned input").await.unwrap();
+    tokio::time::timeout(LIMIT, input.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(input.is_closed());
+    input.close(LIMIT).await.unwrap();
+    assert_eq!(
+        input.write(b"after close").await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        input.flush().await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    let mut bytes = Vec::new();
+    tokio::time::timeout(LIMIT, output.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report["stdin"], "owned input");
+    assert!(child.wait(LIMIT).await.unwrap().success());
+    child.terminate().unwrap();
+    output.close(LIMIT).await.unwrap();
+    assert_eq!(
+        output.read(&mut [0]).await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn process_diagnostics_retain_failed_observations_and_partial_member_details() {
+    use kuru_platform::windows::process::{JobMember, JobSnapshot, TreeSnapshot};
+
+    let snapshot = TreeSnapshot {
+        root_id: 42,
+        root: Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "root query denied",
+        )),
+        root_sample: Err(io::Error::other("root sample unavailable")),
+        job: Some(Ok(JobSnapshot {
+            active_processes: 2,
+            total_processes: 3,
+            terminated_processes: 1,
+            assigned_processes: 2,
+            members: vec![
+                JobMember {
+                    id: 43,
+                    image: Ok("retained fixture.exe".into()),
+                    sample: Err(io::Error::other("member sample unavailable")),
+                },
+                JobMember {
+                    id: 44,
+                    image: Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "member query denied",
+                    )),
+                    sample: Err(io::Error::other("second sample unavailable")),
+                },
+            ],
+        })),
+    };
+    let text = snapshot.to_string();
+    for expected in [
+        "root pid=42",
+        "state_error=root query denied",
+        "sample_error=root sample unavailable",
+        "active=2",
+        "listed=2/2",
+        "pid=43",
+        "image=retained fixture.exe",
+        "pid=44",
+        "image_error=member query denied",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    let snapshot = TreeSnapshot {
+        root_id: 42,
+        root: Ok(RootObservation::Exited(7)),
+        root_sample: Err(io::Error::other("unavailable")),
+        job: Some(Err(io::Error::other("job query unavailable"))),
+    };
+    assert!(snapshot.to_string().contains("state=exited(7)"));
+    assert!(
+        snapshot
+            .to_string()
+            .contains("job_error=job query unavailable")
+    );
 }
 
 #[tokio::test]

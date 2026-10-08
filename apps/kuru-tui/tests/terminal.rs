@@ -7875,3 +7875,102 @@ async fn update_notice_excluded_commands_and_nonterminal_stderr_have_no_effect()
     })
     .await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_recall_search_cycles_and_refuses_paste_without_changing_literal_draft()
+-> Result<()> {
+    kuru_memory::test_support::closing(async {
+        for columns in [120, 80] {
+            let sandbox = Sandbox::warmed().await?;
+            let mut command = sandbox.command("demo");
+            command
+                .args(["--mode", "freudian", "-c", "max_rounds=1"])
+                .env("KURU_REDUCED_MOTION", "1");
+            let mut terminal = Terminal::spawn(command, 30, columns)?;
+            terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+            let oldest = "recall oldest 猫";
+            let newest = "recall newest 日本語";
+            for (index, prompt) in [oldest, newest].into_iter().enumerate() {
+                terminal.send(prompt.as_bytes())?;
+                terminal.wait_composer_frame(&[prompt, "enter send"], READY_TIMEOUT)?;
+                terminal.send(b"\r")?;
+                terminal.wait_composer_frame(
+                    &[&format!("{} turns", index + 1), "enter send"],
+                    READY_TIMEOUT,
+                )?;
+            }
+            let draft = "literal draft e\u{301} 猫";
+            terminal.send(draft.as_bytes())?;
+            terminal.wait_composer_frame(&[draft, "enter send"], READY_TIMEOUT)?;
+            for (key, prompt, label) in [
+                (b"\x1b[A".as_slice(), newest, "history 1/2"),
+                (b"\x1b[A".as_slice(), oldest, "history 2/2"),
+                (b"\x1b[A".as_slice(), oldest, "history 2/2"),
+                (b"\x1b[B".as_slice(), newest, "history 1/2"),
+                (b"\x1b[B".as_slice(), draft, "enter send"),
+                (b"\x1b[A".as_slice(), newest, "history 1/2"),
+                (b"\x1b".as_slice(), draft, "enter send"),
+            ] {
+                terminal.send(key)?;
+                terminal.wait_composer_frame(&[prompt, label], READY_TIMEOUT)?;
+            }
+            terminal.send(b"\x12recall")?;
+            terminal.wait_composer_frame(&["reverse search", newest, "1/2"], READY_TIMEOUT)?;
+            for (prompt, label) in [(oldest, "2/2"), (newest, "1/2")] {
+                terminal.send(b"\x12")?;
+                terminal.wait_composer_frame(&["reverse search", prompt, label], READY_TIMEOUT)?;
+            }
+            terminal.send(&[127; 6])?;
+            terminal.send(b"NO_NATIVE_RECALL_MATCH")?;
+            terminal.wait_composer_frame(&["reverse search", "0/0", draft], READY_TIMEOUT)?;
+            terminal.send(b"\x1b[200~ignored search paste\x1b[201~")?;
+            terminal.wait_composer_frame(
+                &[draft, "Leave prompt search before pasting"],
+                READY_TIMEOUT,
+            )?;
+            terminal.send(b"\x1b")?;
+            terminal.wait_composer_frame(&[draft, "enter send"], READY_TIMEOUT)?;
+            terminal.send(b"\x12oldest")?;
+            terminal.wait_composer_frame(&["reverse search", oldest, "1/1"], READY_TIMEOUT)?;
+            terminal.send(b"\r")?;
+            terminal.wait_composer_frame(&[oldest, "enter send"], READY_TIMEOUT)?;
+            terminal.send(b"\r")?;
+            terminal.wait_composer_frame(&["3 turns", "enter send"], READY_TIMEOUT)?;
+            terminal.send(b"/quit\r")?;
+            terminal.wait_exit(EXIT_TIMEOUT)?;
+            terminal.assert_restored()?;
+            drop(terminal);
+            let sessions = sandbox.sessions()?;
+            ensure!(sessions.len() == 1 && sessions[0].turns == 3);
+            let output = sandbox
+                .command("demo")
+                .args(["sessions", "export", &sessions[0].id, "--format", "jsonl"])
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut prompts = Vec::new();
+            for line in std::str::from_utf8(&output.stdout)?.lines().skip(1) {
+                let entry: kuru_memory::PublicTranscriptEntry = serde_json::from_str(line)?;
+                let kuru_memory::PublicTranscriptEntry::Turn { record } = entry else {
+                    anyhow::bail!("native recall created an unexpected legacy record");
+                };
+                ensure!(record.settlement == kuru_memory::PublicTurnSettlement::Completed);
+                let user = record.user_entry.context("settled native prompt absent")?;
+                prompts.push(
+                    user.plain_text()
+                        .context("native prompt is not text")?
+                        .to_owned(),
+                );
+            }
+            ensure!(
+                prompts == [oldest, newest, oldest],
+                "recall changed canonical prompt bytes at {columns} columns"
+            );
+        }
+        Ok(())
+    })
+    .await
+}

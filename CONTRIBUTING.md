@@ -15,7 +15,7 @@ mise run setup
 
 The monorepo uses `apps/` and `packages/`, centrally pinned tools and dependencies,
 and hk hooks. Run commands through mise. See [development](docs/development.md)
-for the full task catalog and the meaningful 90% workspace coverage requirement.
+for the full task catalog and the meaningful 95% workspace coverage requirement.
 
 [AGENTS.md](AGENTS.md) is the shared instruction source for coding assistants;
 Claude Code imports it through `CLAUDE.md`. Cospec workflows are generated for

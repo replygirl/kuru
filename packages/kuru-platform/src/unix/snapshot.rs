@@ -712,6 +712,17 @@ mod tests {
         assert_eq!(result.unwrap(), Some(()));
         assert!(armed);
         assert_eq!(operations, [HelperOperation::Poll, HelperOperation::Wait]);
+
+        // A completed poll has already consumed the exact child's wait.
+        // Cleanup must return that status without a kill or another wait.
+        let mut armed = true;
+        let mut operations = Vec::new();
+        let result = stop_helper_with(&mut armed, |operation| {
+            operations.push(operation);
+            Ok(Some(17))
+        });
+        assert_eq!(result.unwrap(), Some(17));
+        assert_eq!(operations, [HelperOperation::Poll]);
     }
 
     #[test]
@@ -743,7 +754,7 @@ mod tests {
                 Some(20),
                 Instant::now() + super::super::tests::TEST_BOUND,
                 &AtomicBool::new(false),
-                None,
+                Some(super::super::tests::TEST_BOUND),
                 |pipe, stream, sender| {
                     if stream == failed_stream {
                         let limit = Instant::now() + super::super::tests::TEST_BOUND;
@@ -926,5 +937,283 @@ mod tests {
         let text = describe_rows(1, &rows);
         assert!(text.starts_with(&format!("process tree of 1 ({} rows): [", rows.len())));
         assert!(text.ends_with("; 2 more omitted]"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod reader_failure_contracts {
+    use super::*;
+    use std::{fs, sync::Arc};
+
+    fn write_fixture(program: &Path, bytes: &[u8]) {
+        // Only this retained writer child opens a writable executable handle.
+        // Reap it before another native helper may select the file for exec.
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "umask 077; printf '%s' \"$2\" > \"$1\" && /bin/chmod 700 \"$1\"",
+                "kuru-snapshot-writer",
+            ])
+            .arg(program)
+            .arg(std::str::from_utf8(bytes).unwrap());
+        let mut child = super::super::spawn_independent(command, None).unwrap();
+        assert!(
+            child.wait().unwrap().success(),
+            "native fixture writer failed"
+        );
+    }
+
+    #[test]
+    fn oversized_native_snapshot_is_rejected_after_the_owned_helper_is_reaped() {
+        let temporary = tempfile::tempdir().unwrap();
+        let program = temporary.path().join("owned-large-fixture");
+        let sentinel = temporary.path().join("adjacent");
+        fs::write(&sentinel, b"unrelated fixture state").unwrap();
+        // Builtins produce the excess output without an unowned descendant.
+        let bytes = format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nblock='{}'\ni=0\nwhile [ \"$i\" -lt 1025 ]; do printf '%s' \"$block\"; i=$((i + 1)); done\nexit 0\n",
+            "x".repeat(4096),
+        );
+        write_fixture(&program, bytes.as_bytes());
+        let error = list_until_with_readers(
+            &program,
+            MEMBERSHIP_COLUMNS,
+            Some(7),
+            Instant::now() + SNAPSHOT_TIMEOUT,
+            &AtomicBool::new(false),
+            Some(SNAPSHOT_TIMEOUT),
+            start_reader,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "ps output exceeds limit");
+        let pid = fs::read_to_string(program.with_file_name("owned-large-fixture.pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert!(matches!(
+            rustix::process::waitid(
+                rustix::process::WaitId::Pid(rustix::process::Pid::from_raw(pid).unwrap()),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ),
+            Err(rustix::io::Errno::CHILD)
+        ));
+        assert_eq!(fs::read(&program).unwrap(), bytes.as_bytes());
+        assert_eq!(fs::read(sentinel).unwrap(), b"unrelated fixture state");
+    }
+
+    #[test]
+    fn native_helper_reader_failures_are_typed_only_after_the_exact_helper_is_reaped() {
+        for failed_stream in ["stdout", "stderr"] {
+            let faults = if failed_stream == "stdout" {
+                ["missing", "read", "panic", "cancel"].as_slice()
+            } else {
+                ["missing", "read", "panic"].as_slice()
+            };
+            for &fault in faults {
+                let temporary = tempfile::tempdir().unwrap();
+                let program = temporary.path().join("owned-ps-fixture");
+                let bytes = b"#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nprintf '7 7 S\\n'\n";
+                write_fixture(&program, bytes);
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let result = list_until_with_readers(
+                    &program,
+                    MEMBERSHIP_COLUMNS,
+                    Some(7),
+                    Instant::now() + Duration::from_secs(5),
+                    &cancelled,
+                    Some(Duration::from_secs(5)),
+                    |pipe, stream, sender| {
+                        if stream != failed_stream {
+                            return start_reader(pipe, stream, sender);
+                        }
+                        if fault == "missing" {
+                            drop(pipe);
+                            return start_reader(None, stream, sender);
+                        }
+                        let cancellation = Arc::clone(&cancelled);
+                        Ok(thread::spawn(move || {
+                            let mut bytes = Vec::new();
+                            pipe.unwrap().read_to_end(&mut bytes).unwrap();
+                            // Cancellation follows this launched helper's
+                            // healthy stdout EOF, never pre-launch admission.
+                            if fault == "cancel" {
+                                cancellation.store(true, Ordering::Release);
+                                let _ = sender.send(());
+                                return (Ok(()), bytes);
+                            }
+                            let _ = sender.send(());
+                            assert_ne!(fault, "panic", "controlled native reader panic");
+                            (
+                                Err(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "controlled native reader failure",
+                                )),
+                                bytes,
+                            )
+                        }))
+                    },
+                );
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if fault == "read" {
+                        io::ErrorKind::BrokenPipe
+                    } else if fault == "cancel" {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::Other
+                    }
+                );
+                let expected = match fault {
+                    "missing" => format!("missing ps {failed_stream}"),
+                    "panic" => format!("ps {failed_stream} reader panicked"),
+                    "cancel" => "ps inspection cancelled".to_owned(),
+                    _ => "controlled native reader failure".to_owned(),
+                };
+                assert_eq!(error.to_string(), expected);
+                let pid = fs::read_to_string(program.with_file_name("owned-ps-fixture.pid"))
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                assert!(
+                    matches!(
+                        rustix::process::waitid(
+                            rustix::process::WaitId::Pid(
+                                rustix::process::Pid::from_raw(pid).unwrap()
+                            ),
+                            rustix::process::WaitIdOptions::EXITED
+                                | rustix::process::WaitIdOptions::NOHANG
+                                | rustix::process::WaitIdOptions::NOWAIT,
+                        ),
+                        Err(rustix::io::Errno::CHILD)
+                    ),
+                    "an output failure cannot leave the native helper unreaped"
+                );
+                assert_eq!(fs::read(&program).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_range_and_unicode_truncation_preserve_safe_snapshot_evidence() {
+        for fields in ["4294967296 1 7", "7 4294967296 7", "7 1 4294967296"] {
+            let error = parse(&format!("{fields} 0 0 S 0:00 1 fixture")).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(error.to_string().contains("exceeds range"));
+        }
+        let rows = parse(&format!(
+            "7 1 7 0 0 S 0:00 1 x{}",
+            "é".repeat(COMMAND_LIMIT)
+        ))
+        .unwrap();
+        let kept = &rows[0].command;
+        assert!(kept.ends_with("..."));
+        assert_eq!(kept.len(), COMMAND_LIMIT - 1 + 3);
+        assert!(kept.starts_with('x'));
+        assert!(
+            kept.strip_suffix("...")
+                .unwrap()
+                .chars()
+                .skip(1)
+                .all(|character| character == 'é')
+        );
+    }
+
+    #[test]
+    fn native_helper_wait_loss_disarms_polling_before_termination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let program = temporary.path().join("owned-wait-fixture");
+        let marker = program.with_file_name("owned-wait-fixture.pid");
+        let bytes = b"#!/bin/sh\nwhile [ ! -f \"$0.publish\" ]; do :; done\nprintf '%s\\n' \"$$\" > \"$0.pid\"\nwhile [ ! -f \"$0.exit\" ]; do :; done\nprintf '7 7 S\\n'\n";
+        write_fixture(&program, bytes);
+        let mut publication = Some(program.with_file_name("owned-wait-fixture.publish"));
+        let mut exit = Some(program.with_file_name("owned-wait-fixture.exit"));
+        let mut consumed = None;
+        let error = list_until_with_readers(
+            &program,
+            MEMBERSHIP_COLUMNS,
+            Some(7),
+            Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false),
+            Some(Duration::from_secs(5)),
+            |pipe, stream, sender| {
+                let reader = start_reader(pipe, stream, sender)?;
+                if stream == "stdout" {
+                    let limit = Instant::now() + Duration::from_secs(5);
+                    let pid = loop {
+                        if let Some(pid) = fs::read_to_string(&marker)
+                            .ok()
+                            .and_then(|text| {
+                                text.strip_suffix('\n')
+                                    .and_then(|id| id.parse::<i32>().ok())
+                            })
+                            .and_then(rustix::process::Pid::from_raw)
+                        {
+                            break pid;
+                        }
+                        // Publication cannot precede the first absent probe.
+                        if let Some(publication) = publication.take() {
+                            fs::write(publication, b"publish")?;
+                        }
+                        if Instant::now() >= limit {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "fixture identity not published",
+                            ));
+                        }
+                        thread::yield_now();
+                    };
+                    // The reader-factory seam is before this actual helper's
+                    // first owner poll. Its private marker names the retained,
+                    // unreaped child; no row or unrelated PID grants authority.
+                    loop {
+                        match rustix::process::waitid(
+                            rustix::process::WaitId::Pid(pid),
+                            rustix::process::WaitIdOptions::EXITED
+                                | rustix::process::WaitIdOptions::NOHANG,
+                        ) {
+                            Ok(Some(_)) => break,
+                            Ok(None) if Instant::now() < limit => {
+                                // Only the exact child's pending wait releases
+                                // its builtin exit gate; no signal is needed.
+                                if let Some(exit) = exit.take() {
+                                    fs::write(exit, b"exit")?;
+                                }
+                                thread::yield_now()
+                            }
+                            Err(rustix::io::Errno::INTR) if Instant::now() < limit => {
+                                thread::yield_now()
+                            }
+                            result => {
+                                return Err(io::Error::other(format!(
+                                    "fixture wait not consumed: {result:?}"
+                                )));
+                            }
+                        }
+                    }
+                    consumed = Some(pid);
+                }
+                Ok(reader)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error())
+        );
+        assert!(matches!(
+            rustix::process::waitid(
+                rustix::process::WaitId::Pid(consumed.unwrap()),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ),
+            Err(rustix::io::Errno::CHILD)
+        ));
+        assert_eq!(fs::read(program).unwrap(), bytes);
     }
 }

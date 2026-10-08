@@ -4700,6 +4700,107 @@ fn headless_json_remains_machine_readable_when_old_context_is_omitted() {
     assert!(String::from_utf8_lossy(&export.stdout).contains(sentinel));
 }
 
+// The Unix PTY acceptance also covers piped input and signals. Exercise the
+// same public-stream privacy, denied-effect and durable retry contracts using
+// owned native Windows child processes, whose transport has no Unix PTY path.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_windows_headless_stream_preserves_denial_privacy_and_durable_retry() {
+    kuru_memory::test_support::closing(async {
+        use axum::{
+            Json, Router,
+            response::IntoResponse,
+            routing::{get, post},
+        };
+        use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+        struct Server(tokio::task::JoinHandle<()>);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let mode = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route("/v1/models", get(|| async { Json(serde_json::json!({"data":[{"id":"fixture"}]})) }))
+            .route("/v1/responses", post({
+                let mode = mode.clone();
+                let requests = requests.clone();
+                move |Json(request): Json<Value>| {
+                    let mode = mode.clone();
+                    let requests = requests.clone();
+                    async move {
+                        requests.lock().unwrap().push(request.clone());
+                        let speaking = request["instructions"].as_str().is_some_and(|text| text.contains("Phase: speak and act"));
+                        let followup = request["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "function_call_output"));
+                        if speaking && followup && mode.load(Ordering::SeqCst) == 2 {
+                            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "PRIVATE_NATIVE_PROVIDER").into_response();
+                        }
+                        let output = if speaking && !followup {
+                            serde_json::json!([{"type":"function_call","call_id":"native-effect","name":"file_write","arguments":serde_json::json!({"path":"effect.txt","content":"PRIVATE_NATIVE_TOOL"}).to_string()}])
+                        } else if speaking {
+                            serde_json::json!([
+                                {"id":"reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"PRIVATE_NATIVE_REASONING"}],"encrypted_content":"PRIVATE_NATIVE_COGNITIVE"},
+                                {"id":"message","type":"message","content":[{"type":"output_text","text":"PUBLIC_NATIVE_ANSWER"}]}
+                            ])
+                        } else {
+                            serde_json::json!([{"type":"message","content":[{"type":"output_text","text":"PRIVATE_NATIVE_COGNITIVE"}]}])
+                        };
+                        let event = serde_json::json!({"type":"response.completed","response":{"id":"native-headless","status":"completed","output":output,"usage":{"input_tokens":8,"output_tokens":8}}});
+                        ([("content-type", "text/event-stream")], format!("data: {event}\n\n")).into_response()
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = Server(tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); }));
+        for case in 0..3 {
+            mode.store(case, Ordering::SeqCst);
+            let env = Sandbox::warmed().await;
+            let config = env.root.path().join("headless-native.toml");
+            std::fs::write(&config, format!("api_base='http://{address}/v1'\napi_key_env='KURU_NATIVE_STREAM_KEY'\nmax_rounds=1\n")).unwrap();
+            let mut command = env.command_for("responses");
+            command.args(["--model", "fixture", "--config"]).arg(&config).env("KURU_NATIVE_STREAM_KEY", "fixture");
+            if case != 1 { command.arg("--allow-write"); }
+            command.args(["run", "NATIVE_ARGV_PROMPT", "--turn-id", "native-stream", "--output-format", "stream-json"]);
+            let output = tokio::task::spawn_blocking(move || command.output()).await.unwrap().unwrap();
+            assert_eq!(output.status.code(), Some(if case == 2 { 1 } else { 0 }), "case {case}: {}", String::from_utf8_lossy(&output.stderr));
+            for bytes in [&output.stdout, &output.stderr] {
+                let text = String::from_utf8_lossy(bytes);
+                for secret in ["PRIVATE_NATIVE_TOOL", "PRIVATE_NATIVE_COGNITIVE", "PRIVATE_NATIVE_REASONING", "PRIVATE_NATIVE_PROVIDER"] {
+                    assert!(!text.contains(secret), "public native output disclosed {secret}: {text}");
+                }
+            }
+            let records: Vec<Value> = std::str::from_utf8(&output.stdout).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert!(records.iter().all(|record| record["version"] == 1 && ["started", "status", "snapshot", "gap", "terminal"].contains(&record["kind"].as_str().unwrap_or(""))));
+            assert!(records.windows(2).all(|pair| pair[0]["seq"].as_u64() < pair[1]["seq"].as_u64()));
+            assert_eq!(records.iter().filter(|record| record["kind"] == "terminal").count(), 1);
+            let terminal = records.last().unwrap();
+            assert_eq!(terminal["detail"]["status"], if case == 2 { "failed" } else { "completed" });
+            if case != 2 { assert_eq!(terminal["detail"]["answer"], "PUBLIC_NATIVE_ANSWER"); }
+            if case == 1 {
+                assert!(!env.project.join("effect.txt").exists(), "denied native write took effect");
+                assert!(requests.lock().unwrap().iter().any(|request| request["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "function_call_output" && item["output"].as_str().is_some_and(|text| text.contains("tool permission"))))), "denial was not returned to the provider");
+            } else {
+                assert_eq!(std::fs::read(env.project.join("effect.txt")).unwrap(), b"PRIVATE_NATIVE_TOOL");
+            }
+            if case == 0 {
+                let before = requests.lock().unwrap().len();
+                let mut retry = env.command_for("responses");
+                retry.args(["--model", "fixture", "--config"]).arg(&config).env("KURU_NATIVE_STREAM_KEY", "fixture")
+                    .args(["--allow-write", "--resume", terminal["detail"]["session"].as_str().unwrap(), "run", "NATIVE_ARGV_PROMPT", "--turn-id", "native-stream", "--json"]);
+                let output = tokio::task::spawn_blocking(move || retry.output()).await.unwrap().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let replay: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(replay["text"], "PUBLIC_NATIVE_ANSWER");
+                assert!(replay.get("version").is_none());
+                assert_eq!(requests.lock().unwrap().len(), before, "completed retry contacted the provider");
+                assert_eq!(std::fs::read(env.project.join("effect.txt")).unwrap(), b"PRIVATE_NATIVE_TOOL");
+            }
+        }
+    }).await;
+}
+
 #[tokio::test]
 async fn cli_undo_dream_shows_one_notice_without_constructing_a_provider() {
     kuru_memory::test_support::closing(async {

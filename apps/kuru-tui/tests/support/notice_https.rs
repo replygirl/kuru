@@ -94,7 +94,8 @@ impl NoticeHttps {
                                     return;
                                 }
                                 let target = kuru_delivery::archive::host_target().unwrap();
-                                let manifest = format!("{}  kuru-999.0.0-{target}.tar.gz\n", "a".repeat(64));
+                                let extension = kuru_delivery::targets::find(target).unwrap().format.extension();
+                                let manifest = format!("{}  kuru-999.0.0-{target}.{extension}\n", "a".repeat(64));
                                 let (status, extra, body) = match path.as_str() {
                                     "/manifest" | "/signed?token=fixture" => (200, String::new(), manifest),
                                     "/redirect" => (302, format!("Location: {base}/signed?token=fixture\r\n"), String::new()),

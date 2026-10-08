@@ -4,8 +4,8 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use kuru_connectors::{Provider, ProviderEvent, ProviderReasoningSummary, ProviderSink};
 use kuru_core::{
-    Completion, CompletionRequest, Config, InvocationOutcome, InvocationStart, Mode, ModelInfo,
-    UsagePhase,
+    Completion, CompletionRequest, Config, ContentBlock, InvocationOutcome, InvocationStart,
+    Message, Mode, ModelInfo, UsagePhase,
 };
 use kuru_memory::{MemoryStore, StorageRecord};
 use sha2::{Digest, Sha256};
@@ -72,6 +72,62 @@ impl Provider for FailingAfterSummaryProvider {
 }
 
 struct SummaryFreeProvider;
+
+struct RepeatedSummaryProvider {
+    conflicting: bool,
+    speaking_only: bool,
+}
+
+#[async_trait]
+impl Provider for RepeatedSummaryProvider {
+    async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
+        if self.speaking_only && !request.instructions.contains("Phase: speak") {
+            return sink
+                .emit(ProviderEvent::Completed(Completion::from_legacy(
+                    "preparatory contribution",
+                    vec![],
+                    3,
+                    2,
+                )))
+                .await;
+        }
+        let summary = ProviderReasoningSummary {
+            item_id: Some("repeated-item".into()),
+            output_index: Some(0),
+            summary_index: 0,
+            text: "one settled private summary".into(),
+        };
+        sink.emit(ProviderEvent::SettledReasoningSummaries(vec![
+            summary.clone(),
+        ]))
+        .await?;
+        let repeated = ProviderReasoningSummary {
+            text: if self.conflicting {
+                "different private summary".into()
+            } else {
+                summary.text.clone()
+            },
+            ..summary
+        };
+        sink.emit(ProviderEvent::SettledReasoningSummaries(vec![repeated]))
+            .await?;
+        sink.emit(ProviderEvent::Completed(Completion::from_legacy(
+            "repeated summary answer",
+            vec![],
+            3,
+            2,
+        )))
+        .await
+    }
+
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, _request: CompletionRequest) -> Result<Completion> {
+        bail!("the repeated-sidecar fixture requires streaming")
+    }
+}
 
 #[async_trait]
 impl Provider for SummaryFreeProvider {
@@ -243,6 +299,143 @@ async fn exported_private_records(memory: &MemoryStore) -> Vec<(String, serde_js
             _ => None,
         })
         .collect()
+}
+
+#[tokio::test]
+async fn legacy_tool_receipt_flags_reach_provider_and_malformed_evidence_never_dispatches() {
+    kuru_memory::test_support::closing(async {
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(RequestRecordingProvider::default());
+        let (_project, mut harness) = harness(memory.clone(), provider.clone()).await;
+        let actor = harness.topology.parts[0].id.clone();
+        for (flag, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let mut receipt = serde_json::json!({"call_id":"legacy-read","output":{"message":"read outcome"}});
+            if let Some(flag) = flag {
+                receipt["is_error"] = serde_json::json!(flag);
+            }
+            harness.ask(&actor, vec![Message::text("tool", receipt.to_string())], "receipt compatibility", vec![])
+                .await.unwrap();
+            let requests = provider.requests();
+            let request = requests.last().unwrap();
+            let tool = request.messages.iter().rev().find(|message| message.role == "tool").unwrap();
+            assert!(matches!(&tool.blocks[..], [ContentBlock::ToolResult { call_id, output, is_error }]
+                if call_id == "legacy-read" && *is_error == expected && output["message"] == "read outcome"),
+                "legacy {flag:?} flag changed in the actual provider request: {tool:?}");
+        }
+        let calls = provider.requests().len();
+        for malformed in [
+            serde_json::json!({"call_id":"legacy-read","output":"denied","is_error":"true"}),
+            serde_json::json!({"call_id":"legacy-read","output":"denied","is_error":null}),
+            serde_json::json!({"call_id":"legacy-read","output":"denied","is_error":1}),
+            serde_json::json!({"call_id":"legacy-read"}),
+            serde_json::json!({"output":"denied"}),
+            serde_json::json!({"call_id":"","output":"denied"}),
+            serde_json::json!({"call_id":"x".repeat(257),"output":"denied"}),
+        ] {
+            assert!(harness.ask(&actor, vec![Message::text("tool", malformed.to_string())], "reject malformed receipt", vec![])
+                .await.is_err(), "malformed receipt accepted: {malformed}");
+            assert_eq!(provider.requests().len(), calls, "malformed receipt reached inference");
+        }
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }).await
+}
+
+#[tokio::test]
+async fn repeated_reasoning_sidecars_deduplicate_or_fail_without_private_persistence() {
+    kuru_memory::test_support::closing(async {
+        for (conflicting, speaking_only) in [(false, false), (true, false), (true, true)] {
+            let memory = MemoryStore::temporary().await.unwrap();
+            let (_project, mut harness) = harness(
+                memory.clone(),
+                Arc::new(RepeatedSummaryProvider {
+                    conflicting,
+                    speaking_only,
+                }),
+            )
+            .await;
+            let target = harness.topology.parts[0].id.clone();
+            let mut events = harness.subscribe();
+            let result = harness
+                .run_controlled(
+                    "repeat sidecar evidence",
+                    Some(&target),
+                    "repeated-sidecar-turn",
+                    &CancellationToken::new(),
+                )
+                .await;
+            let summaries = exported_private_records(&memory).await;
+            let history = harness.history().await.unwrap();
+            let usage = memory
+                .usage_ledger()
+                .unwrap()
+                .session(&harness.session.id)
+                .await
+                .unwrap();
+            if conflicting {
+                let error = result.unwrap_err();
+                let detail = format!("{error:#}");
+                let mut reported_conflict =
+                    detail.contains("conflicting settled reasoning summaries");
+                while let Ok(event) = events.try_recv() {
+                    if let crate::Event::Error { detail, .. } = event {
+                        reported_conflict |=
+                            detail.contains("conflicting settled reasoning summaries");
+                    }
+                }
+                assert!(
+                    reported_conflict,
+                    "conflict absent from returned error and observable events: {detail}"
+                );
+                assert!(summaries.is_empty());
+                assert!(!history.iter().any(|message| message.role == "assistant"));
+                assert!(usage.invocation_count > 0);
+                assert_eq!(usage.incomplete_invocations, usage.invocation_count);
+                if speaking_only {
+                    let invocation = speaking_invocation_id(
+                        &harness.session.id,
+                        "repeated-sidecar-turn",
+                        &target,
+                        1,
+                    );
+                    let ledger = memory.usage_ledger().unwrap();
+                    assert!(
+                        ledger
+                            .settle(&invocation, InvocationOutcome::Succeeded)
+                            .await
+                            .is_err(),
+                        "failed sidecar invocation had no durable failed outcome"
+                    );
+                    ledger
+                        .settle(&invocation, InvocationOutcome::Failed)
+                        .await
+                        .unwrap();
+                }
+            } else {
+                assert_eq!(result.unwrap().text, "repeated summary answer");
+                assert_eq!(
+                    summaries.len(),
+                    1,
+                    "identical sidecars duplicated persistence"
+                );
+                assert_eq!(summaries[0].1["text"], "one settled private summary");
+                assert_eq!(summaries[0].1["item_id"], "repeated-item");
+                assert!(
+                    history
+                        .iter()
+                        .any(|message| message.plain_text() == Some("repeated summary answer"))
+                );
+            }
+            assert!(history.iter().all(|message| {
+                message
+                    .plain_text()
+                    .is_none_or(|text| !text.contains("private summary"))
+            }));
+            harness.shutdown(false).await.unwrap();
+            memory.close().await.unwrap();
+        }
+    })
+    .await
 }
 
 #[tokio::test]

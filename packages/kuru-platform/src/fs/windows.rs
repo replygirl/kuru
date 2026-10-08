@@ -1825,6 +1825,33 @@ mod tests {
         let (phase, _) =
             replace_open_destination(&wrong_parent, &candidate, None, &destination).unwrap_err();
         assert_eq!(phase, PublicationPhase::Rejected);
+
+        let parent = open(
+            destination_dir.path(),
+            FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let filesystem_root = destination_dir.path().ancestors().last().unwrap();
+        for (name, expected) in [
+            (
+                filesystem_root.to_path_buf(),
+                "missing publication parent path",
+            ),
+            (
+                destination_dir.path().join("invalid\0name"),
+                "invalid native publication filename",
+            ),
+        ] {
+            let (phase, error) =
+                replace_open_destination(&parent, &candidate, None, &name).unwrap_err();
+            assert_eq!(phase, PublicationPhase::Rejected);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), expected);
+        }
         assert_eq!(
             std::fs::read(source_dir.path().join("candidate")).unwrap(),
             b"new"

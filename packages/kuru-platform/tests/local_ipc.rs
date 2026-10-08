@@ -9,6 +9,69 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
+#[test]
+fn private_socket_locators_refuse_malformed_routing_before_creating_a_directory() {
+    for locator in [
+        "",
+        "../outside",
+        "0123456789abcdef0123456",
+        "0123456789abcdef012345678",
+        "0123456789abcdef0123456G",
+        "ABCDEF0123456789abcdef01",
+    ] {
+        let error = local_ipc::prepare_short_directory(locator).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            local_ipc::open_short_directory(locator).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_accept_refuses_a_replaced_directory_and_drop_preserves_both_names() {
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("private");
+    let moved = root.path().join("displaced");
+    let listener = local_ipc::PrivateServiceListener::bind_at(
+        Directory::ensure_private(&original).unwrap(),
+        OsStr::new("generation.sock"),
+    )
+    .unwrap();
+    let error = {
+        let mut accepting = std::pin::pin!(listener.accept());
+        // Poll exactly once: the checked directory was admitted and the native
+        // listener has registered its wait before the namespace changes.
+        poll_fn(|cx| {
+            assert!(accepting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("generation.sock"), b"replacement sentinel").unwrap();
+        let _client = tokio::net::UnixStream::connect(moved.join("generation.sock"))
+            .await
+            .unwrap();
+        tokio::time::timeout(DEADLINE, accepting)
+            .await
+            .unwrap()
+            .unwrap_err()
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    drop(listener);
+    assert_eq!(
+        fs::read(original.join("generation.sock")).unwrap(),
+        b"replacement sentinel"
+    );
+    assert!(moved.join("generation.sock").exists());
+}
+
 #[tokio::test]
 async fn private_socket_accepts_successive_clients_and_cleans_only_its_name() {
     let root = tempfile::tempdir().unwrap();

@@ -679,6 +679,7 @@ fn direct_tools_keeps_stdout_json_and_reports_filtered_failed_stdio() {
         )]),
     )]))
     .unwrap();
+    let config = format!("dream_every = 0\ndream_on_exit = false\n{config}");
     let sandbox = Sandbox::new(&config);
     let output = sandbox.success(&["--trust-workspace-once", "tools"]);
     let tools: Value = serde_json::from_slice(&output.stdout).unwrap();

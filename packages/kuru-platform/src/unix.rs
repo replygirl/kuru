@@ -1347,7 +1347,10 @@ mod tests {
         use std::{future::Future, task::Context};
 
         let mut fixture = WakeFixture::new();
-        fixture.install(|completed| {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        fixture.release = Some(release);
+        fixture.install(move |completed| {
+            let _ = gate.recv();
             completed.send(()).unwrap();
             Ok(Vec::new())
         });
@@ -1361,6 +1364,8 @@ mod tests {
             .is_finished()
             && Instant::now() < limit
         {
+            // Observe the pending worker before allowing its completion.
+            drop(fixture.release.take());
             tokio::task::yield_now().await;
         }
         assert!(
@@ -2780,7 +2785,7 @@ mod tests {
         }
     }
 
-    fn finish_test_owner(owner: &mut OwnedProcessGroup) -> Result<(), String> {
+    pub(super) fn finish_test_owner(owner: &mut OwnedProcessGroup) -> Result<(), String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match owner.terminate_before_reap() {
@@ -2816,5 +2821,472 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+}
+
+#[cfg(test)]
+mod native_disarm_contracts {
+    use super::*;
+
+    const BOUND: Duration = Duration::from_secs(5);
+
+    pub(super) fn exited_root() -> OwnedProcessGroup {
+        // Native fixture has no descendants and inherits LLVM_PROFILE_FILE.
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        OwnedProcessGroup::spawn(
+            command,
+            StdioPlan::new(StdioSlot::Null, StdioSlot::Null, StdioSlot::Null),
+        )
+        .unwrap()
+    }
+
+    pub(super) fn consume_exact_wait(owner: &mut OwnedProcessGroup) {
+        let deadline = Instant::now() + BOUND;
+        loop {
+            // Test-only interference uses this owner's actual retained child.
+            // It never signals or reaps an unrelated numeric identity.
+            match waitid(
+                WaitId::Pid(owner.group),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG,
+            ) {
+                Ok(Some(_)) => return,
+                Ok(None) | Err(Errno::INTR) if Instant::now() < deadline => thread::yield_now(),
+                outcome => {
+                    let cleanup = tests::finish_test_owner(owner);
+                    panic!("fixture child did not yield its exact wait: {outcome:?}; {cleanup:?}");
+                }
+            }
+        }
+    }
+
+    pub(super) fn transition(owner: &mut OwnedProcessGroup) {
+        let deadline = Instant::now() + BOUND;
+        loop {
+            match owner.terminate_before_reap() {
+                Termination::Signalled(_) => return,
+                Termination::Interrupted if Instant::now() < deadline => thread::yield_now(),
+                outcome => {
+                    let cleanup = tests::finish_test_owner(owner);
+                    panic!("fixture transition failed: {outcome:?}; {cleanup:?}");
+                }
+            }
+        }
+    }
+
+    fn assert_permanently_disarmed(owner: &mut OwnedProcessGroup) {
+        let calls = owner.syscall_count();
+        assert!(matches!(
+            owner.root_state(),
+            RootState::Disarmed(DisarmReason::OwnershipLost)
+        ));
+        assert_eq!(
+            owner.terminate_before_reap(),
+            Termination::Disarmed(DisarmReason::OwnershipLost)
+        );
+        assert_eq!(
+            owner.pre_reap_step(Instant::now() + BOUND),
+            PreReap::Disarmed(DisarmReason::OwnershipLost)
+        );
+        assert!(matches!(
+            owner.reap_if_exited(),
+            Reap::Disarmed(DisarmReason::OwnershipLost)
+        ));
+        assert_eq!(owner.presence_after_reap(), GroupPresence::InvalidPhase);
+        assert_eq!(
+            owner.syscall_count(),
+            calls,
+            "disarm must stop native calls"
+        );
+        assert!(
+            matches!(
+                waitid(
+                    WaitId::Pid(owner.group),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                ),
+                Err(Errno::CHILD)
+            ),
+            "fixture child must already be reaped without claiming cleanup success"
+        );
+    }
+
+    #[test]
+    fn native_consumed_wait_disarms_an_anchored_owner_without_signalling() {
+        let mut owner = exited_root();
+        consume_exact_wait(&mut owner);
+        let calls = owner.syscall_count();
+        assert_eq!(
+            owner.terminate_before_reap(),
+            Termination::Disarmed(DisarmReason::OwnershipLost)
+        );
+        assert_eq!(owner.syscall_count(), calls + 1, "observation only");
+        assert_permanently_disarmed(&mut owner);
+    }
+
+    #[test]
+    fn native_consumed_wait_disarms_pre_reap_instead_of_starting_a_snapshot() {
+        let mut owner = exited_root();
+        transition(&mut owner);
+        consume_exact_wait(&mut owner);
+        assert_eq!(
+            owner.pre_reap_step(Instant::now() + BOUND),
+            PreReap::Disarmed(DisarmReason::OwnershipLost)
+        );
+        assert!(owner.membership.is_none());
+        assert_eq!(owner.membership_jobs, 0, "no snapshot child was launched");
+        assert_permanently_disarmed(&mut owner);
+    }
+
+    #[test]
+    fn native_consumed_observed_exit_disarms_the_exact_child_reap() {
+        let mut owner = exited_root();
+        let deadline = Instant::now() + BOUND;
+        loop {
+            match owner.root_state() {
+                RootState::Exited => break,
+                RootState::Running | RootState::Interrupted if Instant::now() < deadline => {
+                    thread::yield_now();
+                }
+                outcome => {
+                    let cleanup = tests::finish_test_owner(&mut owner);
+                    panic!("fixture exit was not observed: {outcome:?}; {cleanup:?}");
+                }
+            }
+        }
+        transition(&mut owner);
+        consume_exact_wait(&mut owner);
+        let calls = owner.syscall_count();
+        assert!(matches!(
+            owner.reap_if_exited(),
+            Reap::Disarmed(DisarmReason::OwnershipLost)
+        ));
+        assert_eq!(owner.syscall_count(), calls + 1, "exact child wait only");
+        assert_permanently_disarmed(&mut owner);
+    }
+}
+
+#[cfg(test)]
+mod native_failure_contracts {
+    use super::*;
+
+    const BOUND: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn fresh_root_and_reap_observations_disarm_after_native_wait_loss() {
+        let mut owner = native_disarm_contracts::exited_root();
+        assert_eq!(
+            owner.pre_reap_step(Instant::now() + BOUND),
+            PreReap::InvalidPhase
+        );
+        assert_eq!(
+            owner.resignal_before_reap(Instant::now() + BOUND),
+            PreReap::InvalidPhase
+        );
+        native_disarm_contracts::consume_exact_wait(&mut owner);
+        assert!(matches!(
+            owner.root_state(),
+            RootState::Disarmed(DisarmReason::OwnershipLost)
+        ));
+        assert_eq!(
+            owner.resignal_before_reap(Instant::now() + BOUND),
+            PreReap::InvalidPhase
+        );
+        let calls = owner.syscall_count();
+        assert!(tests::finish_test_owner(&mut owner).is_err());
+        assert_eq!(
+            owner.syscall_count(),
+            calls,
+            "cleanup cannot regain wait ownership"
+        );
+
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut running = OwnedProcessGroup::spawn(
+            command,
+            StdioPlan::new(StdioSlot::Null, StdioSlot::Null, StdioSlot::Null),
+        )
+        .unwrap();
+        assert!(matches!(running.root_state(), RootState::Running));
+        native_disarm_contracts::transition(&mut running);
+        assert!(
+            !running.observed_exit,
+            "exit must require a fresh observation"
+        );
+        native_disarm_contracts::consume_exact_wait(&mut running);
+        assert!(matches!(
+            running.reap_if_exited(),
+            Reap::Disarmed(DisarmReason::OwnershipLost)
+        ));
+        assert!(tests::finish_test_owner(&mut running).is_err());
+        assert_eq!(running.presence_after_reap(), GroupPresence::InvalidPhase);
+    }
+
+    #[tokio::test]
+    async fn completed_snapshot_faults_are_unobserved_and_never_cleanup_readiness() {
+        for panic in [false, true] {
+            let mut owner = native_disarm_contracts::exited_root();
+            let limit = Instant::now() + BOUND;
+            let observed = (|| -> Result<(), String> {
+                while !matches!(owner.root_state(), RootState::Exited) {
+                    if Instant::now() >= limit {
+                        return Err("fixture exit not observed".into());
+                    }
+                    thread::yield_now();
+                }
+                Ok(())
+            })();
+            if let Err(error) = observed {
+                let cleanup = tests::finish_test_owner(&mut owner);
+                panic!("{error}; {cleanup:?}");
+            }
+            native_disarm_contracts::transition(&mut owner);
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            let mut release = Some(release);
+            let worker = thread::spawn(move || -> io::Result<Vec<snapshot::GroupMember>> {
+                let _ = gate.recv();
+                assert!(!panic, "controlled read-only snapshot worker failure");
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "controlled listing denial",
+                ))
+            });
+            while !worker.is_finished() && Instant::now() < limit {
+                // The worker cannot finish before this first pending probe.
+                // Closing its private gate causes completion without a delay.
+                drop(release.take());
+                thread::yield_now();
+            }
+            drop(release);
+            owner.membership = Some(MembershipJob {
+                worker,
+                completion: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                deadline: limit,
+            });
+            owner.wait_pre_reap(Duration::ZERO, limit).await;
+            owner.wait_pre_reap(Duration::from_millis(1), limit).await;
+            let outcome = owner.pre_reap_step(limit);
+            let retained = matches!(owner.phase, Phase::PostSignal);
+            let consumed = owner.membership.is_none();
+            let cleanup = tests::finish_test_owner(&mut owner);
+            cleanup.unwrap();
+            assert_eq!(
+                outcome,
+                PreReap::Unobserved(if panic {
+                    io::ErrorKind::Other
+                } else {
+                    io::ErrorKind::PermissionDenied
+                })
+            );
+            assert!(retained, "failed listing must not reap the actual root");
+            assert!(
+                consumed,
+                "completed failure must not be mistaken for a pending worker"
+            );
+        }
+    }
+
+    #[test]
+    fn native_wait_loss_cancels_a_pending_snapshot_and_never_repeats_a_signal() {
+        let mut owner = native_disarm_contracts::exited_root();
+        native_disarm_contracts::transition(&mut owner);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let (entered, entry) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let worker = thread::spawn(move || {
+            entered.send(()).unwrap();
+            let _ = gate.recv();
+            Ok(Vec::new())
+        });
+        entry.recv_timeout(BOUND).unwrap();
+        owner.membership = Some(MembershipJob {
+            worker,
+            completion: None,
+            cancelled: flag,
+            deadline: Instant::now() + BOUND,
+        });
+        native_disarm_contracts::consume_exact_wait(&mut owner);
+        assert_eq!(
+            owner.resignal_before_reap(Instant::now() + BOUND),
+            PreReap::Disarmed(DisarmReason::OwnershipLost)
+        );
+        let calls = owner.syscall_count();
+        let outcome = owner.pre_reap_step(Instant::now() + BOUND);
+        let was_pending = owner
+            .membership
+            .as_ref()
+            .is_some_and(|job| !job.worker.is_finished());
+        let was_cancelled = cancelled.load(Ordering::Acquire);
+        let mut release = Some(release);
+        let limit = Instant::now() + BOUND;
+        while owner
+            .membership
+            .as_ref()
+            .is_some_and(|job| !job.worker.is_finished())
+            && Instant::now() < limit
+        {
+            // The observed pending worker owns its gate until this poll.
+            drop(release.take());
+            thread::yield_now();
+        }
+        drop(release);
+        let finished = owner.pre_reap_step(limit);
+        assert_eq!(outcome, PreReap::Disarmed(DisarmReason::OwnershipLost));
+        assert!(was_pending && was_cancelled);
+        assert_eq!(finished, PreReap::Disarmed(DisarmReason::OwnershipLost));
+        assert!(
+            owner.membership.is_none(),
+            "completed cancelled worker must be joined"
+        );
+        assert_eq!(
+            owner.syscall_count(),
+            calls,
+            "disarm prevents all further native calls"
+        );
+    }
+}
+
+#[cfg(test)]
+mod observation_failure_contracts {
+    use super::*;
+
+    #[test]
+    fn unobservable_native_outcomes_never_claim_absence_or_completed_termination() {
+        let kind = Errno::IO.kind();
+        assert_eq!(signal(Err(Errno::IO)), SignalOutcome::Failed(kind));
+        assert_eq!(
+            presence(Err(Errno::IO)),
+            GroupPresence::ObservationError(kind)
+        );
+        for group in [0, 1, u32::MAX] {
+            assert_eq!(
+                group_presence_after_reap(group),
+                GroupPresence::ObservationError(io::ErrorKind::InvalidInput)
+            );
+            let observed = observe_group_after_reap(group);
+            assert!(!observed.none_of_ours());
+            assert!(observed.to_string().contains("invalid process group"));
+        }
+        let denied = classify_group(Ok(()), 40, &own_uids(), || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "controlled native snapshot refusal",
+            ))
+        });
+        assert!(!denied.none_of_ours());
+        assert_eq!(
+            denied.to_string(),
+            "survivors (listing unavailable: controlled native snapshot refusal)"
+        );
+    }
+
+    #[test]
+    fn read_only_numeric_presence_observes_a_physically_settled_owned_group() {
+        let mut owner = native_disarm_contracts::exited_root();
+        let group = owner.group.as_raw_nonzero().get().unsigned_abs();
+        tests::finish_test_owner(&mut owner).unwrap();
+        assert_eq!(group_presence_after_reap(group), GroupPresence::Absent);
+        assert_eq!(observe_group_after_reap(group).to_string(), "absent");
+        assert!(matches!(owner.root_state(), RootState::Reaped(_)));
+        assert_eq!(owner.terminate_before_reap(), Termination::InvalidPhase);
+    }
+}
+
+#[cfg(test)]
+mod retained_worker_contracts {
+    use super::*;
+
+    #[tokio::test]
+    async fn actual_root_reap_retains_cancelled_worker_without_regaining_signal_authority() {
+        let mut owner = native_disarm_contracts::exited_root();
+        native_disarm_contracts::transition(&mut owner);
+        let limit = Instant::now() + tests::TEST_BOUND;
+        let calls = owner.syscall_count();
+        let poll = Duration::from_millis(2);
+        let started = Instant::now();
+        owner.wait_pre_reap(poll, limit).await;
+        let elapsed = Instant::now().duration_since(started);
+        let no_worker = owner.membership.is_none();
+        let no_worker_calls = owner.syscall_count();
+        let expired = owner.resignal_before_reap(Instant::now());
+        let expired_calls = owner.syscall_count();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (release, gate) = std::sync::mpsc::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        owner.membership = Some(MembershipJob {
+            worker: thread::spawn(move || {
+                let _ = gate.recv();
+                let _ = completed.send(());
+                Ok(Vec::new())
+            }),
+            completion: Some(completion),
+            cancelled: Arc::clone(&cancelled),
+            deadline: limit,
+        });
+        owner.wait_pre_reap(poll, limit).await;
+        let wake_retained = owner
+            .membership
+            .as_ref()
+            .is_some_and(|job| job.completion.is_some());
+        let waiting_calls = owner.syscall_count();
+        loop {
+            match owner.reap_if_exited() {
+                Reap::Reaped(_) => break,
+                Reap::NotExited | Reap::Interrupted if Instant::now() < limit => {
+                    tokio::task::yield_now().await;
+                }
+                outcome => {
+                    drop(release);
+                    let cleanup = tests::finish_test_owner(&mut owner);
+                    panic!("native root reap failed: {outcome:?}; {cleanup:?}");
+                }
+            }
+        }
+        let reaped_calls = owner.syscall_count();
+        let pending = owner.pre_reap_step(limit);
+        let retained = owner.membership.is_some();
+        let was_cancelled = cancelled.load(Ordering::Acquire);
+        let cached_root = owner.root_state();
+        let repeated_reap = owner.reap_if_exited();
+        let termination = owner.terminate_before_reap();
+        let still_calls = owner.syscall_count();
+        release.send(()).unwrap();
+        owner.wait_pre_reap(tests::TEST_BOUND, limit).await;
+        let completed_state = owner.pre_reap_step(limit);
+        let joined = owner.membership.is_none();
+        let completed_calls = owner.syscall_count();
+        tests::finish_test_owner(&mut owner).unwrap();
+        assert!(elapsed >= poll);
+        assert!(no_worker);
+        assert_eq!(no_worker_calls, calls);
+        assert_eq!(expired, PreReap::Expired);
+        assert_eq!(expired_calls, calls, "expiry must not observe or signal");
+        assert!(
+            wake_retained,
+            "poll expiry must retain the completion receiver"
+        );
+        assert_eq!(
+            waiting_calls, calls,
+            "waiting must not perform native observations"
+        );
+        assert_eq!(pending, PreReap::Pending);
+        assert!(
+            retained && was_cancelled,
+            "reap must cancel and retain unfinished work"
+        );
+        assert!(matches!(cached_root, RootState::Reaped(_)));
+        assert!(matches!(repeated_reap, Reap::Reaped(_)));
+        assert_eq!(termination, Termination::InvalidPhase);
+        assert_eq!(
+            still_calls, reaped_calls,
+            "cached states cannot regain syscall authority"
+        );
+        assert_eq!(completed_state, PreReap::Reaped);
+        assert!(joined, "completed cancelled worker must be joined");
+        assert_eq!(
+            completed_calls, reaped_calls,
+            "late membership cannot signal or reap again"
+        );
     }
 }

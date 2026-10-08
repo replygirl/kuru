@@ -513,3 +513,102 @@ fn concurrent_owned_children_each_reach_their_own_end_of_file() {
         }
     }
 }
+
+#[test]
+fn emergency_drop_signals_the_unreaped_root_before_an_owned_input_can_close() {
+    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, waitid};
+
+    let root = tempfile::tempdir().unwrap();
+    let identity = root.path().join("root-id");
+    let readiness = root.path().join("root-ready");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf '%s\\n' \"$$\" > \"$1\"; printf ready > \"$2\"; exec /bin/cat",
+            "kuru-emergency-drop",
+        ])
+        .arg(&identity)
+        .arg(&readiness)
+        .current_dir(root.path());
+    // LLVM_PROFILE_FILE remains inherited, just as in the existing fixtures.
+    let mut owner = OwnedProcessGroup::spawn(
+        command,
+        StdioPlan::new(StdioSlot::Pipe, StdioSlot::Pipe, StdioSlot::Null),
+    )
+    .unwrap();
+    let input = owner.take_stdin();
+    let output = owner.take_stdout();
+    let identified = (|| -> Result<Pid, String> {
+        input
+            .as_ref()
+            .map_err(|error| format!("retain root input: {error}"))?;
+        ready(&readiness)?;
+        let marker = fs::read_to_string(&identity)
+            .map_err(|error| format!("read root identity: {error}"))?;
+        let id = marker
+            .strip_suffix('\n')
+            .ok_or("incomplete root identity")?
+            .parse::<i32>()
+            .map_err(|error| format!("invalid root identity: {error}"))?;
+        Pid::from_raw(id).ok_or_else(|| "invalid native root identity".to_owned())
+    })();
+    let pid = match identified {
+        Ok(pid) => pid,
+        Err(error) => {
+            drop(input);
+            let cleanup = settle(&mut owner);
+            let eof = end_of_file_within(output, LIMIT);
+            panic!("root fixture admission failed: {error}; cleanup={cleanup:?}; eof={eof:?}");
+        }
+    };
+    // Only this test can consume this actual direct child's wait identity.
+    // Retain its input across Drop: a normal cat EOF cannot explain its exit.
+    drop(owner);
+    let wait_exact = |consume: bool| -> io::Result<WaitIdStatus> {
+        let deadline = Instant::now() + LIMIT;
+        let options = WaitIdOptions::EXITED
+            | WaitIdOptions::NOHANG
+            | if consume {
+                WaitIdOptions::empty()
+            } else {
+                WaitIdOptions::NOWAIT
+            };
+        loop {
+            match waitid(WaitId::Pid(pid), options) {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) | Err(rustix::io::Errno::INTR) if Instant::now() < deadline => {
+                    thread::yield_now()
+                }
+                Ok(None) | Err(rustix::io::Errno::INTR) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "exact root wait did not complete",
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    let observed = wait_exact(false);
+    // This caller-owned pipe is a natural EOF fallback even if Drop regresses.
+    // An unexpected wait error grants no further numeric process authority.
+    drop(input);
+    let reaped = if observed.is_ok()
+        || observed
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
+    {
+        wait_exact(true)
+    } else {
+        Err(io::Error::other("exact root wait authority was lost"))
+    };
+    let eof = end_of_file_within(output, LIMIT);
+    let status = reaped.unwrap();
+    eof.unwrap();
+    assert_eq!(
+        observed.unwrap().terminating_signal(),
+        Some(Signal::KILL.as_raw())
+    );
+    assert_eq!(status.terminating_signal(), Some(Signal::KILL.as_raw()));
+}

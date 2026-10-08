@@ -60,7 +60,7 @@ and RustSec advisories. The final CI gate requires both quality and every native
 verification category to succeed. Local reproduction and task ownership are
 documented in [development](development.md).
 
-Ubuntu x86-64 and macOS arm64 run instrumented native behavior with the 90%
+Ubuntu x86-64 and macOS arm64 run instrumented native behavior with the 95%
 workspace line-coverage gate. ARM Linux and Intel macOS have additional native
 build, real-memory, packaging, and packaged offline-runtime checks. Windows
 runs four parallel coverage shards: delivery/archive, application, memory/runtime,
@@ -68,7 +68,7 @@ and connectors/core/platform. Its aggregate requires every shard job to have
 succeeded and a checked result for all four shards, taking each shard's latest
 uploaded (successful) attempt within the workflow run. It refuses a missing
 shard, a later or malformed attempt, or any source, tree, toolchain or
-inventory difference between them, and enforces the same 90% workspace
+inventory difference between them, and enforces the same 95% workspace
 threshold. A shard's test executables stop at a deadline inside its job limit;
 a stalled one is terminated with its owned process tree and the shard fails
 with a diagnostics artifact naming the unfinished tests.
@@ -148,7 +148,8 @@ failed runs are not counted as acceptance of the final implementation.
 
 The complete package-owned mise gate passes **209 Rust tests** and **97.51%
 line coverage** (8554/8772), including the CLI and native delivery tooling.
-The 90% threshold remains unchanged. Rust replaces every Python installer,
+That run used the then-current 90% threshold; the current minimum is 95%.
+Rust replaces every Python installer,
 validator and PTY/protocol fixture; Node/npm stays local to the VitePress app.
 The source installer built and executed kuru 0.1.0 from an isolated destination,
 and the installed demo provider completed an offline conversation.
@@ -315,7 +316,7 @@ Validated locally on macOS arm64 on 2026-09-09 with the versions recorded in
 - Whole-workspace LLVM line coverage: **97.66%** (4999/5119). No application
   modules are excluded. A separate cross-check omitting trailing `cfg(test)`
   modules and the test-support file measured **97.25%** (3469/3567) for production
-  code. The enforced standard LLVM threshold is 90%.
+  code. That baseline enforced a 90% LLVM threshold; the current minimum is 95%.
 - Real subprocess/HTTP fixtures cover Codex JSON-RPC, Responses native function
   replay, MCP stdio/Streamable HTTP, and A2A 1.0. These are deterministic protocol
   tests, not a claim that every external server/provider has been exercised.

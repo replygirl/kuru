@@ -32,8 +32,18 @@ pub fn composer_frame_ready(screen: &vt100::Screen, draft: &str) -> bool {
         .rows(0, screen.size().1)
         .enumerate()
         .any(|(row, line)| {
-            line.find(draft).is_some_and(|byte| {
-                let col: usize = line[..byte + draft.len()]
+            let end = if draft.is_empty() {
+                [
+                    "What shall we explore or build?",
+                    "Keep your next thought here…",
+                ]
+                .into_iter()
+                .find_map(|placeholder| line.find(placeholder))
+            } else {
+                line.find(draft).map(|byte| byte + draft.len())
+            };
+            end.is_some_and(|end| {
+                let col: usize = line[..end]
                     .chars()
                     .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
                     .sum();
@@ -353,6 +363,17 @@ impl Terminal {
             &format!("screen contains {values:?}"),
             timeout,
             |terminal| values.iter().all(|value| terminal.screen().contains(value)),
+        )
+    }
+
+    pub fn frame_text(&mut self, values: &[&str], timeout: Duration) -> Result<()> {
+        self.wait(
+            &format!("completed visible frame contains {values:?}"),
+            timeout,
+            |terminal| {
+                composer_frame_ready(terminal.parser.screen(), "")
+                    && values.iter().all(|value| terminal.screen().contains(value))
+            },
         )
     }
 

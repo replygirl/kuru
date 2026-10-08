@@ -536,6 +536,203 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct FaultBackend {
+        inner: SyntheticBackend,
+        reads: Mutex<std::collections::VecDeque<Result<Vec<u8>, NativeSecretErrorKind>>>,
+        write_error: Option<NativeSecretErrorKind>,
+        delete_error: Option<NativeSecretErrorKind>,
+        retain_deleted: bool,
+    }
+
+    impl Backend for FaultBackend {
+        fn get(&self, account: &NativeSecretAccount) -> Result<Vec<u8>, NativeSecretError> {
+            match self.reads.lock().unwrap().pop_front() {
+                Some(value) => value.map_err(NativeSecretError::new),
+                None => self.inner.get(account),
+            }
+        }
+
+        fn set(
+            &self,
+            account: &NativeSecretAccount,
+            bytes: &[u8],
+        ) -> Result<(), NativeSecretError> {
+            if let Some(kind) = self.write_error {
+                return Err(NativeSecretError::new(kind));
+            }
+            self.inner.set(account, bytes)
+        }
+
+        fn delete(&self, account: &NativeSecretAccount) -> Result<(), NativeSecretError> {
+            if let Some(kind) = self.delete_error {
+                return Err(NativeSecretError::new(kind));
+            }
+            if self.retain_deleted {
+                Ok(())
+            } else {
+                self.inner.delete(account)
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_secret_backend_outcomes_never_claim_verified_write_or_deletion() {
+        let account = NativeSecretAccount::from_digest([1; 32]);
+        let adjacent = NativeSecretAccount::from_digest([2; 32]);
+        let original = record(1, b"original-fake-secret");
+        let replacement = record(2, b"replacement-fake-secret");
+        let sentinel = record(3, b"adjacent-fake-secret");
+        for kind in [
+            NativeSecretErrorKind::Denied,
+            NativeSecretErrorKind::Unavailable,
+            NativeSecretErrorKind::Corrupt,
+        ] {
+            let backend = FaultBackend::default();
+            backend
+                .inner
+                .set(&adjacent, &encode(&sentinel).unwrap())
+                .unwrap();
+            backend.reads.lock().unwrap().push_back(Err(kind));
+            let store = Store::new(backend);
+            let error = store.create(&account, &original).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(!error.to_string().contains("fake-secret"));
+            assert_eq!(store.get(&adjacent).unwrap(), sentinel);
+            assert_eq!(
+                store.get(&account).unwrap_err().kind(),
+                NativeSecretErrorKind::NotFound
+            );
+        }
+        let backend = FaultBackend {
+            write_error: Some(NativeSecretErrorKind::Denied),
+            ..Default::default()
+        };
+        backend
+            .inner
+            .set(&account, &encode(&original).unwrap())
+            .unwrap();
+        let store = Store::new(backend);
+        assert_eq!(
+            store
+                .replace(&account, generation(1), &replacement)
+                .unwrap_err()
+                .kind(),
+            NativeSecretErrorKind::Denied
+        );
+        assert_eq!(store.get(&account).unwrap(), original);
+        // A native write returning success can still have an uncertain result.
+        // Its readback must match the complete generation and secret envelope.
+        let backend = FaultBackend::default();
+        backend.reads.lock().unwrap().extend([
+            Err(NativeSecretErrorKind::NotFound),
+            Ok(encode(&replacement).unwrap()),
+        ]);
+        let store = Store::new(backend);
+        assert_eq!(
+            store.create(&account, &original).unwrap_err().kind(),
+            NativeSecretErrorKind::Corrupt
+        );
+        assert_eq!(store.get(&account).unwrap(), original);
+        for (retained, failure) in [
+            (true, None),
+            (false, Some(NativeSecretErrorKind::Unavailable)),
+        ] {
+            let backend = FaultBackend {
+                retain_deleted: retained,
+                ..Default::default()
+            };
+            backend
+                .inner
+                .set(&account, &encode(&original).unwrap())
+                .unwrap();
+            backend
+                .inner
+                .set(&adjacent, &encode(&sentinel).unwrap())
+                .unwrap();
+            if let Some(kind) = failure {
+                backend
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .extend([Ok(encode(&original).unwrap()), Err(kind)]);
+            }
+            let store = Store::new(backend);
+            assert_eq!(
+                store.delete(&account, generation(1)).unwrap_err().kind(),
+                failure.unwrap_or(NativeSecretErrorKind::Stale)
+            );
+            assert_eq!(store.get(&adjacent).unwrap(), sentinel);
+            if retained {
+                assert_eq!(store.get(&account).unwrap(), original);
+            }
+        }
+        let backend = FaultBackend {
+            delete_error: Some(NativeSecretErrorKind::Denied),
+            ..Default::default()
+        };
+        backend
+            .inner
+            .set(&account, &encode(&original).unwrap())
+            .unwrap();
+        let store = Store::new(backend);
+        assert_eq!(
+            store.delete(&account, generation(1)).unwrap_err().kind(),
+            NativeSecretErrorKind::Denied
+        );
+        assert_eq!(store.get(&account).unwrap(), original);
+    }
+
+    #[test]
+    fn native_secret_errors_are_typed_and_do_not_disclose_backend_payloads() {
+        use keyring::Error;
+        let cases = [
+            (Error::NoEntry, NativeSecretErrorKind::NotFound),
+            (
+                Error::NoStorageAccess(Box::new(std::io::Error::other("fake-sensitive-data"))),
+                NativeSecretErrorKind::Denied,
+            ),
+            (Error::NoDefaultStore, NativeSecretErrorKind::Unavailable),
+            (
+                Error::NotSupportedByStore("fake-sensitive-data".into()),
+                NativeSecretErrorKind::Unavailable,
+            ),
+            (
+                Error::BadEncoding(b"fake-sensitive-data".to_vec()),
+                NativeSecretErrorKind::Corrupt,
+            ),
+            (
+                Error::BadDataFormat(
+                    b"fake-sensitive-data".to_vec(),
+                    Box::new(std::io::Error::other("private account")),
+                ),
+                NativeSecretErrorKind::Corrupt,
+            ),
+            (
+                Error::BadStoreFormat("fake-sensitive-data".into()),
+                NativeSecretErrorKind::Corrupt,
+            ),
+            (Error::Ambiguous(Vec::new()), NativeSecretErrorKind::Corrupt),
+            (
+                Error::PlatformFailure(Box::new(std::io::Error::other("fake-sensitive-data"))),
+                NativeSecretErrorKind::Unavailable,
+            ),
+            (
+                Error::Invalid("fake-sensitive-data".into(), "private account".into()),
+                NativeSecretErrorKind::Denied,
+            ),
+            (
+                Error::TooLong("fake-sensitive-data".into(), 1),
+                NativeSecretErrorKind::Denied,
+            ),
+        ];
+        for (backend, kind) in cases {
+            let error = map_keyring_error(backend);
+            assert_eq!(error.kind(), kind);
+            assert!(!format!("{error:?} {error}").contains("fake-sensitive-data"));
+        }
+    }
+
     #[test]
     fn native_store_reopens_replaces_deletes_and_isolates_adjacent_records() {
         let account = unique_account(1);
@@ -558,7 +755,7 @@ mod tests {
         let other = record(4, b"native-recognizable-secret-adjacent");
         store.create(&account, &first).unwrap();
         store.create(&adjacent, &other).unwrap();
-        assert_eq!(NativeSecretStore::new().get(&account).unwrap(), first);
+        assert_eq!(NativeSecretStore::default().get(&account).unwrap(), first);
         assert_eq!(
             store
                 .create(&account, &record(5, b"stale"))
@@ -583,5 +780,172 @@ mod tests {
             store.get(&account).unwrap_err().kind(),
             NativeSecretErrorKind::NotFound
         );
+    }
+
+    mod record_admission_contracts {
+        use super::*;
+
+        #[test]
+        fn structured_diagnostics_and_error_sources_never_expose_secret_material() {
+            let account = NativeSecretAccount::from_digest([11; 32]);
+            let adjacent = NativeSecretAccount::from_digest([12; 32]);
+            let payload = b"fake-diagnostic-secret\n{\"token\":\"private\"}";
+            let original = record(13, payload);
+            let sentinel = record(14, b"fake-adjacent-diagnostic-record");
+            let backend = FaultBackend::default();
+            backend
+                .inner
+                .set(&account, &encode(&original).unwrap())
+                .unwrap();
+            backend
+                .inner
+                .set(&adjacent, &encode(&sentinel).unwrap())
+                .unwrap();
+            let store = Store::new(backend);
+            let diagnostic = format!("{:#?}", store.get(&account).unwrap());
+            assert_eq!(store.get(&account).unwrap().secret(), payload);
+            assert!(diagnostic.contains("[redacted]"));
+            assert!(diagnostic.contains("[opaque]"));
+            assert!(!diagnostic.contains("fake-diagnostic-secret"));
+            assert!(!diagnostic.contains(account.as_str()));
+            for kind in [
+                NativeSecretErrorKind::NotFound,
+                NativeSecretErrorKind::Stale,
+                NativeSecretErrorKind::Denied,
+                NativeSecretErrorKind::Unavailable,
+                NativeSecretErrorKind::Corrupt,
+            ] {
+                store.backend.reads.lock().unwrap().push_back(Err(kind));
+                let error = store.get(&account).unwrap_err();
+                assert_eq!(error.kind(), kind);
+                assert!(std::error::Error::source(&error).is_none());
+                let diagnostic = format!("{error} {error:#?}");
+                assert!(!diagnostic.contains("fake-diagnostic-secret"));
+                assert!(!diagnostic.contains(account.as_str()));
+                assert_eq!(store.get(&account).unwrap(), original);
+                assert_eq!(store.get(&adjacent).unwrap(), sentinel);
+            }
+            assert_eq!(store.backend.inner.records.lock().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn literal_accounts_admit_only_exact_lowercase_digest_bytes() {
+            let backend = SyntheticBackend::default();
+            let store = Store::new(backend.clone());
+            let literal = "a".repeat(ACCOUNT_HEX_BYTES);
+            let admitted = NativeSecretAccount::new(literal.clone()).unwrap();
+            assert_eq!(admitted.as_str(), literal);
+            let original = record(1, b"fake-account-sentinel");
+            store.create(&admitted, &original).unwrap();
+            for invalid in [
+                "A".repeat(ACCOUNT_HEX_BYTES),
+                "g".repeat(ACCOUNT_HEX_BYTES),
+                "\0".repeat(ACCOUNT_HEX_BYTES),
+                "é".repeat(ACCOUNT_HEX_BYTES / 2),
+            ] {
+                assert_eq!(invalid.len(), ACCOUNT_HEX_BYTES);
+                let error = NativeSecretAccount::new(invalid).unwrap_err();
+                assert_eq!(error.kind(), NativeSecretErrorKind::Corrupt);
+                assert_eq!(store.get(&admitted).unwrap(), original);
+                assert_eq!(backend.records.lock().unwrap().len(), 1);
+            }
+            store.delete(&admitted, original.generation()).unwrap();
+            assert!(backend.records.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn corrupt_native_envelopes_remain_intact_across_every_mutating_admission() {
+            let account = NativeSecretAccount::from_digest([1; 32]);
+            let adjacent = NativeSecretAccount::from_digest([2; 32]);
+            let original = record(3, b"recognizable-fake-envelope-payload");
+            let replacement = record(4, b"fake-replacement");
+            let sentinel = record(5, b"fake-adjacent-record");
+            let encoded = encode(&original).unwrap();
+            for fault in 0..7 {
+                let mut corrupt = encoded.clone();
+                match fault {
+                    0 => corrupt[0] ^= 0x80,
+                    1 => corrupt[MAGIC.len()..MAGIC.len() + 16].fill(0),
+                    2 => corrupt[MAGIC.len() + 16..ENVELOPE_BYTES].fill(0),
+                    3 => corrupt[MAGIC.len() + 16..ENVELOPE_BYTES]
+                        .copy_from_slice(&((MAX_NATIVE_SECRET_BYTES + 1) as u32).to_be_bytes()),
+                    4 => {
+                        corrupt.pop();
+                    }
+                    5 => corrupt.push(0),
+                    _ => corrupt.truncate(ENVELOPE_BYTES - 1),
+                }
+                let backend = SyntheticBackend::default();
+                backend.set(&account, &corrupt).unwrap();
+                let store = Store::new(backend.clone());
+                store.create(&adjacent, &sentinel).unwrap();
+                for error in [
+                    store.get(&account).unwrap_err(),
+                    store
+                        .replace(&account, original.generation(), &replacement)
+                        .unwrap_err(),
+                    store.delete(&account, original.generation()).unwrap_err(),
+                ] {
+                    assert_eq!(
+                        error.kind(),
+                        NativeSecretErrorKind::Corrupt,
+                        "fault {fault}"
+                    );
+                    let diagnostic = format!("{error} {error:?}");
+                    assert!(!diagnostic.contains("recognizable-fake-envelope-payload"));
+                    assert!(!diagnostic.contains(account.as_str()));
+                }
+                assert_eq!(
+                    store.create(&account, &replacement).unwrap_err().kind(),
+                    NativeSecretErrorKind::Stale,
+                );
+                assert_eq!(backend.get(&account).unwrap(), corrupt);
+                assert_eq!(store.get(&adjacent).unwrap(), sentinel);
+                assert_eq!(backend.records.lock().unwrap().len(), 2);
+            }
+        }
+
+        #[test]
+        fn accepted_writes_with_failed_readback_preserve_uncertain_effects() {
+            let account = NativeSecretAccount::from_digest([1; 32]);
+            let adjacent = NativeSecretAccount::from_digest([2; 32]);
+            let original = record(1, b"fake-accepted-create");
+            let replacement = record(2, b"fake-accepted-replacement");
+            let sentinel = record(3, b"fake-adjacent-sentinel");
+            for kind in [
+                NativeSecretErrorKind::Denied,
+                NativeSecretErrorKind::Unavailable,
+            ] {
+                let backend = FaultBackend::default();
+                backend
+                    .inner
+                    .set(&adjacent, &encode(&sentinel).unwrap())
+                    .unwrap();
+                backend
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .extend([Err(NativeSecretErrorKind::NotFound), Err(kind)]);
+                let store = Store::new(backend);
+                assert_eq!(store.create(&account, &original).unwrap_err().kind(), kind);
+                assert_eq!(store.get(&account).unwrap(), original);
+                store
+                    .backend
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .extend([Ok(encode(&original).unwrap()), Err(kind)]);
+                assert_eq!(
+                    store
+                        .replace(&account, original.generation(), &replacement)
+                        .unwrap_err()
+                        .kind(),
+                    kind,
+                );
+                assert_eq!(store.get(&account).unwrap(), replacement);
+                assert_eq!(store.get(&adjacent).unwrap(), sentinel);
+                assert_eq!(store.backend.inner.records.lock().unwrap().len(), 2);
+            }
+        }
     }
 }

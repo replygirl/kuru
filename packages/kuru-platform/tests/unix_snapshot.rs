@@ -252,7 +252,7 @@ fn absolute_snapshot_deadline_reaps_its_stalled_helper() {
     write_executable_from_child(
         &stalled,
         &format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec /bin/sleep 30\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec /bin/sleep 30\n",
             marker.display()
         ),
     );
@@ -265,16 +265,43 @@ fn absolute_snapshot_deadline_reaps_its_stalled_helper() {
     let elapsed = start.elapsed();
     let error = result.unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
-    let helper: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    // The absolute deadline may expire after spawn but before the interpreter
+    // writes its first marker, or during that write. Only a complete line names
+    // the exact helper; partial decimal bytes must not select another PID.
+    let helper = match std::fs::read_to_string(&marker) {
+        Ok(text) => text
+            .strip_suffix('\n')
+            .and_then(|id| id.parse::<i32>().ok())
+            .and_then(Pid::from_raw),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read native helper evidence: {error}"),
+    };
     let rows: Vec<_> = snapshot::processes()
         .unwrap()
         .into_iter()
-        .filter(|row| row.pid == helper && row.ppid == std::process::id())
+        .filter(|row| {
+            // Every native child fixture in this binary holds SNAPSHOT_FIXTURE.
+            // A killed pre-marker helper loses its executable command as a
+            // zombie, so also require no unreaped child of this exact parent.
+            row.ppid == std::process::id()
+                && (row.command.contains(stalled.to_str().unwrap()) || row.state.starts_with('Z'))
+        })
         .collect();
     assert!(
         rows.is_empty(),
         "helper remained owned after listing: {rows:?}"
     );
+    if let Some(helper) = helper {
+        assert_eq!(
+            waitid(
+                WaitId::Pid(helper),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )
+            .unwrap_err(),
+            rustix::io::Errno::CHILD,
+            "the complete native helper identity was not reaped",
+        );
+    }
     assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
 }
 

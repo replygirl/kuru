@@ -169,3 +169,132 @@ pub async fn connect(directory: &Directory, name: &OsStr) -> io::Result<UnixStre
     private.revalidate()?;
     Ok(stream)
 }
+
+#[cfg(test)]
+mod refusal_contracts {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn short_directory_cold_probe_preserves_the_shared_prefix_and_only_owns_its_leaf() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            ^ (u128::from(std::process::id()) << 64);
+        let locator = format!("{nonce:024x}");
+        let path = short_directory_path(&locator).unwrap();
+        assert!(!path.exists());
+        let prefix = path.parent().unwrap();
+        let prefix_existed = prefix.exists();
+        assert_eq!(
+            open_short_directory(&locator).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!path.exists(), "a cold client must not create state");
+        assert_eq!(prefix.exists(), prefix_existed);
+        let retained_prefix = prefix_existed
+            .then(|| Directory::open(prefix, Privacy::OwnerOnly, NameRetention::Pinned).unwrap());
+        let prefix_mode =
+            prefix_existed.then(|| fs::metadata(prefix).unwrap().permissions().mode());
+        // Product preparation may create its checked private prefix when
+        // absent. The fixture never chmods or removes that shared prefix.
+        let prepared = prepare_short_directory(&locator).unwrap();
+        let reopened = open_short_directory(&locator).unwrap();
+        assert_eq!(prepared.identity(), reopened.identity());
+        drop(reopened);
+        prepared.remove_tree().unwrap();
+        assert!(!path.exists());
+        assert!(prefix.exists());
+        if let Some(retained_prefix) = retained_prefix {
+            retained_prefix.revalidate().unwrap();
+            assert_eq!(
+                fs::metadata(prefix).unwrap().permissions().mode(),
+                prefix_mode.unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_endpoint_names_and_stale_sockets_never_adopt_or_remove_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let path = directory.path().to_path_buf();
+        fs::write(path.join("adjacent"), b"unchanged").unwrap();
+        fs::set_permissions(path.join("adjacent"), fs::Permissions::from_mode(0o600)).unwrap();
+        for name in ["", "..", "nested/endpoint", "endpoint\0outside"] {
+            assert_eq!(
+                connect(&directory, OsStr::new(name))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                PrivateServiceListener::bind_at(
+                    Directory::ensure_private(&path).unwrap(),
+                    OsStr::new(name),
+                )
+                .err()
+                .unwrap()
+                .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            connect(&directory, OsStr::new("missing"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let endpoint = path.join("stale.sock");
+        let native = UnixListener::bind(&endpoint).unwrap();
+        fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(native);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect(&directory, OsStr::new("stale.sock")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            fs::symlink_metadata(&endpoint)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        assert!(
+            PrivateServiceListener::bind_at(
+                Directory::ensure_private(&path).unwrap(),
+                OsStr::new("stale.sock"),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(path.join("adjacent")).unwrap(), b"unchanged");
+    }
+
+    #[tokio::test]
+    async fn listener_drop_preserves_another_native_socket_at_the_same_name() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let listener =
+            PrivateServiceListener::bind_at(directory, OsStr::new("generation.sock")).unwrap();
+        let original = listener.path();
+        let moved = original.with_file_name("displaced.sock");
+        fs::rename(&original, &moved).unwrap();
+        let replacement = UnixListener::bind(&original).unwrap();
+        let identity = fs::symlink_metadata(&original).unwrap().ino();
+        drop(listener);
+        assert_eq!(fs::symlink_metadata(&original).unwrap().ino(), identity);
+        assert!(
+            fs::symlink_metadata(&moved)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        drop(replacement);
+    }
+}
