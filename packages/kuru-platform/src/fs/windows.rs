@@ -1996,6 +1996,68 @@ mod tests {
         assert_eq!(completed.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
+    #[test]
+    fn pinned_descendant_refusal_preserves_partial_removal_and_exact_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        parent
+            .create_new(OsStr::new("adjacent"))
+            .unwrap()
+            .write_all(b"adjacent evidence")
+            .unwrap();
+        let root_path = parent.path().join("root");
+        let child_path = root_path.join("child");
+        let root = Directory::ensure_private(&root_path).unwrap();
+        let child = Directory::ensure_private(&child_path).unwrap();
+        child
+            .create_new(OsStr::new("payload"))
+            .unwrap()
+            .write_all(b"removed before child unlink")
+            .unwrap();
+        let root_before = refusal_object_state(&root.anchor().file).unwrap();
+        let child_before = refusal_object_state(&child.anchor().file).unwrap();
+        drop(child);
+        let blocker =
+            Directory::open(&child_path, Privacy::OwnerOnly, NameRetention::Pinned).unwrap();
+
+        // There is one descendant at each level: the payload is removed before
+        // native DELETE sharing refuses its now-empty pinned directory. No
+        // sibling enumeration order or injected filesystem error is involved.
+        let outcome = root.remove_tree();
+        let root_after = Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Movable)
+            .and_then(|retained| refusal_object_state(&retained.anchor().file));
+        let child_after = refusal_object_state(&blocker.anchor().file);
+        let payload_after = fs::symlink_metadata(child_path.join("payload"));
+        let adjacent_after = fs::read(parent.path().join("adjacent"));
+        drop(blocker);
+        let cleaned_root = Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Movable)
+            .map(|retained| retained.remove_tree());
+        let cleaned_parent = parent.remove_tree();
+        let cleaned_fixture = temporary.close();
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(failure.phase, PublicationPhase::Uncertain);
+        assert_eq!(failure.identity, Some(root_before.0.identity));
+        assert_eq!(failure.path, root_path);
+        assert_eq!(failure.descendant, Some(PathBuf::from("child")));
+        assert_eq!(failure.error.raw_os_error(), Some(32));
+        let root_after = root_after.unwrap();
+        let child_after = child_after.unwrap();
+        assert_eq!(root_after.0.identity, root_before.0.identity);
+        assert_eq!(child_after.0.identity, child_before.0.identity);
+        assert!(root_after.1 && child_after.1);
+        assert_eq!(root_after.2, root_before.2, "root ACL changed on refusal");
+        assert_eq!(
+            child_after.2, child_before.2,
+            "child ACL changed on refusal"
+        );
+        assert_eq!(payload_after.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(adjacent_after.unwrap(), b"adjacent evidence");
+        cleaned_root.unwrap().unwrap();
+        cleaned_parent.unwrap();
+        cleaned_fixture.unwrap();
+    }
+
     fn refusal_object_state(file: &File) -> io::Result<(FileInfo, bool, Vec<u8>)> {
         let metadata = info(file)?;
         Ok((
