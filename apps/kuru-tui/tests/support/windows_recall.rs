@@ -1,6 +1,7 @@
 //! Native composer recall preserves literal prompts and the unsent draft.
 
 use super::*;
+use crossterm::event::{KeyCode as Key, KeyModifiers as Modifiers};
 
 const LITERAL_DRAFT: &str = "literal draft e\u{301} 猫";
 const NATIVE_DRAFT_PROJECTION: &str = "literal draft e 猫";
@@ -23,8 +24,8 @@ async fn native_conpty_literal_combining_input_is_observed_before_composer() -> 
         terminal.wait("native raw input initialization", READY, |_| {
             directory.join("ready.json").is_file()
         })?;
-        terminal.send(LITERAL_DRAFT.as_bytes())?;
-        terminal.send(b"\r")?;
+        terminal.committed_text(LITERAL_DRAFT)?;
+        terminal.committed_key(Key::Enter, Modifiers::NONE)?;
         terminal.finish(EXIT)
     }
     .await;
@@ -56,26 +57,23 @@ async fn native_conpty_literal_combining_input_is_observed_before_composer() -> 
         filtered.len(),
         observed["keys"]
     );
-    let keys = observed["keys"].as_array().context("key receipt absent")?;
-    let accent: Vec<_> = keys.iter().filter(|key| key["scalar"] == 769).collect();
+    let keys = observed["keys"]
+        .as_array()
+        .context("native key receipts absent")?;
+    let accent_kinds: Vec<&str> = keys
+        .iter()
+        .filter(|key| key["scalar"] == u32::from('\u{301}'))
+        .filter_map(|key| key["kind"].as_str())
+        .collect();
     ensure!(
-        accent.len() == 1 && accent[0]["kind"] == "Press",
-        "Alt-code text did not commit exactly once: {accent:?}"
+        accent_kinds == ["Press", "Release"],
+        "committed accent must retain exactly one down/up pair: {observed}"
     );
-    let ordinary_count = LITERAL_DRAFT
-        .chars()
-        .filter(|&character| character == 'e')
-        .count();
-    for kind in ["Press", "Release"] {
-        let count = keys
-            .iter()
-            .filter(|key| key["scalar"] == u32::from('e') && key["kind"] == kind)
-            .count();
-        ensure!(
-            count == ordinary_count,
-            "ordinary character {kind} changed: {count}, expected {ordinary_count}; keys={keys:?}"
-        );
-    }
+    let expected_raw: String = LITERAL_DRAFT.chars().flat_map(|ch| [ch, ch]).collect();
+    ensure!(
+        raw_characters == expected_raw,
+        "ordinary committed releases must remain visible and excluded from text: {observed}"
+    );
     Ok(())
 }
 
@@ -115,48 +113,52 @@ async fn native_conpty_recall_search_and_key_history_preserve_literal_prompts() 
             let oldest = "recall oldest 猫";
             let newest = "recall newest 日本語";
             for (index, prompt) in [oldest, newest].into_iter().enumerate() {
-                terminal.send(prompt.as_bytes())?;
+                terminal.committed_text(prompt)?;
                 terminal.composer(prompt)?;
-                terminal.send(b"\r")?;
+                terminal.committed_key(Key::Enter, Modifiers::NONE)?;
                 settled_turn(&mut terminal, index + 1)?;
             }
 
             let draft = LITERAL_DRAFT;
-            terminal.send(draft.as_bytes())?;
+            terminal.committed_text(draft)?;
             draft_frame(&mut terminal, draft, &["enter send"])?;
             for (key, prompt, label) in [
-                (b"\x1b[A".as_slice(), newest, "history 1/2"),
-                (b"\x1b[B".as_slice(), draft, "enter send"),
-                (b"\x1b[A".as_slice(), newest, "history 1/2"),
-                (b"\x1b[A".as_slice(), oldest, "history 2/2"),
-                (b"\x1b[B".as_slice(), newest, "history 1/2"),
-                (b"\x1b".as_slice(), draft, "enter send"),
+                (Key::Up, newest, "history 1/2"),
+                (Key::Down, draft, "enter send"),
+                (Key::Up, newest, "history 1/2"),
+                (Key::Up, oldest, "history 2/2"),
+                (Key::Down, newest, "history 1/2"),
+                (Key::Esc, draft, "enter send"),
             ] {
-                terminal.send(key)?;
+                terminal.committed_key(key, Modifiers::NONE)?;
                 draft_frame(&mut terminal, prompt, &[label])?;
             }
 
-            terminal.send(b"\x12recall")?;
+            terminal.committed_key(Key::Char('r'), Modifiers::CONTROL)?;
+            terminal.committed_text("recall")?;
             draft_frame(&mut terminal, newest, &["reverse search", "1/2"])?;
-            terminal.send(b"\x12")?;
+            terminal.committed_key(Key::Char('r'), Modifiers::CONTROL)?;
             draft_frame(&mut terminal, oldest, &["reverse search", "2/2"])?;
-            terminal.send(b"\x12")?;
+            terminal.committed_key(Key::Char('r'), Modifiers::CONTROL)?;
             draft_frame(&mut terminal, newest, &["reverse search", "1/2"])?;
-            terminal.send(&[127; 6])?;
-            terminal.send(b"NO_NATIVE_RECALL_MATCH")?;
+            for _ in 0..6 {
+                terminal.committed_key(Key::Backspace, Modifiers::NONE)?;
+            }
+            terminal.committed_text("NO_NATIVE_RECALL_MATCH")?;
             draft_frame(&mut terminal, draft, &["reverse search", "0/0"])?;
-            terminal.send(b"\x1b")?;
+            terminal.committed_key(Key::Esc, Modifiers::NONE)?;
             draft_frame(&mut terminal, draft, &["enter send"])?;
             // Submit the restored decomposed draft so the durable byte check
             // proves the accent survived independently of ConPTY's projection.
-            terminal.send(b"\r")?;
+            terminal.committed_key(Key::Enter, Modifiers::NONE)?;
             settled_turn(&mut terminal, 3)?;
-            terminal.send(b"\x12oldest")?;
+            terminal.committed_key(Key::Char('r'), Modifiers::CONTROL)?;
+            terminal.committed_text("oldest")?;
             draft_frame(&mut terminal, oldest, &["reverse search", "1/1"])?;
             // Enter accepts a recalled draft; the next Enter submits it.
-            terminal.send(b"\r")?;
+            terminal.committed_key(Key::Enter, Modifiers::NONE)?;
             draft_frame(&mut terminal, oldest, &["enter send"])?;
-            terminal.send(b"\r")?;
+            terminal.committed_key(Key::Enter, Modifiers::NONE)?;
             settled_turn(&mut terminal, 4)?;
 
             let prefix = "saved 猫pre";
@@ -165,46 +167,52 @@ async fn native_conpty_recall_search_and_key_history_preserve_literal_prompts() 
             // crossterm's native Windows backend reads console key records,
             // not atomic bracketed-paste events. Exercise actual key transport;
             // paste-chip controls remain covered by Unix PTYs and event tests.
-            terminal.send(edited_draft.as_bytes())?;
+            terminal.committed_text(&edited_draft)?;
             draft_frame(&mut terminal, &edited_draft, &["enter send"])?;
-            terminal.send(b"\x1b[A")?;
+            terminal.committed_key(Key::Up, Modifiers::NONE)?;
             draft_frame(&mut terminal, oldest, &["history 1/4"])?;
-            terminal.send(b"\x1b[B")?;
+            terminal.committed_key(Key::Down, Modifiers::NONE)?;
             draft_frame(&mut terminal, &edited_draft, &["enter send"])?;
-            terminal.send(b"\x12newest")?;
+            terminal.committed_key(Key::Char('r'), Modifiers::CONTROL)?;
+            terminal.committed_text("newest")?;
             draft_frame(&mut terminal, newest, &["reverse search", "1/1"])?;
-            terminal.send(b"\x1b")?;
+            terminal.committed_key(Key::Esc, Modifiers::NONE)?;
             draft_frame(&mut terminal, &edited_draft, &["enter send"])?;
 
-            terminal.send(b"\x1b[D\x1b[D\x1b[D\x1b[D")?;
+            for _ in 0..4 {
+                terminal.committed_key(Key::Left, Modifiers::NONE)?;
+            }
             draft_frame(
                 &mut terminal,
                 &format!("{prefix}{insertion}"),
                 &[&edited_draft],
             )?;
-            terminal.send(&vec![127; insertion.len()])?;
+            for _ in 0..insertion.len() {
+                terminal.committed_key(Key::Backspace, Modifiers::NONE)?;
+            }
             let removed = format!("{prefix}post");
             draft_frame(&mut terminal, prefix, &[&removed])?;
-            terminal.send(b"\x05")?;
+            terminal.committed_key(Key::Char('e'), Modifiers::CONTROL)?;
             terminal.composer(&removed)?;
-            terminal.send(b"\r")?;
+            terminal.committed_key(Key::Enter, Modifiers::NONE)?;
             settled_turn(&mut terminal, 5)?;
 
             let long_text = "日本語猫".repeat(50);
             let literal = format!("literal-input:{long_text}:end");
-            terminal.send(literal.as_bytes())?;
+            terminal.committed_text(&literal)?;
             draft_frame(&mut terminal, ":end", &["enter send"])?;
-            terminal.send(b"\r")?;
+            terminal.committed_key(Key::Enter, Modifiers::NONE)?;
             settled_turn(&mut terminal, 6)?;
             // Submitted history carries canonical Unicode text. Its wrapped
             // final row owns the cursor, independently of logical-line joining.
-            terminal.send(b"\x1b[A")?;
+            terminal.committed_key(Key::Up, Modifiers::NONE)?;
             draft_frame(&mut terminal, ":end", &["history 1/6"])?;
-            terminal.send(b":again")?;
+            terminal.committed_text(":again")?;
             terminal.composer(":end:again")?;
-            terminal.send(b"\r")?;
+            terminal.committed_key(Key::Enter, Modifiers::NONE)?;
             settled_turn(&mut terminal, 7)?;
-            terminal.send(b"/quit\r")?;
+            terminal.committed_text("/quit")?;
+            terminal.committed_key(Key::Enter, Modifiers::NONE)?;
             ensure!(terminal.finish(EXIT)?["status"] == 0);
             drop(terminal);
 

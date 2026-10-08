@@ -28,10 +28,6 @@ when applying that standard. AGENTS.md is canonical; CLAUDE.md imports it with
 Keep provider and protocol knowledge behind connector interfaces. All crates
 inherit workspace dependencies; pin exact versions and update Cargo.lock in the
 same change. Preserve unknown model/effort capabilities returned by providers.
-Verified third-party dependency patches live under their owning app/package's
-vendor directory, retaining the upstream license and exact archive provenance.
-Keep them outside Kuru workspace membership and preserve the foreign-dependency
-coverage boundary described in [development](docs/development.md#patched-terminal-dependency).
 Kuru owns the complete agent runtime. OpenAI integration must use native
 authentication and inference transports: ChatGPT browser OAuth (with device flow
 where useful), or `OPENAI_API_KEY`. Do not embed the Codex CLI/app-server, require

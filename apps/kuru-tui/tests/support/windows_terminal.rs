@@ -390,6 +390,71 @@ impl Terminal {
         Ok(())
     }
 
+    // ConPTY hosts receive this documented request before native keyboard
+    // records. Inspect accumulated output so a split read cannot hide it.
+    fn committed_input_ready(&mut self) -> Result<()> {
+        const REQUEST: &[u8] = b"\x1b[?9001h";
+        if !self
+            .output
+            .windows(REQUEST.len())
+            .any(|part| part == REQUEST)
+        {
+            self.wait("ConPTY requests win32-input-mode", READY, |terminal| {
+                terminal
+                    .output
+                    .windows(REQUEST.len())
+                    .any(|part| part == REQUEST)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Fixture-host committed BMP keys, using Microsoft's Win32-input-mode
+    /// protocol. This deliberately leaves raw-text/paste scenarios on send().
+    pub fn committed_text(&mut self, text: &str) -> Result<()> {
+        ensure!(
+            text.chars().all(|ch| ch.len_utf16() == 1),
+            "committed-key fixture supports BMP text only"
+        );
+        self.committed_input_ready()?;
+        let mut bytes = Vec::new();
+        for character in text.encode_utf16() {
+            bytes.extend(Self::committed_record(0, character, 0));
+        }
+        self.send(&bytes)
+    }
+
+    pub fn committed_key(
+        &mut self,
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Result<()> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Vk/Uc/Cs correspond to KEY_EVENT_RECORD; scan=0, repeat=1. Native
+        // Backspace is VK_BACK/U+0008, not VK_DELETE despite legacy byte 127.
+        let (virtual_key, character, controls) = match (key, modifiers) {
+            (KeyCode::Enter, KeyModifiers::NONE) => (13, 13, 0),
+            (KeyCode::Esc, KeyModifiers::NONE) => (27, 27, 0),
+            (KeyCode::Backspace, KeyModifiers::NONE) => (8, 8, 0),
+            (KeyCode::Up, KeyModifiers::NONE) => (38, 0, 0),
+            (KeyCode::Down, KeyModifiers::NONE) => (40, 0, 0),
+            (KeyCode::Left, KeyModifiers::NONE) => (37, 0, 0),
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => (82, 18, 8),
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => (69, 5, 8),
+            _ => bail!("unsupported committed fixture key {key:?}/{modifiers:?}"),
+        };
+        self.committed_input_ready()?;
+        self.send(&Self::committed_record(virtual_key, character, controls))
+    }
+
+    fn committed_record(virtual_key: u16, character: u16, controls: u32) -> Vec<u8> {
+        // CSI Vk;Sc;Uc;Kd;Cs;Rc_: preserve both down/up records so production
+        // crossterm and Kuru release filtering are exercised unchanged.
+        format!(
+            "\x1b[{virtual_key};0;{character};1;{controls};1_\x1b[{virtual_key};0;{character};0;{controls};1_"
+        ).into_bytes()
+    }
+
     pub fn focus(&mut self, focused: bool) -> Result<()> {
         let path = self
             .directory

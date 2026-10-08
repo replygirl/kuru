@@ -2490,26 +2490,6 @@ differently-named sibling task.
 
 ## Dependency and release updates
 
-### Patched terminal dependency
-
-The TUI owns a verified source copy of crossterm 0.29.0 under
-`apps/kuru-tui/vendor/crossterm-0.29.0`. Its Windows Alt-code parser now emits
-committed text as Press while ordinary keyboard releases remain Release.
-Native ConPTY tests require exact decomposed Unicode bytes and persisted recall;
-the application continues to ignore ordinary releases. The original MIT license,
-archive checksum, VCS identity and exact correction are documented in
-[vendor provenance](../apps/kuru-tui/vendor/README.md).
-
-Root Cargo applies this exact-version patch to every consumer, including ratatui.
-The third-party crate remains outside Kuru workspace membership. Coverage retains
-the existing foreign-dependency boundary through a filter restricted to its exact
-versioned directory, applied before LCOV and JSON exports with the existing
-summary self-checks. Every Kuru application source remains in the inventory and
-all coverage gates remain at 95%. Remove the patch after verifying an exactly
-pinned upstream release contains the same correction.
-
-### Refreshing dependency and tool provenance
-
 Change workspace dependency pins centrally and regenerate Cargo.lock. Change
 tool pins with the matching five-platform lock refresh:
 

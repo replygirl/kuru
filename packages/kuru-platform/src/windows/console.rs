@@ -162,10 +162,32 @@ fn queue_focus(input: &OwnedHandle, focused: bool) -> io::Result<()> {
 #[cfg(feature = "test-support")]
 pub fn verify_private_console_fixture() -> io::Result<()> {
     use std::fs::OpenOptions;
-    use windows_sys::Win32::System::Console::{
-        ENABLE_INSERT_MODE, ENABLE_WRAP_AT_EOL_OUTPUT, FOCUS_EVENT, FlushConsoleInputBuffer,
-        INPUT_RECORD, PeekConsoleInputW,
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        System::Console::{
+            ENABLE_INSERT_MODE, ENABLE_WRAP_AT_EOL_OUTPUT, FOCUS_EVENT, FlushConsoleInputBuffer,
+            GetStdHandle, INPUT_RECORD, PeekConsoleInputW, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE, SetStdHandle,
+        },
     };
+    // Standard slots are borrowed process-owned handles. Retain a private
+    // duplicate while changing each slot, and restore its exact original value
+    // even if an observation unwinds. Only this isolated fixture mutates them.
+    struct RestoreStandardHandle {
+        channel: u32,
+        original: HANDLE,
+        _retained: OwnedHandle,
+        restore_on_drop: bool,
+    }
+    impl Drop for RestoreStandardHandle {
+        fn drop(&mut self) {
+            if self.restore_on_drop {
+                // SAFETY: the original process-owned handle was never closed;
+                // its private duplicate also retains the same console object.
+                let _ = unsafe { SetStdHandle(self.channel, self.original) };
+            }
+        }
+    }
     let input: OwnedHandle = OpenOptions::new()
         .read(true)
         .write(true)
@@ -192,6 +214,64 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
         StandardStream::Error,
     ]
     .map(virtual_terminal_output_enabled);
+    let mut absent_streams = Vec::new();
+    for (index, channel) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .enumerate()
+    {
+        let selected = || match channel {
+            STD_INPUT_HANDLE => StandardStream::Input,
+            STD_OUTPUT_HANDLE => StandardStream::Output,
+            _ => StandardStream::Error,
+        };
+        let retained = stream(selected())?;
+        // SAFETY: the slot belongs to this process and has no concurrent users.
+        let original = unsafe { GetStdHandle(channel) };
+        let mut restoration = RestoreStandardHandle {
+            channel,
+            original,
+            _retained: retained,
+            restore_on_drop: true,
+        };
+        // SAFETY: NULL is a real absent standard stream; it does not close the
+        // original handle or construct an invalid owned handle.
+        if unsafe { SetStdHandle(channel, std::ptr::null_mut()) } == 0 {
+            let error = io::Error::last_os_error();
+            drop(restoration);
+            return Err(error);
+        }
+        // Capture every result without propagating errors, asserting, or
+        // printing while a standard stream is absent.
+        let stdio = inherited_stdio(selected());
+        let console = stream(selected());
+        let capture = ConsoleModeGuard::capture();
+        let vt_absent = virtual_terminal_output_enabled(selected());
+        // SAFETY: the unchanged original handle and its duplicate remain live.
+        let restored_slot = unsafe { SetStdHandle(channel, original) };
+        let restored_slot = if restored_slot == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            restoration.restore_on_drop = false;
+            Ok(())
+        };
+        drop(restoration);
+        restored_slot?;
+        // A missing stderr does not prevent input/output capture. Restore and
+        // drop that successful temporary guard before the original mode guard.
+        let capture = match capture {
+            Ok(mut captured) => captured.restore(),
+            Err(error) => Err(error),
+        };
+        let vt_restored = virtual_terminal_output_enabled(selected());
+        absent_streams.push((
+            index,
+            stdio,
+            console.map(drop),
+            capture,
+            vt_absent,
+            vt_restored,
+        ));
+    }
     set(&input, before.input ^ ENABLE_INSERT_MODE)?;
     set(&output, before.output ^ ENABLE_WRAP_AT_EOL_OUTPUT)?;
     let changed = guard.current()?;
@@ -224,6 +304,24 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
     assert_eq!(vt_before, [false; 3], "baseline VT admission");
     assert_eq!(before, baseline, "captured console modes");
     assert_eq!(vt_enabled, [false, true, true], "enabled VT admission");
+    for (index, stdio, console, capture, vt_absent, vt_restored) in absent_streams {
+        assert!(matches!(stdio, Ok(Stdio::Null)), "absent stdio {index}");
+        let error = console.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(error.to_string(), "standard console handle is unavailable");
+        if index == 2 {
+            capture.unwrap();
+        } else {
+            let error = capture.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(error.to_string(), "standard console handle is unavailable");
+        }
+        assert!(!vt_absent, "absent VT admission {index}");
+        assert_eq!(
+            vt_restored, vt_enabled[index],
+            "restored VT admission {index}"
+        );
+    }
     assert_ne!(changed, before, "console modes did not change");
     assert_eq!(restored, before, "explicit console restoration");
     assert_eq!(after_drop, before, "Drop console restoration");

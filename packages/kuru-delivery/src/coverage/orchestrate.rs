@@ -36,10 +36,6 @@ use std::{
 
 /// The pinned cargo-llvm-cov tool request resolved through mise.
 const LLVM_COV_TOOL: &str = "aqua:taiki-e/cargo-llvm-cov@0.9.1";
-/// Keep this patched foreign dependency outside the existing Kuru source gate.
-/// The local workspace task uses the same exact directory boundary.
-const FOREIGN_DEPENDENCY_FILENAME_REGEX: &str =
-    r"(^|[/\\])apps[/\\]kuru-tui[/\\]vendor[/\\]crossterm-0[.]29[.]0([/\\]|$)";
 /// Private state directory created inside the fresh coverage target.
 const STATE: &str = "kuru-shard-state";
 /// State copied beside `failure.txt` when a partition fails after creating it.
@@ -1174,14 +1170,7 @@ async fn report<H: Host>(
     let output_text = output
         .to_str()
         .context("coverage export path is not UTF-8")?;
-    let mut args = vec![
-        "llvm-cov",
-        "report",
-        "--failure-mode",
-        "any",
-        "--ignore-filename-regex",
-        FOREIGN_DEPENDENCY_FILENAME_REGEX,
-    ];
+    let mut args = vec!["llvm-cov", "report", "--failure-mode", "any"];
     args.extend(format);
     args.extend(["--output-path", output_text]);
     host.stream(&Invocation::new(llvm_cov, &args, root).with_env(env), None)
@@ -1536,108 +1525,6 @@ mod tests {
 
     fn variables(text: &str) -> BTreeMap<String, String> {
         parse_show_env(text).unwrap().into_iter().collect()
-    }
-
-    #[test]
-    fn foreign_dependency_filter_has_exact_cross_platform_directory_boundaries() {
-        use grep_matcher::Matcher;
-        let matcher = grep_regex::RegexMatcher::new(FOREIGN_DEPENDENCY_FILENAME_REGEX).unwrap();
-        for path in [
-            "apps/kuru-tui/vendor/crossterm-0.29.0",
-            "/work/kuru/apps/kuru-tui/vendor/crossterm-0.29.0/src/event/source/windows.rs",
-            r"C:\work\kuru\apps\kuru-tui\vendor\crossterm-0.29.0\src\event\source\windows.rs",
-        ] {
-            assert!(matcher.is_match(path.as_bytes()).unwrap(), "{path}");
-        }
-        for path in [
-            "apps/kuru-tui/vendor/crossterm-0.29.0-extra/src/lib.rs",
-            "apps/kuru-tui/vendor/crossterm-0.29.0.rs",
-            "apps/kuru-tui/vendor/crossterm-0.29.00/src/lib.rs",
-            "apps/kuru-tui/vendor/crossterm-0.29.1/src/lib.rs",
-            "apps/kuru-tui/vendor/crossterm-0x29x0/src/lib.rs",
-            "otherapps/kuru-tui/vendor/crossterm-0.29.0/src/lib.rs",
-            "apps/kuru-tui-extra/vendor/crossterm-0.29.0/src/lib.rs",
-            "apps/kuru-tui/src/vendor/crossterm-0.29.0/src/lib.rs",
-            "packages/kuru-core/vendor/crossterm-0.29.0/src/lib.rs",
-        ] {
-            for path in [path.to_owned(), path.replace('/', "\\")] {
-                assert!(!matcher.is_match(path.as_bytes()).unwrap(), "{path}");
-            }
-        }
-    }
-
-    #[test]
-    fn foreign_dependency_filter_retains_every_kuru_source_module() {
-        use grep_matcher::Matcher;
-        let matcher = grep_regex::RegexMatcher::new(FOREIGN_DEPENDENCY_FILENAME_REGEX).unwrap();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
-        for package in WORKSPACE_PACKAGES {
-            let directory = if package == "kuru" {
-                root.join("apps/kuru-tui")
-            } else {
-                root.join("packages").join(package)
-            };
-            let mut pending = vec![directory.join("src")];
-            if directory.join("build.rs").is_file() {
-                pending.push(directory.join("build.rs"));
-            }
-            let mut modules = 0;
-            while let Some(path) = pending.pop() {
-                if path.is_dir() {
-                    pending.extend(
-                        fs::read_dir(path)
-                            .unwrap()
-                            .map(|entry| entry.unwrap().path()),
-                    );
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    modules += 1;
-                    let relative = path
-                        .strip_prefix(&root)
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .replace('\\', "/");
-                    for source in [
-                        relative.clone(),
-                        format!("/work/kuru/{relative}"),
-                        format!(r"C:\work\kuru\{}", relative.replace('/', "\\")),
-                    ] {
-                        assert!(!matcher.is_match(source.as_bytes()).unwrap(), "{source}");
-                    }
-                }
-            }
-            assert!(modules > 0, "no source modules inspected for {package}");
-        }
-    }
-
-    #[test]
-    fn local_workspace_coverage_uses_the_canonical_foreign_dependency_filter() {
-        let config: toml::Value = toml::from_str(include_str!("../../mise.toml")).unwrap();
-        assert_eq!(
-            config["vars"]["kuru_coverage_foreign_dependency_regex"].as_str(),
-            Some(FOREIGN_DEPENDENCY_FILENAME_REGEX)
-        );
-        let task = &config["tasks"]["coverage:workspace"];
-        for shell in ["run", "run_windows"] {
-            let command = task[shell].as_str().unwrap();
-            assert_eq!(
-                command
-                    .matches(
-                        "--ignore-filename-regex '{{vars.kuru_coverage_foreign_dependency_regex}}'"
-                    )
-                    .count(),
-                1,
-                "{shell}: {command}"
-            );
-            assert!(
-                command.contains("--fail-under-lines 95"),
-                "{shell}: {command}"
-            );
-            assert!(!command.contains("--no-default-ignore-filename-regex"));
-        }
     }
 
     #[test]
@@ -2235,13 +2122,10 @@ mod tests {
                     "report",
                     "--failure-mode",
                     "any",
-                    "--ignore-filename-regex",
-                    ignore,
                     ref format @ ..,
                     "--output-path",
                     output,
                 ] => {
-                    assert_eq!(ignore, FOREIGN_DEPENDENCY_FILENAME_REGEX);
                     assert!(stdout.is_none());
                     let target = Self::target(invocation);
                     assert!(!target.join("kuru-0-0.profraw").exists());
@@ -2611,16 +2495,6 @@ mod tests {
             assert_eq!(
                 export.args[2..4],
                 ["--failure-mode", "any"].map(OsString::from)
-            );
-            assert_eq!(
-                export.args[4..6],
-                ["--ignore-filename-regex", FOREIGN_DEPENDENCY_FILENAME_REGEX].map(OsString::from)
-            );
-            assert!(
-                !export
-                    .args
-                    .iter()
-                    .any(|arg| arg == "--no-default-ignore-filename-regex")
             );
             assert!(Fake::env(export, "CARGO_LLVM_COV_TARGET_DIR").is_some());
         }

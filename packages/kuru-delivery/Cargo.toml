@@ -67,8 +67,6 @@ rustix = { workspace = true, optional = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 axum.workspace = true
-grep-regex.workspace = true
-grep-matcher.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]

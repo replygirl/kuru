@@ -2,15 +2,13 @@
 
 ## Why
 
-Actual Windows ConPTY input loses U+0301 before composer editing or recall: the native receipt contains the character only as a release, then Kuru correctly ignores keyboard releases. Crossterm's Windows parser recognizes an Alt-code text commit internally but labels it as an ordinary release, discarding the distinction needed for safe application handling.
+Native ConPTY fixtures send plain UTF-8, which can synthesize Release-only Alt-code characters (observed for U+0301 on Windows x64 and ARM). That differs from Windows Terminal committed-key input. Ratatui recommends Kuru's existing Press-only filtering to avoid duplicate keys. Upstream PR745 deliberately discusses Release-only Alt-code commitment; changing the dependency is unjustified for this coverage work.
 
 ## What Changes
 
-- Patch only the existing Alt-code discriminator in the exact crossterm 0.29.0 source so committed text becomes Press; retain ordinary keyboard Release events and unchanged Kuru release filtering.
-- Keep a verified upstream source copy and MIT license under `apps/kuru-tui/vendor/crossterm-0.29.0`, with original archive checksum and VCS provenance. Root Cargo applies one patch for all consumers and retains the exact version; exclude the foreign dependency from Kuru workspace membership, preserving the existing application source inventory.
-- Strengthen the actual ConPTY input probe to check the accent is committed once and ordinary release events remain distinct, retaining exact seven-turn persisted Unicode bytes at both terminal sizes.
-- Preserve the existing foreign-dependency coverage boundary with a filter restricted to this exact vendored dependency directory, shared by canonical exports and local workspace reporting; retain all application sources and the existing metric/gates.
-- Document the dependency patch in the owning development page and keep repository vendor conventions accurate.
+- Remove the rejected vendored dependency, Cargo patch and all associated coverage/formatter/repository exceptions. Keep latest released crossterm 0.29.0 from the registry.
+- Correct only the owned recall/key fixture host: observe ConPTY's documented Win32-input-mode request and send committed Unicode and explicit command key records over the existing pipe.
+- Preserve exact decomposed Unicode, ordinary release filtering and all seven durable prompts. Qualify keyboard proof separately from unresolved raw-text paste/Alt-code behavior.
 
 ## Capabilities
 
@@ -20,11 +18,11 @@ Actual Windows ConPTY input loses U+0301 before composer editing or recall: the 
 
 ## Impact
 
-TUI-owned vendored dependency source, root Cargo patch and lock, delivery coverage reporting/task, native fixture assertions, contributor documentation and AGENTS.md. Preserve the exact original foreign manifest through an exact-file Taplo exclusion; every Kuru manifest remains checked. No dependency/tool version upgrades, mise version changes, new input backend, keyboard-state heuristic, normalization, unsafe consumer exemption, threshold change, or HTML roadmap edit.
+Windows native test helpers and acceptance documentation only. Production EventStream and Press-only behavior remain. No vendoring, fork, unreleased pin, downgrade, replacement backend, timing workaround, coverage exception or HTML roadmap edit.
 
 ## Surfaces
 
-- [x] interactive — actual Windows text entry
+- [x] interactive — exact Windows committed-key recall acceptance
 - [ ] deploy
-- [x] integration — existing crossterm native parser contract
+- [x] integration — released crossterm and documented ConPTY host input
 - [ ] agent-behavior

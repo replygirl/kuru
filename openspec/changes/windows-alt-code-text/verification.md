@@ -1,12 +1,12 @@
 # Verification
 
-## 1. Native text commitment [critical]
+## 1. Exact native committed-key input [critical]
 
-- [ ] 1.1 @regression (agent) send exact `literal draft e\u{301} 猫` bytes through actual ConPTY and public terminal/EventStream -> original CI37853387922 job113571954580 fails: raw U+0301 is Release-only, filtered text loses its two UTF-8 bytes; corrected receipt must preserve exact input and one accent Press.
-- [ ] 1.2 @integration (agent) inspect actual ordinary character events and persisted recall -> ordinary Press/Release pairs remain, text does not duplicate, and all seven completed prompt strings remain exact at 120/80 columns on native Windows x64 and ARM.
-- [ ] 1.3 @e2e (agent) use the actual public live renderer and native recall fixture -> completed frames and seven submitted synthetic prompts preserve the original decomposed draft, with all native terminal modes and owned processes restored before comparison.
+- [ ] 1.1 @regression (agent) same owned ConPTY and public EventStream, documented native committed-key transport -> exactly one U+0301 Press and Release; filtered bytes equal the original decomposed draft. Original raw-text CI37853387922 demonstrated Release-only loss on x64 and ARM; it is not evidence that all ordinary keyboard input loses the accent.
+- [ ] 1.2 @integration (agent) actual mode negotiation and explicit controls -> no silent raw fallback, duplicate ordinary characters, release-triggered commands or ambiguous bare Escape after native protocol activation.
+- [ ] 1.3 @e2e (agent) public renderer/native recall -> all seven completed synthetic prompts remain exact at120/80 columns on Windows x64 and ARM; restore terminal modes and owned processes before comparison.
 
-## 2. Dependency and repository boundaries
+## 2. Repository and dependency boundaries
 
-- [x] 2.1 @integration (agent) verify vendored bytes against the pinned original archive and inspect Cargo resolution -> exact 0.29.0 version, upstream MIT license/checksum/VCS retained, only Alt-code behavior changes, all consumers use one patched dependency, and Kuru workspace members remain unchanged. Observed: archive SHA and all77 files independently checked; offline locked metadata resolves one dependency and8 original members.
-- [x] 2.2 @integration (agent) run Rust format, Windows-target TUI lint, host checks and public documentation checks -> pass without tool upgrades, unsafe consumer exceptions or relaxed coverage/Unicode assertions. Observed: format, native-target lint, delivery host lint,28 orchestrator tests and public docs checks pass. Native corrected input checks in section1 remain unrun until CI executes them.
+- [x] 2.1 @integration (agent) source/config inspection -> rejected vendor/source patch and reporting/formatter conventions removed; Cargo.lock restores registry crossterm0.29.0. Docs.rs latest and upstream release list confirm0.29.0; all Kuru source and95% gates remain.
+- [ ] 2.2 @integration (agent) relevant static checks, independent review and acceptance documentation -> targeted fixture-only correction; raw-text paste/Alt-code and atomic Paste limitations remain explicit. Native passes recorded only after actual execution.

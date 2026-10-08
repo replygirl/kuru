@@ -1,13 +1,13 @@
 # Tasks
 
-## 1. Exact dependency correction
+## 1. Scope correction and causal research
 
-- [x] 1.1 Verify and retain the exact crossterm 0.29.0 upstream archive, MIT license and provenance in the TUI-owned vendor directory; apply one root Cargo patch with unchanged dependency version and application workspace inventory. Exact archive SHA matches; all77 files retained, only parser source differs after LF normalization. Offline locked metadata resolves one exact0.29.0 dependency and8 unchanged members; independent review clears.
-- [x] 1.2 Correct the Windows Alt-code parser branch to emit committed text as Press while retaining ordinary Release events, with no Kuru UI heuristic or unsafe exemption. Exact discriminator patch reviewed; Windows-target TUI lint passes. Corrected native acceptance remains task2.1.
+- [x] 1.1 Remove all rejected vendored source, root Cargo patch, coverage filter, extra development dependencies, formatter exception and vendor conventions; restore normal latest-release registry resolution and unchanged Kuru source inventory/95% gates.
+- [x] 1.2 Research primary crossterm/ratatui/popular-dependent sources and Microsoft's ConPTY protocol; distinguish committed-key fixture correction from unresolved raw-text paste/Alt-code fidelity.
 
-- [x] 1.3 Preserve the foreign-dependency reporting boundary with one exact versioned directory filter in canonical exports and local workspace coverage; verify Unix/Windows boundaries and retention of every application source. Delivery orchestrator tests28/28 pass, including all export arguments, OS boundaries and every Kuru source module. Independent review clears; pinned LLVM accepts the regex against saved profiles (syntax only, no new coverage claim).
+## 2. Kuru acceptance
 
-## 2. Causal acceptance
+- [x] 2.1 Implement the documented native-key fixture protocol with observed negotiation, exact decomposed text receipts and explicit command keys; qualify native keyboard acceptance separately from paste/Alt-code limitations.
+- [ ] 2.2 Run relevant static checks and independent review, then observe exact input and seven-prompt recall acceptance at 120/80 columns on Windows x64 and ARM before archive.
 
-- [ ] 2.1 Preserve the original native regression's exact decomposed Unicode input and seven persisted prompts; require one accent commit and distinct ordinary press/release events. Observe the original native failure and corrected native pass.
-- [x] 2.2 Update contributor/vendor documentation, run relevant static and documentation checks, independently review the exact patch/provenance and name native checks honestly until CI executes them. Format, Windows-target TUI lint, delivery host lint and docs checks pass; exact source/provenance and coverage-boundary reviews clear. Native acceptance remains pending in task2.1.
+Observed locally: Windows-target TUI lint, formatting and docs checks pass. Independent implementation review clears negotiated BMP-only text, explicit command framing, release exclusion and cleanup. Native task2.2 remains pending.
