@@ -69,6 +69,7 @@ async fn wait_for_file(path: &std::path::Path, bound: Duration) -> bool {
 #[derive(Default)]
 struct Recording {
     deliberation_call: bool,
+    denied_file_call: bool,
     requests: Mutex<Vec<CompletionRequest>>,
 }
 
@@ -80,8 +81,28 @@ impl Provider for Recording {
 
     async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
         let deliberate = request.instructions.contains("Phase: deliberate");
+        let current = request
+            .current_message_count
+            .unwrap_or(request.messages.len());
+        let saw_tool_result = request
+            .messages
+            .iter()
+            .rev()
+            .take(current)
+            .any(|message| message.role == "tool");
         self.requests.lock().unwrap().push(request);
-        let completion = if deliberate && self.deliberation_call {
+        let completion = if self.denied_file_call && !deliberate && !saw_tool_result {
+            Completion::from_legacy(
+                "proposed write",
+                vec![ToolCall {
+                    id: "platform-denied-file-call".into(),
+                    name: "file_write".into(),
+                    arguments: json!({"path":"owned.txt","content":"rejected mutation"}),
+                }],
+                1,
+                1,
+            )
+        } else if deliberate && self.deliberation_call {
             Completion::from_legacy(
                 "deliberated",
                 vec![ToolCall {
@@ -119,6 +140,74 @@ fn hook_seen(events: &[Event], hook_event: &str, outcome: &str, call_id: Option<
                 && observation.outcome == outcome
                 && observation.call_id.as_deref() == call_id)
     })
+}
+
+#[tokio::test]
+async fn denied_pre_tool_hook_preserves_original_call_and_receipt_without_file_effects()
+-> Result<()> {
+    kuru_memory::test_support::closing(async {
+        use anyhow::ensure;
+        use kuru_core::ContentBlock;
+
+        warm_hook_launch().await;
+        let project = tempfile::tempdir()?;
+        let original = b"private file body sk-abcdefghijklmnop";
+        std::fs::write(project.path().join("owned.txt"), original)?;
+        std::fs::write(project.path().join("adjacent.txt"), b"unrelated bytes")?;
+        let provider = Arc::new(Recording { denied_file_call: true, ..Recording::default() });
+        let hooks = LifecycleHooks {
+            pre_tool: vec![
+                fake_hook(
+                    r#"cat >/dev/null; printf '%s' '{"decision":"deny","reason":"api_key=fixture-secret denied by policy"}'"#,
+                    r#"$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('{"decision":"deny","reason":"api_key=fixture-secret denied by policy"}')"#,
+                ),
+                fake_hook(
+                    r#"cat >/dev/null; printf x > later-hook-ran; printf '%s' '{"decision":"allow"}'"#,
+                    r#"$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText('later-hook-ran', 'x'); [Console]::Out.Write('{"decision":"allow"}')"#,
+                ),
+            ],
+            ..LifecycleHooks::default()
+        };
+        let mut options = config(hooks);
+        // This fixture offers the real native write; the pre-tool denial must
+        // settle its original call before any otherwise permitted effect.
+        options.allow_write = true;
+        let mut harness = Harness::new(options, project.path(), MemoryStore::temporary().await?,
+            provider.clone(), None).await?;
+        let target = harness.topology.parts[0].id.clone();
+        let result = harness.run_for("propose the checked file write", Some(&target)).await;
+        let requests = provider.requests.lock().unwrap().clone();
+        let in_flight = harness.hook_host().in_flight_hooks();
+        let shutdown = harness.shutdown(false).await;
+        shutdown?;
+        let output = result?;
+
+        ensure!(output.text == "final answer");
+        ensure!(in_flight == 0);
+        ensure!(hook_seen(&output.events, "pre_tool", "denied", Some("platform-denied-file-call")));
+        ensure!(std::fs::read(project.path().join("owned.txt"))? == original);
+        ensure!(std::fs::read(project.path().join("adjacent.txt"))? == b"unrelated bytes");
+        ensure!(!project.path().join("later-hook-ran").try_exists()?);
+        let original_arguments = json!({"path":"owned.txt","content":"rejected mutation"});
+        ensure!(requests.iter().any(|request| {
+            let call = request.messages.iter().flat_map(|message| &message.blocks).any(|block|
+                matches!(block, ContentBlock::ToolUse { id, name, arguments }
+                    if id == "platform-denied-file-call" && name == "file_write" && arguments == &original_arguments));
+            let receipt = request.messages.iter().flat_map(|message| &message.blocks).any(|block|
+                matches!(block, ContentBlock::ToolResult { call_id, output, is_error }
+                    if call_id == "platform-denied-file-call" && *is_error
+                        && output.to_string().contains("denied")
+                        && output.to_string().contains("[REDACTED:recognized-secret]")));
+            call && receipt
+        }), "the next provider request dropped or rebound the denied original call/result");
+        for request in &requests {
+            let exposed = format!("{} {}", request.instructions, serde_json::to_string(&request.messages)?);
+            ensure!(!exposed.contains("fixture-secret") && !exposed.contains("sk-abcdefghijklmnop")
+                && !exposed.contains("private file body"), "provider request exposed private file or hook secret bytes");
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tokio::test]

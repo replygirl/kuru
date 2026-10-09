@@ -10057,9 +10057,11 @@ mod legacy_import_tests {
 
 #[cfg(test)]
 mod managed_coverage_contract_tests {
-    struct DriverClaims(std::sync::Mutex<Vec<(super::MemoryStore, super::SessionDriver)>>);
+    pub(super) struct DriverClaims(
+        pub(super) std::sync::Mutex<Vec<(super::MemoryStore, super::SessionDriver)>>,
+    );
 
-    async fn checked_owner_case(
+    pub(super) async fn checked_owner_case(
         label: &'static str,
         check: impl std::ops::AsyncFnOnce(
             &super::MemoryStore,
@@ -10538,6 +10540,150 @@ mod managed_coverage_contract_tests {
                 memory.put("after-refusal", &json!(true)).await?;
                 ensure!(memory.get("after-refusal").await? == Some(json!(true)));
                 attachment.close();
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn managed_exports_keep_the_captured_revision_and_refuse_foreign_cursors()
+    -> anyhow::Result<()> {
+        use super::*;
+        use anyhow::ensure;
+        use serde_json::json;
+
+        checked_owner_case(
+            "managed captured export boundaries",
+            async |memory, reader, _project, _claims| {
+                let namespace = "checked/export/private-history";
+                let captured = [
+                    Message::text("user", "CAPTURED_USER"),
+                    Message::text("assistant", "CAPTURED_REPLY"),
+                ];
+                memory
+                    .checkpoint(
+                        namespace,
+                        &captured,
+                        &[("export-state".into(), json!("CAPTURED_STATE"))],
+                    )
+                    .await?;
+                let revision = memory.revision().await?;
+                let export_a = reader.begin_active_export().await?;
+                let provenance = export_a.provenance().clone();
+                ensure!(provenance.branch == "main" && provenance.revision == revision);
+                let first = export_a.page(None).await?;
+                let cursor = first
+                    .next
+                    .context("captured export omitted its state continuation")?;
+
+                // The export owns a dedicated read attachment. Its writable
+                // sibling advances live state and a separate candidate while
+                // that committed reader remains open.
+                memory
+                    .append_message(namespace, &Message::text("user", "LATER_LIVE"))
+                    .await?;
+                memory.put("export-state", &json!("LATER_STATE")).await?;
+                let candidate = memory.begin_candidate("excluded export candidate").await?;
+                let private = candidate.view();
+                let changed = async {
+                    private
+                        .append_message(namespace, &Message::text("assistant", "CANDIDATE_ONLY"))
+                        .await?;
+                    private
+                        .put("candidate-export-state", &json!("CANDIDATE_STATE"))
+                        .await?;
+                    ensure!(memory.get("candidate-export-state").await?.is_none());
+                    ensure!(memory.history(namespace, 8).await?.len() == 3);
+                    let export_b = memory.begin_active_export().await?;
+                    ensure!(export_b.provenance().revision != revision);
+                    let refusal = export_b
+                        .page(Some(cursor.clone()))
+                        .await
+                        .err()
+                        .context("remote export accepted another snapshot's cursor")?;
+                    ensure!(refusal.to_string().contains("different snapshot"));
+                    ensure!(
+                        !export_b.page(None).await?.records.is_empty(),
+                        "foreign cursor refusal poisoned its own snapshot"
+                    );
+
+                    let mut records = first.records;
+                    let mut next = Some(cursor);
+                    while let Some(cursor) = next {
+                        let page = export_a.page(Some(cursor)).await?;
+                        records.extend(page.records);
+                        next = page.next;
+                    }
+                    let mut counts = [0_u64; 6];
+                    let mut messages = Vec::new();
+                    for record in &records {
+                        match record {
+                            StorageRecord::Message {
+                                namespace: observed,
+                                content,
+                                ..
+                            } => {
+                                counts[0] += 1;
+                                ensure!(observed == namespace);
+                                messages.push(content.as_str());
+                            }
+                            StorageRecord::State { .. } => counts[1] += 1,
+                            StorageRecord::ContextSummary { .. } => counts[2] += 1,
+                            StorageRecord::ContextCursor { .. } => counts[3] += 1,
+                            StorageRecord::SessionCatalog { .. } => counts[4] += 1,
+                            StorageRecord::PublicTurn { .. } => counts[5] += 1,
+                        }
+                    }
+                    export_a.verify_counts(
+                        counts[0], counts[1], counts[2], counts[3], counts[4], counts[5],
+                    )?;
+                    ensure!(
+                        export_a
+                            .verify_counts(
+                                counts[0] + 1,
+                                counts[1],
+                                counts[2],
+                                counts[3],
+                                counts[4],
+                                counts[5]
+                            )
+                            .is_err(),
+                        "remote export accepted a renderer count outside its captured provenance"
+                    );
+                    ensure!(
+                        counts[0] == 2
+                            && messages[0].contains("CAPTURED_USER")
+                            && messages[1].contains("CAPTURED_REPLY")
+                    );
+                    ensure!(records.iter().any(|record| matches!(record,
+                        StorageRecord::State { key, value, .. }
+                            if key == "export-state" && value == &json!("CAPTURED_STATE"))));
+                    let encoded = serde_json::to_string(&records)?;
+                    ensure!(
+                        !encoded.contains("LATER_LIVE")
+                            && !encoded.contains("LATER_STATE")
+                            && !encoded.contains("CANDIDATE_ONLY")
+                            && !encoded.contains("CANDIDATE_STATE"),
+                        "captured remote export leaked later or candidate rows"
+                    );
+                    ensure!(export_a.provenance() == &provenance);
+                    let live = memory.revision().await?;
+                    ensure!(reader.revision().await? == live);
+                    ensure!(memory.get("export-state").await? == Some(json!("LATER_STATE")));
+                    drop(export_b);
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                let abandoned = candidate.abandon().await;
+                drop(private);
+                drop(export_a);
+                changed?;
+                abandoned?;
+                memory
+                    .put("export-sibling-still-usable", &json!(true))
+                    .await?;
+                ensure!(reader.get("export-sibling-still-usable").await? == Some(json!(true)));
                 Ok(())
             },
         )

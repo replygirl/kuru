@@ -2,9 +2,11 @@
 
 ## 1. Existing native contracts
 
-- [ ] 1.1 Extend memory lifecycle/inspection/summary and portable hook-settlement fixtures; prove checked cleanup, one owner, durable isolated reads/writes, exact retry and no peer/public leakage.
-- [ ] 1.2 Extend existing delivery fixtures; retain exact profile destination and prove native failed-publication/cleanup refusal preserves owned evidence until successful retry, with actual recovery after stdin EOF.
-- [ ] 1.3 Port existing ToolHost MCP and hook contracts and extend terminal public-state/rendering tests; retain exact authorization, protocol, ownership, draft and privacy assertions.
+- [x] 1.1 Extend memory lifecycle/inspection/summary and portable hook-settlement fixtures; prove checked cleanup, one owner, durable isolated reads/writes, exact retry and no peer/public leakage.
+- [x] 1.2 Extend existing delivery fixtures; retain exact profile destination and prove native failed-publication/cleanup refusal preserves owned evidence until successful retry, with actual recovery after stdin EOF.
+- [x] 1.3 Port existing ToolHost MCP and hook contracts and extend terminal public-state/rendering tests; retain exact authorization, protocol, ownership, draft and privacy assertions.
+- [ ] 1.4 Verify rejected managed switch recovery retains the exact old claim; remote exports retain captured revision and reject foreign cursors without exposing later or candidate rows. Use existing managed owner/factory fixtures and await every claim/client/owner cleanup.
+- [ ] 1.5 Exercise existing public command/session contracts through ConPTY with completed frames and durable exact session state; verify hook cancellation while its native peer cannot consume the bounded request, output/privacy failures, and the original denied call/receipt reaching the next provider request without a file effect. Reuse existing helpers, bounds and cleanup scopes; add no production seams.
 
 ## 2. Verification
 
@@ -18,3 +20,7 @@ Observed locally: summary selection1/1, attached inspection1/1, lost hook reply1
 CI37870584478 exposed two new test mistakes: the hook test imported before the mandatory closing scope, and bootstrap recovery compared equivalent Windows receipt path spellings. Move the import inside the existing scope and compare concurrently retained native file identities before releasing both receipt handles for recovery. The unchanged cleanup-layout guard passes locally1/1; Windows-target lint and independent receipt-identity review pass. Native rerun and canonical95% results remain pending.
 
 Subsequent861811ef CI37872687339 passes the unchanged cleanup guard on Ubuntu, macOS and Windows x64/ARM; Ubuntu canonical167299/175911 passes95.10%. Bootstrap's native identity/restoration assertions now pass, but its last assertion incorrectly expects -Recover to retire the receipt. Stock bootstrap intentionally retains the verified rolled_back receipt until a fresh install. Correct the test to require the same operation/original evidence in that retained receipt and the absence of displaced/candidate/backup images. Windows-target lint and independent source-policy review pass; the corrected native recovery rerun and full Windows95% gate remain pending.
+
+Subsequent6ae691c2 CI37875015919 passes all eight Windows behavior/coverage partitions and corrected bootstrap recovery on x64/ARM. The actual canonical merge is164668/173739 (94.778950%), below95%; all eight original exports agree. Doctor381/461 includes the now-proven14/14 invocation-error group. Current full exports and source review identify the additional1.4/1.5 contracts before implementation; new gains require a fresh complete canonical merge, not prediction or changed inventory/gates.
+
+New scoped host acceptance: captured managed export1/1, exact rejected-switch recovery1/1, denied original tool call/error receipt1/1, and connector hooks17/17 pass. Application, memory, connector and runtime Windows-target lint pass. Independent source review verifies revision/cursor isolation, exact recovered authority, denied-effect/privacy receipts, cancellation before timeout, and exact public session IDs after fork/refusal/restore/restart. The switch check proves client-close/transfer and eventual checked teardown; it does not claim an owner EOF acknowledgement. New ConPTY and undrained Windows request execution require native CI and are unrun locally.

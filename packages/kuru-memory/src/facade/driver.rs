@@ -935,6 +935,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_managed_switch_recovery_reattaches_the_exact_old_claim() -> Result<()> {
+        kuru_memory::test_support::closing(async {
+            use super::super::managed_coverage_contract_tests::checked_owner_case;
+            use crate::service::rpc::ViewOperation;
+
+        checked_owner_case(
+            "rejected managed switch exact recovery",
+            async |memory, _reader, project, claims| {
+                for session in ["retained", "stale-target"] {
+                    memory.create_session(session, Mode::Ifs, session).await?;
+                }
+                let (bound, driver) = memory.bind_project_driver(project).await?;
+                claims.0.lock().unwrap().push((bound.clone(), driver.clone()));
+                let original = driver.select(target(memory, "retained").await?).await?;
+                bound.append_session_message("checked/switch/private", "retained",
+                    &Message::text("user", "OLD_PRIVATE_SENTINEL")).await?;
+                let stale = target(memory, "stale-target").await?;
+                let record = memory.session_catalog_record("stale-target").await?
+                    .context("switch target catalog absent")?;
+                memory.rename_session("stale-target", record.lifecycle_generation,
+                    "changed after capture").await?;
+                let revision = memory.revision().await?;
+                let selection = SessionDriverSelection {
+                    expected: Some(original.clone()),
+                    target: stale,
+                };
+                let id = Uuid::new_v4();
+                let factory = driver.inner.factory.as_ref().context("managed driver factory absent")?.clone();
+                // Retain the real old-session native lease across transfer and
+                // intentional original client close. It is released only after
+                // the transferred connection drops its claim.
+                let held = driver.invocation_hold()?;
+                let mut presence = Presence::Remote {
+                    attachment: Box::new(factory.connect().await?),
+                    factory: factory.clone(),
+                };
+                let checked = async {
+                    let Presence::Remote { attachment, .. } = &mut presence else {
+                        bail!("recovery presence must use checked native IPC")
+                    };
+                    let refusal = attachment.call_with_id(id,
+                        ServiceCall::SelectSessionDriver { selection: selection.clone() }).await
+                        .err().context("owner admitted the stale captured catalog")?;
+                    ensure!(refusal.downcast_ref::<SessionDriverRejected>()
+                        .is_some_and(|error| error.0 == SessionDriverRefusal::CatalogChanged),
+                        "stale switch lost its checked refusal: {refusal:#}");
+                    ensure!(attachment.has_definite_mutation_reply());
+                    let outcome = attachment.call(ServiceCall::SessionDriverOutcome {
+                        original_id: id,
+                        original_generation: original.service_generation.clone(),
+                        selection: selection.clone(),
+                    }).await?;
+                    ensure!(matches!(outcome,
+                        ServiceValue::SessionDriverOutcome(SessionDriverOutcome::NotSelected(Some(ref proof)))
+                            if proof == &original), "completed refused switch lost the exact old proof");
+                    ensure!(memory.revision().await? == revision);
+                    ensure!(driver.proof()? == Some(original.clone()));
+
+                    let recovered = exchange(&mut presence, id, &original.service_generation,
+                        &selection, true).await;
+                    ensure!(matches!(recovered, Completed::NotSelected(ref proof) if proof == &original),
+                        "checked recovery did not restore the unchanged old claim");
+                    driver.close().await?;
+                    // close acknowledges local disposal, not the owner's EOF
+                    // handler. This checks exact transfer after client close;
+                    // the fixture's final empty inventory and owner teardown
+                    // separately await eventual server-side cleanup.
+                    let inventory = memory.live_session_drivers().await?;
+                    ensure!(inventory.len() == 1 && inventory[0].proof == original,
+                        "transferred old claim differs after original client close");
+                    // Closing the original driver clears its published caller
+                    // proof. Publish only the exact proof returned by the real
+                    // reattachment, as normal selection publication does; the
+                    // closed original driver itself remains closed.
+                    let Completed::NotSelected(restored) = recovered else {
+                        bail!("checked recovery did not return an unchanged proof")
+                    };
+                    factory.publish_driver_proof(Some(restored))?;
+                    let Presence::Remote { attachment, .. } = &mut presence else {
+                        bail!("recovered presence must remain managed")
+                    };
+                    let append = |session: &str, text: &str| ServiceCall::View {
+                        candidate: None,
+                        operation: Box::new(ViewOperation::AppendSessionMessage {
+                            namespace: "checked/switch/private".into(),
+                            session_id: session.into(),
+                            message: Message::text("user", text),
+                        }),
+                    };
+                    ensure!(attachment.call(append("stale-target", "FORBIDDEN_TARGET_SENTINEL"))
+                        .await.is_err(), "restored old proof authorized the target session");
+                    ensure!(memory.revision().await? == revision);
+                    ensure!(memory.session_history_window("checked/switch/private", "retained", 8)
+                        .await?.messages == [Message::text("user", "OLD_PRIVATE_SENTINEL")]);
+                    ensure!(memory.session_history_window("checked/switch/private", "stale-target", 8)
+                        .await?.messages.is_empty());
+                    ensure!(matches!(attachment.call(append("retained", "OLD_CLAIM_SURVIVED")).await?,
+                        ServiceValue::Unit));
+                    ensure!(memory.session_history_window("checked/switch/private", "retained", 8)
+                        .await?.messages == [Message::text("user", "OLD_PRIVATE_SENTINEL"),
+                            Message::text("user", "OLD_CLAIM_SURVIVED")]);
+                    ensure!(memory.session_history_window("checked/switch/private", "stale-target", 8)
+                        .await?.messages.is_empty());
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+                // Drop the actual checked connection before its native lease,
+                // on failure as well as success. The enclosing owner fixture
+                // closes the registered original driver/client and reaps.
+                drop(presence);
+                let original_closed = driver.close().await;
+                let released = async {
+                    while !memory.live_session_drivers().await?.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+                drop(held);
+                checked?;
+                original_closed?;
+                released
+            },
+        ).await
+        }).await
+    }
+
+    #[tokio::test]
     async fn refused_selection_releases_worker_lease_before_caller_returns() -> Result<()> {
         kuru_memory::test_support::closing(async {
             use std::{

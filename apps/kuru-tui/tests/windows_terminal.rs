@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -659,6 +659,268 @@ impl Drop for ProviderServer {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_session_controls_share_cli_identity_and_public_history() -> Result<()> {
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let _serial = SERIAL.lock().await;
+    let sandbox = Sandbox::warmed().await?;
+    let outcome = async {
+        let cli_action = |args: &[&str]| -> Result<Value> {
+            let output = BlockingCommand::new(env!("CARGO_BIN_EXE_kuru"))
+                .args(sandbox.args("demo"))
+                .args(["-c", "max_rounds=1"])
+                .args(args)
+                .env_clear()
+                .envs(&sandbox.environment)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(serde_json::from_slice(&output.stdout)?)
+        };
+        let created = cli_action(&["run", "NATIVE-SESSION-ORIGIN", "--json"])?;
+        let source = created["session"]
+            .as_str()
+            .context("CLI source session missing")?
+            .to_owned();
+        ensure!(cli_action(&["sessions", "rename", &source, "CLI-LABEL"])?["session_id"] == source);
+        let catalog = cli_action(&["sessions"])?;
+        let source_record = catalog
+            .as_array()
+            .context("CLI catalog is not an array")?
+            .iter()
+            .find(|row| row["id"] == source)
+            .context("CLI source is absent")?;
+        let source_node = source_record["head_node_id"]
+            .as_str()
+            .context("source head missing")?
+            .to_owned();
+
+        // Command dispatch must not run an inference turn. Unexpected requests
+        // are counted and fail closed, while the real model catalog remains
+        // available to the application's ordinary provider initialization.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let router = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let counted = Arc::clone(&counted);
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = sandbox.root.join("session-controls.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "api_base='http://{}/v1'\napi_key_env='KURU_NATIVE_CONTROL_KEY'\nmax_rounds=1\n",
+                listener.local_addr()?
+            ),
+        )?;
+        let _server = ProviderServer(tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        }));
+        let config_path = config
+            .to_str()
+            .context("fixture config path is not UTF-8")?;
+        let mut terminal = sandbox.start(
+            "session-controls",
+            "app",
+            &[
+                "--model",
+                "fixture",
+                "--mode",
+                "freudian",
+                "--config",
+                config_path,
+                "--resume",
+                &source,
+            ],
+            true,
+            "responses",
+            &[("KURU_NATIVE_CONTROL_KEY", "fixture")],
+        )?;
+        terminal.frame_text(&["NATIVE-SESSION-ORIGIN", "enter send"], sandbox.startup)?;
+        let submit = |terminal: &mut Terminal, command: &str| -> Result<()> {
+            terminal.frame_text(&["enter send"], READY)?;
+            terminal.committed_text(command)?;
+            terminal.composer(command)?;
+            terminal.committed_key(KeyCode::Enter, KeyModifiers::NONE)
+        };
+        for (command, result) in [
+            ("/file-checkpoints", "[]"),
+            ("/file-inspect missing-id", "file checkpoint does not exist"),
+            ("/file-prune missing-id", "file checkpoint does not exist"),
+            ("/file-undo missing-id", "file checkpoint does not exist"),
+            ("/memory-candidates", "\"candidates\": []"),
+            (
+                "/memory-candidate-status",
+                "usage: /memory-candidate-status BRANCH",
+            ),
+            (
+                "/memory-candidate-abandon",
+                "usage: /memory-candidate-abandon BRANCH BASE HEAD",
+            ),
+        ] {
+            submit(&mut terminal, command)?;
+            terminal.frame_text(&[result, "enter send"], READY)?;
+            ensure!(
+                !terminal.screen().contains("Unknown command"),
+                "registered command was not dispatched: {command}"
+            );
+        }
+
+        submit(
+            &mut terminal,
+            &format!("/session-rename {source} NATIVE-LABEL"),
+        )?;
+        terminal.text(&["Sessions", "NATIVE-LABEL"], READY)?;
+        terminal.committed_key(KeyCode::Esc, KeyModifiers::NONE)?;
+        terminal.frame_text(&["enter send"], READY)?;
+        let catalog = cli_action(&["sessions"])?;
+        ensure!(
+            catalog
+                .as_array()
+                .context("renamed catalog is not an array")?
+                .iter()
+                .any(|row| row["id"] == source && row["label"] == "NATIVE-LABEL")
+        );
+
+        submit(&mut terminal, &format!("/session-boundaries {source}"))?;
+        terminal.text(&["Settled boundaries"], READY)?;
+        terminal.committed_key(KeyCode::Enter, KeyModifiers::NONE)?;
+        terminal.frame_text(
+            &[
+                "current project memory remains shared",
+                "NATIVE-SESSION-ORIGIN",
+                "enter send",
+            ],
+            READY,
+        )?;
+        let catalog = cli_action(&["sessions"])?;
+        let child = catalog
+            .as_array()
+            .context("forked catalog is not an array")?
+            .iter()
+            .find(|row| {
+                row["id"] != source && row["fork_provenance"]["source_session_id"] == source
+            })
+            .context("native fork is missing from CLI catalog")?;
+        ensure!(child["fork_provenance"]["source_node_id"] == source_node);
+        let child_id = child["id"]
+            .as_str()
+            .context("native child ID missing")?
+            .to_owned();
+        submit(&mut terminal, "/status")?;
+        terminal.frame_text(&[&format!("Session: {child_id}"), "enter send"], READY)?;
+
+        // The child owns the active claim, so removing its source must preserve
+        // the child's public history and refuse a direct resume until restore.
+        submit(&mut terminal, &format!("/session-remove {source}"))?;
+        terminal.text(&["Sessions", "NATIVE-LABEL", "removed"], READY)?;
+        terminal.committed_key(KeyCode::Esc, KeyModifiers::NONE)?;
+        terminal.frame_text(&["enter send"], READY)?;
+        ensure!(
+            cli_action(&["sessions"])?
+                .as_array()
+                .context("active catalog is not an array")?
+                .iter()
+                .all(|row| row["id"] != source)
+        );
+        submit(&mut terminal, &format!("/resume {source}"))?;
+        terminal.frame_text(
+            &[
+                "session is removed; restore it before resuming",
+                "enter send",
+            ],
+            READY,
+        )?;
+        // Clear only visible history so an earlier child status cannot satisfy
+        // this check of the active claim after the refused source resume.
+        submit(&mut terminal, "/clear")?;
+        terminal.frame_text(
+            &["View cleared · stored history unchanged", "enter send"],
+            READY,
+        )?;
+        submit(&mut terminal, "/status")?;
+        terminal.frame_text(&[&format!("Session: {child_id}"), "enter send"], READY)?;
+        submit(&mut terminal, &format!("/session-restore {source}"))?;
+        terminal.text(&["Sessions", "NATIVE-LABEL"], READY)?;
+        terminal.committed_key(KeyCode::Esc, KeyModifiers::NONE)?;
+        terminal.frame_text(&["enter send"], READY)?;
+        submit(&mut terminal, &format!("/resume {source}"))?;
+        terminal.frame_text(&["NATIVE-SESSION-ORIGIN", "enter send"], READY)?;
+        submit(&mut terminal, "/status")?;
+        terminal.frame_text(&[&format!("Session: {source}"), "enter send"], READY)?;
+        submit(&mut terminal, "/export native-session-export.md")?;
+        terminal.frame_text(&["Exported public session", "enter send"], READY)?;
+        let exported = std::fs::read_to_string(sandbox.project.join("native-session-export.md"))?;
+        ensure!(exported.contains("NATIVE-SESSION-ORIGIN"));
+        ensure!(
+            requests.load(Ordering::SeqCst) == 0,
+            "session controls dispatched an inference turn"
+        );
+        submit(&mut terminal, "/quit")?;
+        ensure!(terminal.finish(EXIT)?["status"] == 0);
+        drop(terminal);
+
+        let mut reopened = sandbox.start(
+            "session-controls-reopened",
+            "app",
+            &[
+                "--model",
+                "fixture",
+                "--mode",
+                "freudian",
+                "--config",
+                config_path,
+                "--resume",
+                &child_id,
+            ],
+            true,
+            "responses",
+            &[("KURU_NATIVE_CONTROL_KEY", "fixture")],
+        )?;
+        reopened.frame_text(&["NATIVE-SESSION-ORIGIN", "enter send"], sandbox.startup)?;
+        submit(&mut reopened, "/status")?;
+        reopened.frame_text(&[&format!("Session: {child_id}"), "enter send"], READY)?;
+        submit(&mut reopened, "/sessions")?;
+        reopened.text(&["Sessions", "NATIVE-LABEL", &child_id], READY)?;
+        reopened.committed_key(KeyCode::Esc, KeyModifiers::NONE)?;
+        reopened.frame_text(&["enter send"], READY)?;
+        let catalog = cli_action(&["sessions"])?;
+        ensure!(
+            catalog
+                .as_array()
+                .context("reopened catalog is not an array")?
+                .iter()
+                .any(|row| row["id"] == source && row["label"] == "NATIVE-LABEL")
+        );
+        submit(&mut reopened, "/quit")?;
+        ensure!(reopened.finish(EXIT)?["status"] == 0);
+        drop(reopened);
+        ensure!(requests.load(Ordering::SeqCst) == 0);
+        Ok(())
+    }
+    .await;
+    sandbox.release(outcome)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
