@@ -607,9 +607,10 @@ async fn acceptance(root: &Path) -> Result<()> {
             exact_install(&keg, &old_binary, old_support.as_ref(), &previous.archive)?;
             let mut old_runtime = Offline::new(&root.join("old-runtime"), keg.join("bin/kuru"), cellar.clone())?;
             let old_session = old_runtime.conversation().await?;
-            commit_formula(&git, &repository, &local_formula(&formula, &base)?).await?;
             let tap_repository = PathBuf::from(text(brew(&["--repository", &tap], root).await?)?);
-            ensure!(git.git(&tap_repository, &["pull", "--ff-only"]).await.status.success(), "fixture tap fast-forward failed");
+            // Advance only this owned tap's formula. Plain add/commit retain
+            // the fixture's childless Git audit; brew performs the real upgrade.
+            commit_formula(&git, &tap_repository, &local_formula(&formula, &base)?).await?;
             brew(&["upgrade", "--formula", &full_name], root).await?;
             old_runtime.binary = cellar.join("kuru").join(version.to_string()).join("bin/kuru");
             let resumed = old_runtime.run(&["--resume", &old_session, "run", "Continue the conversation after Homebrew upgrade", "--json"]).await?;

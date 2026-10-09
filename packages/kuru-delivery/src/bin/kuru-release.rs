@@ -241,7 +241,12 @@ async fn execute(root: &Path, action: Action) -> Result<()> {
             output,
         } => {
             let hashes = release::verified_assets(&directory, version)?;
-            std::fs::write(output, homebrew::generate(version, &repository, &hashes)?)?;
+            let formula = homebrew::generate(version, &repository, &hashes)?;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)?
+                .write_all(formula.as_bytes())?;
         }
         Action::HomebrewPublish { version, sha } => {
             let source = github()?;

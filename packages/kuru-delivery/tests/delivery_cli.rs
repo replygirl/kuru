@@ -723,13 +723,50 @@ async fn release_cli_generates_exact_read_only_homebrew_formula_and_rejects_inva
     }
     assert!(!formula.contains("windows"));
     assert_eq!(release_snapshot(&fixture.release), original);
+    // Even a valid candidate cannot authorize replacing an existing generated
+    // file or an alias to any of its already verified inputs.
+    let manifest = fixture.release.join("SHA256SUMS");
+    let core = fixture.archive();
+    let core_identity = files::identity(&core);
+    let manifest_identity = files::identity(&manifest);
+    let hardlink = fixture.root.path().join("archive hardlink.rb");
+    fs::hard_link(&core, &hardlink).unwrap();
+    let linked = fixture.root.path().join("manifest symlink.rb");
+    symlink(&manifest, &linked).unwrap();
+    let sentinel = fixture.root.path().join("existing formula.rb");
+    fs::write(&sentinel, b"existing output sentinel").unwrap();
+    for output in [
+        &formula_path,
+        &sentinel,
+        &manifest,
+        &core,
+        &hardlink,
+        &linked,
+    ] {
+        let result = run_release(generate("replygirl/kuru", output)).await;
+        assert!(
+            !result.status.success(),
+            "replaced existing output {output:?}"
+        );
+        assert_eq!(release_snapshot(&fixture.release), original);
+        assert_eq!(fs::read_to_string(&formula_path).unwrap(), formula);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"existing output sentinel");
+        assert_eq!(files::identity(&core), core_identity);
+        assert_eq!(files::identity(&manifest), manifest_identity);
+        assert_eq!(files::identity(&hardlink), core_identity);
+        assert!(
+            fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
     failure(
         &run_release(generate("unrelated/repository", &formula_path)).await,
         "assets must come from replygirl/kuru",
     );
     assert_eq!(fs::read_to_string(&formula_path).unwrap(), formula);
     let rejected_output = fixture.root.path().join("rejected.rb");
-    let manifest = fixture.release.join("SHA256SUMS");
     fs::write(&manifest, b"malformed checksum manifest\n").unwrap();
     let malformed = release_snapshot(&fixture.release);
     failure(

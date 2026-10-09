@@ -41,3 +41,12 @@ runs in ordinary native Linux x64/macOS installation CI and Linux ARM build CI,
 with the actual native executable and explicit foreign archive-shape fixtures.
 The Release workflow retains the complete real candidate route. Native Homebrew
 and exact branch CI results remain pending; they are not claimed as passed.
+
+The initial source PR run 38003428408 confirms Linux x64/ARM64 previous-release
+installation, exact installed bytes and offline durable reopen, then fails in the
+fixture at an unsupported `git pull`: its deliberately childless Git audit rejects
+Git's transport children. The fixture now commits the candidate formula directly
+into its owned tap before the real Homebrew upgrade; the shared audit remains
+unchanged. Complete install/upgrade acceptance is still pending the corrected CI.
+Formula CLI regressions also prove create-only output cannot truncate a verified
+manifest/archive through a direct path, hardlink or symlink; 66 focused tests pass.
