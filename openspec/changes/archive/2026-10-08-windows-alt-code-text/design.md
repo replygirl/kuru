@@ -20,7 +20,7 @@ Require exactly one U+0301 Press and one Release, exact filtered draft bytes, un
 
 ## Risks / Trade-offs
 
-Actual native execution must prove protocol recognition and command behavior; cross-target lint is not native evidence. Supplementary characters use UTF-16 units as the documented wire requires. No key-pair/focus heuristic is introduced.
+Actual native execution must prove protocol recognition and command behavior; cross-target lint is not native evidence. The committed-text fixture deliberately accepts BMP characters only; supplementary characters are outside this scenario and rejected before transport. No key-pair/focus heuristic is introduced.
 
 ## Sources
 

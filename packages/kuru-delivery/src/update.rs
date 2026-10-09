@@ -1617,4 +1617,92 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn displaced_image_sharing_retains_cleanup_evidence_until_checked_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let mut fixture = Fixture::new();
+        let (adjacent, adjacent_image) =
+            write_new(&fixture.parent, "adjacent", b"unrelated bytes", false).unwrap();
+        drop(adjacent);
+        publish(&fixture.state, &mut fixture.receipt, &mut |_, _| Ok(())).unwrap();
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(fixture.parent.path().join(&fixture.receipt.displaced))
+            .unwrap();
+        let first = cleanup(&fixture.state, &mut fixture.receipt);
+        let pending = load(&fixture.state).unwrap().unwrap();
+        let displaced = image(&mut blocker.try_clone().unwrap()).unwrap();
+        let backup = verified(&fixture.state, &pending.backup, &pending.rollback).is_ok();
+        let replacement = verified(&fixture.parent, "kuru.exe", &pending.replacement).is_ok();
+        drop(blocker);
+        let retry = recover(&fixture.state, &mut fixture.receipt);
+        let completed = load(&fixture.state).unwrap().unwrap();
+
+        first.unwrap();
+        assert_eq!(pending.phase, Phase::CleanupPending);
+        assert_eq!(pending.operation, completed.operation);
+        assert_eq!(displaced.identity, pending.original.identity);
+        assert_eq!(displaced.sha256, pending.original.sha256);
+        assert!(backup && replacement);
+        retry.unwrap();
+        assert_eq!(completed.phase, Phase::Complete);
+        drop(verified(&fixture.parent, "kuru.exe", &pending.replacement).unwrap());
+        drop(verified(&fixture.parent, "adjacent", &adjacent_image).unwrap());
+        assert!(absent(&fixture.parent, &pending.displaced).unwrap());
+        assert!(absent(&fixture.state, &pending.backup).unwrap());
+    }
+
+    #[test]
+    fn receipt_sharing_refusal_preserves_durable_identity_and_removes_only_its_draft() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let mut fixture = Fixture::new();
+        fixture.move_old();
+        fixture.receipt.phase = Phase::OldMoved;
+        let path = fixture.state.path().join(RECEIPT);
+        let before = std::fs::read(&path).unwrap();
+        let blocker = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        let identity = regular_file_info(&blocker).unwrap().identity;
+        let inventory = || {
+            let mut names = std::fs::read_dir(fixture.state.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let original_inventory = inventory();
+        let refused = save(&fixture.state, &fixture.receipt);
+        let unchanged_bytes = std::fs::read(&path).unwrap();
+        let unchanged_identity =
+            regular_file_info(&fixture.state.read(OsStr::new(RECEIPT)).unwrap())
+                .unwrap()
+                .identity;
+        let refused_inventory = inventory();
+        drop(blocker);
+        let retry = save(&fixture.state, &fixture.receipt);
+        let published = load(&fixture.state).unwrap().unwrap();
+
+        assert!(
+            refused.is_err(),
+            "DELETE sharing must refuse receipt replacement"
+        );
+        assert_eq!(unchanged_bytes, before);
+        assert_eq!(unchanged_identity, identity);
+        assert_eq!(refused_inventory, original_inventory);
+        retry.unwrap();
+        assert_eq!(published.phase, Phase::OldMoved);
+        assert_eq!(published.operation, fixture.receipt.operation);
+        drop(verified(&fixture.parent, &published.displaced, &published.original).unwrap());
+        drop(verified(&fixture.state, &published.candidate, &published.replacement).unwrap());
+        drop(verified(&fixture.state, &published.backup, &published.rollback).unwrap());
+        assert!(absent(&fixture.parent, "kuru.exe").unwrap());
+    }
 }

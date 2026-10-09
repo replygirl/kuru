@@ -14780,3 +14780,154 @@ mod tests {
         store.close().await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod summary_selection_contract_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn one_axis_summary_selection_preserves_exact_admitted_boundaries_and_revision()
+    -> Result<()> {
+        crate::test_support::closing(async {
+            let store = MemoryStore::temporary().await?;
+            let observed = async {
+                let actor = "project/summary-selection/actor";
+                let summary_namespace = "project/summary-selection/admitted-summaries";
+                let source_a = "project/summary-selection/raw-a";
+                let source_b = "project/summary-selection/raw-b";
+                let cases = [
+                    (
+                        actor,
+                        "session-a",
+                        source_a,
+                        summary_namespace,
+                        "a-source-a",
+                    ),
+                    (
+                        actor,
+                        "session-a",
+                        source_b,
+                        summary_namespace,
+                        "a-source-b",
+                    ),
+                    (
+                        actor,
+                        "session-b",
+                        source_a,
+                        summary_namespace,
+                        "b-source-a",
+                    ),
+                    (
+                        "project/summary-selection/other",
+                        "session-a",
+                        source_a,
+                        summary_namespace,
+                        "other-actor",
+                    ),
+                    (
+                        actor,
+                        "session-c",
+                        source_a,
+                        "project/summary-selection/other-summaries",
+                        "other-namespace",
+                    ),
+                ];
+                for (_, session, source, _, text) in cases {
+                    store
+                        .append_session_message(source, session, &Message::text("user", text))
+                        .await?;
+                }
+                for (selected_actor, session, source, summary, text) in cases {
+                    let snapshot = store
+                        .session_source_snapshot(selected_actor, session, source, 0, 16)
+                        .await?;
+                    let record = ContextSummaryRecord {
+                        actor_namespace: selected_actor.into(),
+                        session_id: session.into(),
+                        source_namespace: source.into(),
+                        summary_namespace: summary.into(),
+                        source_view: snapshot.view,
+                        source_revision: snapshot.revision,
+                        after_sequence: snapshot.after_exclusive,
+                        through_sequence: snapshot
+                            .through_inclusive
+                            .context("summary source boundary missing")?,
+                        turn_id: Some(format!("turn-{text}")),
+                        operation_id: None,
+                        producer_actor_id: None,
+                        invocation_id: format!("invocation-{text}"),
+                        summary: text.into(),
+                    };
+                    store
+                        .checkpoint_context_summary(&ContextSummaryCheckpoint {
+                            record,
+                            private_reasoning: Vec::new(),
+                        })
+                        .await?;
+                }
+                let revision = store.revision().await?;
+                for (session, source, expected) in [
+                    (Some("session-a"), None, vec!["a-source-a", "a-source-b"]),
+                    (None, Some(source_a), vec!["a-source-a", "b-source-a"]),
+                ] {
+                    let window = store
+                        .context_summary_window(actor, summary_namespace, session, source, 16)
+                        .await?;
+                    let mut text = window
+                        .records
+                        .iter()
+                        .map(|item| item.record.summary.as_str())
+                        .collect::<Vec<_>>();
+                    text.sort_unstable();
+                    ensure!(
+                        text == expected,
+                        "one-axis summary projection escaped its admitted boundary: {text:?}"
+                    );
+                    ensure!(
+                        window.total_rows == 2
+                            && window.view == "main"
+                            && window.revision == revision
+                    );
+                    ensure!(
+                        window.session_id.as_deref() == session
+                            && window.source_namespace.as_deref() == source
+                    );
+                    ensure!(
+                        window
+                            .records
+                            .iter()
+                            .all(|item| item.record.actor_namespace == actor
+                                && item.record.summary_namespace == summary_namespace)
+                    );
+                    let count = store
+                        .context_summary_window(actor, summary_namespace, session, source, 0)
+                        .await?;
+                    ensure!(count.total_rows == 2 && count.records.is_empty());
+                }
+                ensure!(
+                    store
+                        .context_summary_window(
+                            actor,
+                            summary_namespace,
+                            Some("session-a"),
+                            None,
+                            MAX_SESSION_SOURCE_ROWS + 1
+                        )
+                        .await
+                        .is_err(),
+                    "oversized summary window was admitted"
+                );
+                ensure!(
+                    store.revision().await? == revision,
+                    "summary inspection changed durable state"
+                );
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            let closed = store.close().await;
+            observed?;
+            closed
+        })
+        .await
+    }
+}

@@ -114,6 +114,9 @@ and checks an immutable snapshot before exposing fixture aliases. This is test
 scaffolding, already outside cargo-llvm-cov's default measured source scope.
 Real application children still inherit the runner's `LLVM_PROFILE_FILE`, and
 application instrumentation, strict profile export and the 95% gate are unchanged.
+After checked cleanup, CLI commands return their status through Rust's standard
+`ExitCode`. Ordinary main termination lets LLVM's registered exit handler write
+child profiles on Windows; immediate `ExitProcess` termination bypasses it.
 
 The failure also reports recorded writer candidates for each changed profile.
 A raw profile is named

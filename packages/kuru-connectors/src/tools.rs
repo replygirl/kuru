@@ -2542,7 +2542,6 @@ mod tests {
     use super::*;
     use crate::shell_diagnostic::{ShellCapture, ShellFailureCategory, failure as shell_failure};
     use crate::test_support::{HttpFixture, Reply, drain_bounded};
-    #[cfg(unix)]
     use crate::test_support::{StdioFixture, Step};
     use kuru_core::{McpConfig, PermissionAction, PermissionRule};
 
@@ -4291,7 +4290,6 @@ mod tests {
         assert_eq!(error.chain().count(), 1);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn toolhost_stdio_mcp_projects_application_success_and_protocol_results() {
         const SECRET: &str = "sk-abcdefghijklmnop";
@@ -4390,7 +4388,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn central_permission_gate_denies_stdio_mcp_before_tools_call() {
         let peer = StdioFixture::new([
@@ -4456,7 +4453,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn foreground_once_approval_dispatches_stdio_mcp_tool_call() {
         let peer = StdioFixture::new([

@@ -1108,6 +1108,99 @@ async fn normal_bootstrap_recovers_genuine_missing_path_crash_gap_before_install
 }
 
 #[tokio::test]
+async fn observer_stdin_eof_after_old_move_recovers_exact_original_identity() -> anyhow::Result<()>
+{
+    use anyhow::{Context, ensure};
+    use tokio::io::AsyncBufReadExt;
+
+    let fixture = Fixture::new();
+    let installed = fixture.install.join("kuru.exe");
+    let original = regular_file_info(&fs::File::open(&installed)?)?.identity;
+    let adjacent = fixture.install.join("adjacent");
+    fs::write(&adjacent, b"unrelated bytes")?;
+    let mut spec = NativeSpawnSpec::new(installed.clone(), fixture.install.clone());
+    spec.args = vec![
+        "crash-gap".into(),
+        fixture.candidate.clone().into(),
+        fixture.root.path().join("trusted helper cache").into(),
+    ];
+    spec.environment = fixture.environment();
+    spec.stdin = Stdio::Pipe;
+    spec.stdout = Stdio::Pipe;
+    spec.stderr = Stdio::Pipe;
+    let mut child = spec.spawn().await?;
+    let mut input = child.take_stdin().context("crash-gap lifetime input")?;
+    let mut stdout = child.take_stdout().context("crash-gap acknowledgment")?;
+    let mut stderr = child.take_stderr().context("crash-gap diagnostics")?;
+    let bound = launch_budget::until_job_deadline();
+    let operation = async {
+        let mut marker = Vec::new();
+        tokio::time::timeout(bound, async {
+            let mut reader = tokio::io::BufReader::new((&mut stdout).take(65537));
+            reader.read_until(b'\n', &mut marker).await
+        })
+        .await
+        .context("crash-gap acknowledgment deadline")??;
+        ensure!(marker.len() <= 65536 && marker.last() == Some(&b'\n'));
+        let marker: serde_json::Value = serde_json::from_slice(&marker)?;
+        ensure!(
+            marker["ready"] == "old_moved",
+            "unexpected marker: {marker}"
+        );
+        // Only the completed durable move acknowledgment authorizes EOF.
+        input.close(Duration::from_secs(10)).await?;
+        let mut diagnostic = Vec::new();
+        let mut bounded_stderr = (&mut stderr).take(65537);
+        let (status, read) = tokio::join!(
+            child.wait(bound),
+            tokio::time::timeout(bound, bounded_stderr.read_to_end(&mut diagnostic))
+        );
+        let status = status?;
+        read.context("crash-gap diagnostic EOF deadline")??;
+        ensure!(
+            diagnostic.len() <= 65536,
+            "crash-gap diagnostic exceeds bounds"
+        );
+        Ok::<_, anyhow::Error>((marker, status, diagnostic))
+    }
+    .await;
+    let termination = operation.is_err().then(|| child.terminate());
+    let input_close = input.close(Duration::from_secs(10)).await;
+    let stdout_close = stdout.close(Duration::from_secs(10)).await;
+    let stderr_close = stderr.close(Duration::from_secs(10)).await;
+    let reaped = child.wait(Duration::from_secs(10)).await;
+    let cleanup = format!(
+        "terminate={termination:?}; input={input_close:?}; stdout={stdout_close:?}; stderr={stderr_close:?}; reap={reaped:?}"
+    );
+    let (marker, status, diagnostic) = operation.context(cleanup)?;
+    input_close?;
+    stdout_close?;
+    stderr_close?;
+    reaped?;
+
+    let receipt_path = fixture.install.join(".kuru-update/receipt.json");
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+    let name = receipt["displaced"].as_str().context("displaced name")?;
+    kuru_platform::fs::validate_component(OsStr::new(name))?;
+    let displaced = fixture.install.join(name);
+    let displaced_identity = regular_file_info(&fs::File::open(&displaced)?)?.identity;
+    let displaced_bytes = fs::read(&displaced)?;
+    let missing = !installed.try_exists()?;
+    let recovery = fixture.run(fixture.command().arg("-Recover")).await;
+
+    ensure!(!status.success(), "EOF interruption unexpectedly succeeded");
+    ensure!(String::from_utf8_lossy(&diagnostic).contains("failed to fill whole buffer"));
+    ensure!(marker["receipt"] == receipt_path.to_string_lossy().as_ref());
+    ensure!(missing && displaced_identity == original && displaced_bytes == fixture.original);
+    success(&recovery);
+    fixture.unchanged();
+    ensure!(regular_file_info(&fs::File::open(&installed)?)?.identity == original);
+    ensure!(!receipt_path.try_exists()? && !displaced.try_exists()?);
+    ensure!(fs::read(adjacent)? == b"unrelated bytes");
+    Ok(())
+}
+
+#[tokio::test]
 async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_helper() {
     let fixture = Fixture::new();
     let identity = regular_file_info(&fs::File::open(fixture.install.join("kuru.exe")).unwrap())

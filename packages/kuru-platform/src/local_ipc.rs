@@ -269,9 +269,16 @@ mod refusal_contracts {
             io::ErrorKind::NotFound
         );
         let endpoint = path.join("stale.sock");
-        let native = bind_listener(&endpoint).unwrap();
-        fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
-        drop(native);
+        {
+            let _spawning = crate::unix::spawn_lock();
+            let native = UnixSocket::new_stream().unwrap();
+            native.bind(&endpoint).unwrap();
+            // Never listen: even a temporary forked copy must not accept a
+            // connection before closing and turn refusal into peer reset.
+            fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
+            drop(native);
+        }
+        let stale = fs::symlink_metadata(&endpoint).unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(5),
             connect(&directory, OsStr::new("stale.sock")),
@@ -280,12 +287,9 @@ mod refusal_contracts {
         .unwrap()
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
-        assert!(
-            fs::symlink_metadata(&endpoint)
-                .unwrap()
-                .file_type()
-                .is_socket()
-        );
+        let retained = fs::symlink_metadata(&endpoint).unwrap();
+        assert!(retained.file_type().is_socket());
+        assert_eq!((retained.dev(), retained.ino()), (stale.dev(), stale.ino()));
         assert!(
             PrivateServiceListener::bind_at(
                 Directory::ensure_private(&path).unwrap(),
@@ -293,6 +297,8 @@ mod refusal_contracts {
             )
             .is_err()
         );
+        let retained = fs::symlink_metadata(&endpoint).unwrap();
+        assert_eq!((retained.dev(), retained.ino()), (stale.dev(), stale.ino()));
         assert_eq!(fs::read(path.join("adjacent")).unwrap(), b"unchanged");
     }
 

@@ -1,11 +1,11 @@
 #[cfg(not(windows))]
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<std::process::ExitCode> {
     finish_dispatch(Box::pin(dispatch()).await)
 }
 
 #[cfg(windows)]
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<std::process::ExitCode> {
     const DISPATCH_STACK_BYTES: usize = 8 * 1024 * 1024;
 
     let worker = std::thread::Builder::new()
@@ -25,7 +25,7 @@ async fn windows_dispatch() -> anyhow::Result<()> {
     Box::pin(dispatch()).await
 }
 
-fn finish_dispatch(result: anyhow::Result<()>) -> anyhow::Result<()> {
+fn finish_dispatch(result: anyhow::Result<()>) -> anyhow::Result<std::process::ExitCode> {
     if let Err(error) = &result
         && let Some(code) = kuru::cli::headless_exit_code(error)
             .or_else(|| kuru::cli::canary_exit_code(error))
@@ -34,9 +34,9 @@ fn finish_dispatch(result: anyhow::Result<()>) -> anyhow::Result<()> {
         // All authority cleanup completed before the CLI returned this typed
         // status. Only a stdout/stdin-only OS thread may remain kernel-blocked.
         eprintln!("Error: {error:#}");
-        std::process::exit(code);
+        return Ok(std::process::ExitCode::from(u8::try_from(code)?));
     }
-    result
+    result.map(|()| std::process::ExitCode::SUCCESS)
 }
 
 async fn dispatch() -> anyhow::Result<()> {

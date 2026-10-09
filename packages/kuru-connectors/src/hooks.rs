@@ -1451,6 +1451,134 @@ mod tests {
         }
     }
 
+    fn response_command(response: Value) -> HookCommand {
+        let text = response.to_string();
+        #[cfg(unix)]
+        return command(&format!(
+            "cat >/dev/null; printf '%s' '{}'",
+            text.replace('\'', "'\\''")
+        ));
+        #[cfg(windows)]
+        return windows_command(&format!(
+            "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('{}')",
+            text.replace('\'', "''")
+        ));
+    }
+
+    #[tokio::test]
+    async fn speaker_hooks_observe_stop_and_reject_invalid_decisions_before_later_launch() {
+        #[cfg(windows)]
+        warm_hook_launch().await;
+        for response in [
+            serde_json::json!({"decision":"observe"}),
+            serde_json::json!({"decision":"stop"}),
+            serde_json::json!({"decision":"stop","reason":"api_key=fixture-secret safe stop"}),
+            serde_json::json!({"decision":"allow"}),
+            serde_json::json!({"decision":"deny"}),
+            serde_json::json!({"decision":"rewrite","value":{"input":"wrong event"}}),
+            serde_json::json!({"decision":"annotate","annotation":"wrong event"}),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            let later = command(
+                "cat >/dev/null; : > speaker-later; printf '%s' '{\"decision\":\"observe\"}'",
+            );
+            #[cfg(windows)]
+            let later = windows_command(
+                r#"$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText('speaker-later', ''); [Console]::Out.Write('{"decision":"observe"}')"#,
+            );
+            let host = host_with_hooks(
+                root.path(),
+                LifecycleHooks {
+                    speaker_selected: vec![response_command(response.clone()), later],
+                    ..LifecycleHooks::default()
+                },
+            );
+            let budget = host.budget();
+            let run = host
+                .run_speaker(
+                    &budget,
+                    "invocation",
+                    "actor",
+                    Some("turn"),
+                    &serde_json::json!({"speaker":"actor"}),
+                )
+                .await;
+            host.quiesce().await.unwrap();
+            match response["decision"].as_str().unwrap() {
+                "observe" => {
+                    assert_eq!(run.outcome.unwrap(), SpeakerHookOutcome::Continue);
+                    assert_eq!(
+                        run.observations,
+                        vec![
+                            observation(HookEvent::SpeakerSelected, 0, HookOutcomeKind::Observed),
+                            observation(HookEvent::SpeakerSelected, 1, HookOutcomeKind::Observed)
+                        ]
+                    );
+                    assert!(root.path().join("speaker-later").is_file());
+                    assert_eq!(budget.snapshot().2, 2);
+                }
+                "stop" => {
+                    let SpeakerHookOutcome::Stop(reason) = run.outcome.unwrap() else {
+                        panic!("stop hook continued")
+                    };
+                    assert!(!reason.contains("fixture-secret"));
+                    if response.get("reason").is_none() {
+                        assert_eq!(reason, "hook stopped speaker dispatch");
+                    }
+                    assert_eq!(
+                        run.observations,
+                        vec![observation(
+                            HookEvent::SpeakerSelected,
+                            0,
+                            HookOutcomeKind::Stopped
+                        )]
+                    );
+                    assert!(!root.path().join("speaker-later").exists());
+                    assert_eq!(budget.snapshot().2, 1);
+                }
+                _ => {
+                    assert_eq!(
+                        run.outcome.unwrap_err().to_string(),
+                        "hook returned an invalid decision"
+                    );
+                    assert_eq!(
+                        run.observations,
+                        vec![observation(
+                            HookEvent::SpeakerSelected,
+                            0,
+                            HookOutcomeKind::Failed
+                        )]
+                    );
+                    assert!(!root.path().join("speaker-later").exists());
+                    assert_eq!(budget.snapshot().2, 1);
+                }
+            }
+            assert_eq!(budget.snapshot().1, 0, "speaker hook retained a lease");
+        }
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let failed = command("cat >/dev/null; exit 7");
+        #[cfg(windows)]
+        let failed = windows_command("$null = [Console]::In.ReadToEnd(); exit 7");
+        let host = host(root.path(), HookEvent::SpeakerSelected, failed);
+        let budget = host.budget();
+        let run = host
+            .run_speaker(&budget, "invocation", "actor", None, &serde_json::json!({}))
+            .await;
+        host.quiesce().await.unwrap();
+        assert!(run.outcome.is_err());
+        assert_eq!(
+            run.observations,
+            vec![observation(
+                HookEvent::SpeakerSelected,
+                0,
+                HookOutcomeKind::Failed
+            )]
+        );
+        assert_eq!((budget.snapshot().1, budget.snapshot().2), (0, 1));
+    }
+
     #[cfg(windows)]
     fn aggregate_for(hooks: &[&HookCommand]) -> u64 {
         hooks.iter().map(|hook| hook.timeout_ms).sum()
@@ -1698,9 +1826,10 @@ mod tests {
         assert!(!marker.exists(), "failed pre hook admitted a later command");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn invalid_intermediate_rewrite_never_reaches_a_later_hook() {
+        #[cfg(windows)]
+        warm_hook_launch().await;
         for (event, invalid, input) in [
             (
                 HookEvent::PreTurn,
@@ -1721,14 +1850,17 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             let marker = root.path().join("later-hook-ran");
+            #[cfg(unix)]
+            let later = command(
+                "cat >/dev/null; : > later-hook-ran; printf '%s' '{\"decision\":\"allow\"}'",
+            );
+            #[cfg(windows)]
+            let later = windows_command(
+                r#"$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText('later-hook-ran', ''); [Console]::Out.Write('{"decision":"allow"}')"#,
+            );
             let chain = vec![
-                command(&format!(
-                    "cat >/dev/null; printf '%s' '{}'",
-                    serde_json::json!({"decision":"rewrite","value":invalid})
-                )),
-                command(
-                    "cat >/dev/null; : > later-hook-ran; printf '%s' '{\"decision\":\"allow\"}'",
-                ),
+                response_command(serde_json::json!({"decision":"rewrite","value":invalid})),
+                later,
             ];
             let hooks = if event == HookEvent::PreTurn {
                 LifecycleHooks {
@@ -1753,6 +1885,7 @@ mod tests {
                     input,
                 )
                 .await;
+            host.quiesce().await.unwrap();
             assert!(run.outcome.is_err(), "{event:?}");
             assert_eq!(run.observations.len(), 1, "{event:?}");
             assert_eq!(run.observations[0].outcome, HookOutcomeKind::Failed);
@@ -1820,23 +1953,35 @@ mod tests {
         assert!(post.annotations[0].text.contains("\\u{1b}"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn protocol_orders_rewrites_rejects_wrong_variants_and_continues_post_failures() {
+        #[cfg(windows)]
+        warm_hook_launch().await;
         let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let check_rewrite = command(
+            "read value; case \"$value\" in *first*) printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"file_read\",\"arguments\":{\"path\":\"second\"}}}';; *) exit 9;; esac",
+        );
+        #[cfg(windows)]
+        let check_rewrite = windows_command(
+            r#"$request = [Console]::In.ReadToEnd(); if (-not $request.Contains('first')) { exit 9 }; [Console]::Out.Write('{"decision":"rewrite","value":{"name":"file_read","arguments":{"path":"second"}}}')"#,
+        );
+        #[cfg(unix)]
+        let malformed = command("cat >/dev/null; printf trailing");
+        #[cfg(windows)]
+        let malformed =
+            windows_command("$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('trailing')");
         let hooks = LifecycleHooks {
             pre_tool: vec![
-                command(
-                    "cat >/dev/null; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"file_read\",\"arguments\":{\"path\":\"first\"}}}'",
+                response_command(
+                    serde_json::json!({"decision":"rewrite","value":{"name":"file_read","arguments":{"path":"first"}}}),
                 ),
-                command(
-                    "read value; case \"$value\" in *first*) printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"file_read\",\"arguments\":{\"path\":\"second\"}}}';; *) exit 9;; esac",
-                ),
+                check_rewrite,
             ],
             post_tool: vec![
-                command("cat >/dev/null; printf trailing"),
-                command(
-                    "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"safe note\"}'",
+                malformed,
+                response_command(
+                    serde_json::json!({"decision":"annotate","annotation":"safe note"}),
                 ),
             ],
             ..LifecycleHooks::default()
@@ -1878,6 +2023,7 @@ mod tests {
                 &serde_json::json!({"result":"unchanged"}),
             )
             .await;
+        host.quiesce().await.unwrap();
         assert_eq!(post.failures.len(), 1);
         assert_eq!(post.annotations[0].text, "safe note");
         assert_eq!(post.observations[0].outcome, HookOutcomeKind::Failed);
@@ -2256,11 +2402,15 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn suppressed_hosts_report_every_configured_hook_without_running_it() {
         let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
         let ran = command("cat >/dev/null; : > hook-ran; printf '%s' '{\"decision\":\"deny\"}'");
+        #[cfg(windows)]
+        let ran = windows_command(
+            r#"$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText('hook-ran', ''); [Console]::Out.Write('{"decision":"deny"}')"#,
+        );
         let hooks = LifecycleHooks {
             pre_tool: vec![ran.clone(), ran.clone()],
             post_turn: vec![ran.clone()],
@@ -2347,21 +2497,18 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn annotation_budget_fails_only_the_excess_post_hook() {
+        #[cfg(windows)]
+        warm_hook_launch().await;
         let root = tempfile::tempdir().unwrap();
         let mut hooks = LifecycleHooks {
             max_annotation_bytes: 5,
             ..LifecycleHooks::default()
         };
         hooks.post_tool = vec![
-            command(
-                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"four\"}'",
-            ),
-            command(
-                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"more\"}'",
-            ),
+            response_command(serde_json::json!({"decision":"annotate","annotation":"four"})),
+            response_command(serde_json::json!({"decision":"annotate","annotation":"more"})),
         ];
         let host = host_with_hooks(root.path(), hooks);
         let run = host
@@ -2375,13 +2522,13 @@ mod tests {
                 &serde_json::json!({"result":"settled"}),
             )
             .await;
+        host.quiesce().await.unwrap();
         assert_eq!(run.annotations.len(), 1);
         assert_eq!(run.annotations[0].text, "four");
         assert_eq!(run.observations[1].outcome, HookOutcomeKind::Failed);
         assert_eq!(run.failures.len(), 1);
     }
 
-    #[cfg(unix)]
     fn host_with_hooks(root: &std::path::Path, hooks: LifecycleHooks) -> HookHost {
         HookHost::new(
             Arc::new(Directory::open(root, Privacy::Inherited, NameRetention::Pinned).unwrap()),

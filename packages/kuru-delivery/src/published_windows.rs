@@ -1626,25 +1626,51 @@ mod tests {
     #[tokio::test]
     async fn published_command_names_failed_phase_and_refuses_substituted_cleanup_root() {
         let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().to_owned();
         let missing = temporary.path().join("missing-mise.exe");
         let mut install = MiseInstall::new(temporary.path(), &missing).unwrap();
-        let error = install
-            .output("demo-conversation", &[])
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("native mise demo-conversation command did not settle"),
-            "{error}"
-        );
+        let primary = install
+            .kuru(
+                "demo-conversation",
+                &["run".into(), "isolated prompt".into()],
+            )
+            .await;
+        let memory_attempted = install.memory_attempted;
+        let cleanup = install.retire_memory().await;
+        let commands_empty = install.commands.is_empty();
+        let cold = !install.data.exists() && !install.engine_cache.exists();
 
         let foreign = tempfile::tempdir().unwrap();
         let marker = foreign.path().join("untouched");
         fs::write(&marker, b"foreign").unwrap();
-        install.memory_attempted = true;
         install.data = foreign.path().to_owned();
-        let error = install.retire_memory().await.unwrap_err().to_string();
-        assert!(error.contains("changed its isolated project or data root"));
+        let substituted = install.retire_memory().await;
+        drop(install);
+        let verified =
+            primary.and_then(|_| Err(anyhow::anyhow!("missing executable unexpectedly ran")));
+        let result = finish_isolated_verification(temporary, verified, cleanup);
+        let retained = root.is_dir();
+        // No command started or created memory. Retire the retained TempDir
+        // only after the actual cleanup failure has been captured.
+        fs::remove_dir_all(&root).unwrap();
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(memory_attempted && commands_empty && cold);
+        assert!(retained, "failed cleanup must retain its isolated root");
+        assert!(
+            error.contains("native mise demo-conversation command did not settle"),
+            "{error}"
+        );
+        assert!(
+            error.contains("native mise memory-cleanup command did not settle"),
+            "{error}"
+        );
+        assert!(error.contains("root retained"), "{error}");
+        assert!(
+            substituted
+                .unwrap_err()
+                .to_string()
+                .contains("changed its isolated project or data root")
+        );
         assert_eq!(fs::read(marker).unwrap(), b"foreign");
     }
 
@@ -1750,6 +1776,20 @@ mod tests {
                 release.as_os_str().to_owned(),
             ),
         ]);
+        let profile = std::env::var_os("LLVM_PROFILE_FILE");
+        if let Some(value) = &profile {
+            install
+                .environment
+                .push(("LLVM_PROFILE_FILE".into(), value.clone()));
+        }
+        assert_eq!(
+            install
+                .environment
+                .iter()
+                .find_map(|(name, value)| (name == "LLVM_PROFILE_FILE").then_some(value)),
+            profile.as_ref(),
+            "the existing native child must retain the runner's exact profile destination"
+        );
         let output = install
             .output(
                 "independent-service-regression",

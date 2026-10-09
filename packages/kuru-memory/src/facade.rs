@@ -10543,6 +10543,111 @@ mod managed_coverage_contract_tests {
         )
         .await
     }
+    #[tokio::test]
+    async fn attached_inspection_never_elects_and_cannot_mutate_or_retire_its_owner()
+    -> anyhow::Result<()> {
+        use super::*;
+        use anyhow::ensure;
+        use serde_json::json;
+
+        checked_owner_case(
+            "attached-only inspection authority",
+            async |memory, _, project, _| {
+                let Backend::Remote(remote) = &memory.backend else {
+                    anyhow::bail!("inspection fixture has no managed owner")
+                };
+                let mut options = remote.session.options.clone();
+                options.read_only = true;
+                let mut absent = options.clone();
+                absent.data_dir = project.join("never-activated-inspection");
+                let entries_before = std::fs::read_dir(project)?.count();
+                let missing = MemoryStore::attach_existing_for_inspection(
+                    absent.clone(),
+                    project.to_owned(),
+                    remote.session.executable.clone(),
+                )
+                .await?;
+                ensure!(missing.is_none(), "inspection elected an unpublished owner");
+                ensure!(
+                    !absent.data_dir.exists(),
+                    "inspection created private project state"
+                );
+                ensure!(
+                    std::fs::read_dir(project)?.count() == entries_before,
+                    "inspection created an election or lifecycle artifact"
+                );
+                absent.read_only = false;
+                let refusal = MemoryStore::attach_existing_for_inspection(
+                    absent.clone(),
+                    project.to_owned(),
+                    remote.session.executable.clone(),
+                )
+                .await
+                .err()
+                .context("writable options bypassed inspection admission")?;
+                ensure!(
+                    refusal
+                        .to_string()
+                        .contains("memory inspection requires read-only options")
+                );
+                ensure!(
+                    !absent.data_dir.exists(),
+                    "refused inspection created project state"
+                );
+
+                memory
+                    .put("inspection-retained", &json!("private retained value"))
+                    .await?;
+                let revision = memory.revision().await?;
+                let generation = remote.attachment.lock().await.generation().to_owned();
+                let reader = MemoryStore::attach_existing_for_inspection(
+                    options,
+                    project.to_owned(),
+                    remote.session.executable.clone(),
+                )
+                .await?
+                .context("published owner was invisible to attached inspection")?;
+                let observed = async {
+                    ensure!(reader.status().await?.read_only);
+                    ensure!(
+                        reader.get("inspection-retained").await?
+                            == Some(json!("private retained value"))
+                    );
+                    ensure!(
+                        reader
+                            .put("inspection-forbidden", &json!(true))
+                            .await
+                            .is_err()
+                    );
+                    ensure!(
+                        reader
+                            .begin_candidate("inspection cannot dream")
+                            .await
+                            .is_err()
+                    );
+                    ensure!(reader.revision().await? == revision);
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                let closed = reader.close().await;
+                observed?;
+                closed.context("close attached inspection before owner assertions")?;
+                ensure!(memory.revision().await? == revision);
+                ensure!(memory.get("inspection-forbidden").await?.is_none());
+                ensure!(
+                    remote.attachment.lock().await.generation() == generation,
+                    "closing inspection changed its writable sibling's owner generation"
+                );
+                memory.put("inspection-survivor", &json!(true)).await?;
+                ensure!(
+                    memory.get("inspection-survivor").await? == Some(json!(true)),
+                    "closing inspection retired its still-attached writable owner"
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
