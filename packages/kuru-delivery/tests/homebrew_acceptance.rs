@@ -648,6 +648,7 @@ async fn acceptance(root: &Path) -> Result<()> {
     let uninstall = brew(
         &[
             "uninstall",
+            "--force",
             "--ignore-dependencies",
             "--formula",
             &full_name,
@@ -661,6 +662,11 @@ async fn acceptance(root: &Path) -> Result<()> {
         .err()
         .map_or_else(|| "checks passed".to_owned(), |error| format!("{error:#}"));
     uninstall.with_context(|| format!("Homebrew acceptance outcome: {outcome}; retained fixture tap {tap} and private source at {} because Kuru uninstall did not finish", repository.display()))?;
+    ensure!(
+        !cellar.join("kuru").exists(),
+        "Homebrew acceptance outcome: {outcome}; Kuru Cellar still exists after removing every fixture version; retained tap {tap} and source at {}",
+        repository.display()
+    );
     brew(&["untap", &tap], root).await.with_context(|| format!("Homebrew acceptance outcome: {outcome}; fixture tap {tap} could not be removed; private source retained at {}", repository.display()))?;
     result
 }

@@ -18,5 +18,5 @@
 ## 4. Documentation and integration
 
 - [x] 4.1 Update owning installation/release/development documentation and the private Phase 2 working document; identify deferred live account acceptance accurately.
-- [ ] 4.2 Run relevant local checks, strict cospec validation and archive the completed change before the final branch commit.
+- [x] 4.2 Run relevant local checks and strict cospec validation; archive through the CLI before the final branch commit, with final-head CI and merged-main acceptance explicitly retained as subsequent workflow gates.
 - [x] 4.3 Prepare the dedicated tap bootstrap and normal PR workflow with production account prerequisites explicitly identified.
