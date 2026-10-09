@@ -1203,7 +1203,22 @@ async fn observer_stdin_eof_after_old_move_recovers_exact_original_identity() ->
     success(&recovery);
     fixture.unchanged();
     ensure!(regular_file_info(&fs::File::open(&installed)?)?.identity == original);
-    ensure!(!receipt_path.try_exists()? && !displaced.try_exists()?);
+    ensure!(!displaced.try_exists()?);
+    let recovered: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+    ensure!(recovered["phase"] == "rolled_back");
+    ensure!(recovered["operation"] == receipt["operation"]);
+    ensure!(recovered["original"] == receipt["original"]);
+    for field in ["candidate", "backup"] {
+        let name = recovered[field].as_str().context("recovered image name")?;
+        kuru_platform::fs::validate_component(OsStr::new(name))?;
+        ensure!(
+            !fixture
+                .install
+                .join(".kuru-update")
+                .join(name)
+                .try_exists()?
+        );
+    }
     ensure!(fs::read(adjacent)? == b"unrelated bytes");
     Ok(())
 }

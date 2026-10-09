@@ -17,7 +17,7 @@ Kuru's typed doctor/headless/canary statuses immediately terminate from `finish_
 
 ## Impact
 
-`apps/kuru-tui/src/main.rs` and contributor coverage guidance only. No CLI status/message, runtime authority, dependency, threshold or instrumentation API changes. Before/after native profile collection remains to be measured; no causal runtime pass is claimed from source inspection alone.
+`apps/kuru-tui/src/main.rs` and contributor coverage guidance only. No CLI status/message, runtime authority, dependency, threshold or instrumentation API changes. Valid native Windows before/after exports confirm previously absent invocation-error counters from the same existing cases; verification names the observed groups.
 
 ## Surfaces
 
