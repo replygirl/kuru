@@ -486,18 +486,39 @@ impl Terminal {
         })
     }
 
-    /// Some ConPTY versions omit nonspacing accents from their screen output.
-    /// Both projections still require the completed visible composer cursor;
-    /// the caller verifies canonical bytes separately through persisted state.
-    pub fn composer_projection(&mut self, canonical: &str, projected: &str) -> Result<()> {
+    /// ConPTY can change the visible tail after a combining glyph. Bind this
+    /// short draft to its stable composer anchor and full canonical caret,
+    /// independent of that lossy text projection. Durable bytes are checked
+    /// separately; this does not establish native glyph fidelity.
+    pub fn composer_projection(&mut self, canonical: &str, anchor: &str) -> Result<()> {
         self.wait(
-            &format!("completed native composer projection of {canonical:?}"),
+            &format!("completed canonical composer cursor after {canonical:?}"),
             READY,
             |terminal| {
-                composer_frame_ready(terminal.parser.screen(), canonical)
-                    || composer_frame_ready(terminal.parser.screen(), projected)
+                let screen = terminal.parser.screen();
+                screen
+                    .rows(0, screen.size().1)
+                    .enumerate()
+                    .any(|(row, line)| {
+                        line.find(anchor).is_some_and(|start| {
+                            let column = unicode_width::UnicodeWidthStr::width(&line[..start])
+                                + unicode_width::UnicodeWidthStr::width(canonical);
+                            line[..start].trim_end().ends_with('›')
+                                && screen.cursor_position() == (row as u16, column as u16)
+                                && !screen.hide_cursor()
+                        })
+                    })
             },
         )
+        .with_context(|| {
+            format!(
+                "canonical width={}, native cursor={:?}, hidden={}, last 2048 output bytes={:?}",
+                unicode_width::UnicodeWidthStr::width(canonical),
+                self.parser.screen().cursor_position(),
+                self.parser.screen().hide_cursor(),
+                String::from_utf8_lossy(&self.output[self.output.len().saturating_sub(2048)..])
+            )
+        })
     }
 
     /// Assert the entire observation interval, without first waiting for silence.

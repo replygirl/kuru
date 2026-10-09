@@ -4,7 +4,7 @@ use super::*;
 use crossterm::event::{KeyCode as Key, KeyModifiers as Modifiers};
 
 const LITERAL_DRAFT: &str = "literal draft e\u{301} 猫";
-const NATIVE_DRAFT_PROJECTION: &str = "literal draft e 猫";
+const NATIVE_DRAFT_ANCHOR: &str = "literal draft e";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_conpty_literal_combining_input_is_observed_before_composer() -> Result<()> {
@@ -82,7 +82,7 @@ fn draft_frame(terminal: &mut Terminal, cursor_after: &str, labels: &[&str]) -> 
     // The text can precede the final cursor update. Search and paste states
     // remain stable until another key, so bind the cursor before sending it.
     if cursor_after == LITERAL_DRAFT {
-        terminal.composer_projection(cursor_after, NATIVE_DRAFT_PROJECTION)
+        terminal.composer_projection(cursor_after, NATIVE_DRAFT_ANCHOR)
     } else {
         terminal.composer(cursor_after)
     }
@@ -121,6 +121,9 @@ async fn native_conpty_recall_search_and_key_history_preserve_literal_prompts() 
 
             let draft = LITERAL_DRAFT;
             terminal.committed_text(draft)?;
+            if columns >= 90 {
+                terminal.text(&[&format!("{} chars", draft.chars().count())], READY)?;
+            }
             draft_frame(&mut terminal, draft, &["enter send"])?;
             for (key, prompt, label) in [
                 (Key::Up, newest, "history 1/2"),

@@ -16,7 +16,7 @@ Existing native ConPTY, public EventStream/renderer and owned cleanup run on x64
 
 ## Integration contract
 
-Require exactly one U+0301 Press and one Release, exact filtered draft bytes, unchanged ordinary release exclusion, and seven exact completed persisted prompts at 120/80 columns. Assertions follow native cleanup. Keyboard framing demonstrates committed-key behavior only: Windows Terminal paste intentionally sends raw text, so this does not fix or verify pasted decomposed text or genuine Alt-code commitment. Existing atomic Paste portability limitations remain explicit.
+Require exactly one U+0301 Press and one Release, exact filtered draft bytes, unchanged ordinary release exclusion, and seven exact completed persisted prompts at 120/80 columns. Native e6f4ee77 x64 input probe passes, while both recall tests fail the old exact-output projection predicate (18-character draft reported, missing space/cat in ConPTY text). Check exact Kuru TestBackend glyph cells and cursor first. Synchronize the native decomposed draft on its stable ASCII composer anchor and visible cursor at the full canonical display width, retaining labels, initial character count at wide size, exact durable bytes and bounded cursor/output diagnostics. Do not enumerate more lossy glyph strings or claim full ConPTY glyph fidelity; no own renderer defect is confirmed. Assertions follow native cleanup. Keyboard framing demonstrates committed-key behavior only: Windows Terminal paste intentionally sends raw text, so this does not fix or verify pasted decomposed text or genuine Alt-code commitment. Existing atomic Paste portability limitations remain explicit.
 
 ## Risks / Trade-offs
 
@@ -32,3 +32,6 @@ Actual native execution must prove protocol recognition and command behavior; cr
 - https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalCore/Terminal.cpp
 - https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalControl/ControlCore.cpp
 - https://docs.rs/crate/crossterm/latest
+
+- https://github.com/microsoft/terminal/pull/16916
+- https://github.com/microsoft/terminal/wiki/Console%3A-Potential-Breaking-Changes

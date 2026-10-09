@@ -11,3 +11,7 @@
 - [ ] 2.2 Run relevant static checks and independent review, then observe exact input and seven-prompt recall acceptance at 120/80 columns on Windows x64 and ARM before archive.
 
 Observed locally: Windows-target TUI lint, formatting and docs checks pass. Independent implementation review clears negotiated BMP-only text, explicit command framing, release exclusion and cleanup. Native task2.2 remains pending.
+
+Native e6f4ee77: x64 committed-key probe passes; x64/ARM recall stops at the initial frame assertion before durable comparison. Finish narrow canonical-cursor synchronization and exact own-renderer cell verification; no deadline or accepted-byte changes.
+
+Exact TestBackend regression passes at120/80: e+U301 remains one glyph cell, following space and wide 猫 remain intact, caret22 and submitted21bytes match canonical input. Native projection now binds composer marker/ASCII anchor and the full canonical caret, with bounded raw-tail/cursor diagnostics. Native recall remains task2.2 pending.
