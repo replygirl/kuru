@@ -256,10 +256,33 @@ jobs:
           RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
           RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}
+          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+          HOMEBREW_APP_ID: ${{ vars.HOMEBREW_APP_ID }}
+          HOMEBREW_APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
         run: |
           test -n "$RELEASE_APP_ID" || { echo 'Missing RELEASE_APP_ID variable'; exit 1; }
           test -n "$RELEASE_APP_PRIVATE_KEY" || { echo 'Missing RELEASE_APP_PRIVATE_KEY secret'; exit 1; }
           test -n "$ANTHROPIC_API_KEY" || { echo 'Missing ANTHROPIC_API_KEY_COMMUNIQUE secret'; exit 1; }
+          for setting in MACOS_SIGNING_P12_BASE64 MACOS_SIGNING_P12_PASSWORD MACOS_SIGNING_IDENTITY \
+            APPLE_TEAM_ID APPLE_NOTARY_KEY_P8 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID \
+            AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_SIGNING_ENDPOINT \
+            AZURE_SIGNING_ACCOUNT AZURE_SIGNING_PROFILE WINDOWS_SIGNING_SUBJECT \
+            HOMEBREW_APP_ID HOMEBREW_APP_PRIVATE_KEY; do
+            test -n "${!setting}" || { echo "Missing $setting signing/tap configuration"; exit 1; }
+          done
       - run: mise run //packages/kuru-delivery:setup:test-tools
       - name: Select immutable release base and version
         id: plan
@@ -322,7 +345,11 @@ jobs:
       ref: ${{ needs.bump.outputs.sha }}
 
   build:
+    name: Build native package (${{ matrix.target }})
     needs: [plan, bump, verify, dolt-windows-arm64]
+    permissions:
+      contents: read
+      actions: read
     env:
       # Archive jobs do not write Git commits or need repository-hook setup.
       MISE_NO_HOOKS: "1"
@@ -355,26 +382,54 @@ jobs:
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      - name: Find retained signed native package
+        id: retained
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_RUN_ID: ${{ github.run_id }}
+        run: |
+          mise run release:tool -- retained-package --version $env:RELEASE_VERSION --sha $env:RELEASE_SHA --target $env:RELEASE_TARGET --run-id $env:RELEASE_RUN_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Retained package lookup failed' }
+      - name: Restore retained signed native package
+        if: steps.retained.outputs.found == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.retained.outputs.name }}
+          path: dist
+      - name: Validate retained signed native package
+        if: steps.retained.outputs.found == 'true'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          mise run release:tool -- verify-package --directory dist --version $env:RELEASE_VERSION --target $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Retained package validation failed' }
       - name: Select private bundle build inputs
-        if: matrix.target == 'aarch64-pc-windows-msvc'
+        if: matrix.target == 'aarch64-pc-windows-msvc' && steps.retained.outputs.found != 'true'
         shell: pwsh
         # Leave the leaf absent so the preparer creates this runner's private ACLs.
         run: Add-Content -LiteralPath $env:GITHUB_ENV "KURU_DOLT_BUNDLE_DIR=$env:RUNNER_TEMP/kuru-bundles-release"
       - name: Download the Windows arm64 engine input
-        if: matrix.target == 'aarch64-pc-windows-msvc'
+        if: matrix.target == 'aarch64-pc-windows-msvc' && steps.retained.outputs.found != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.dolt-windows-arm64.outputs.artifact }}
           path: ${{ runner.temp }}/bundle-input
       - name: Import the pin-verified Windows arm64 engine
-        if: matrix.target == 'aarch64-pc-windows-msvc'
+        if: matrix.target == 'aarch64-pc-windows-msvc' && steps.retained.outputs.found != 'true'
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'bundle-input/dolt-windows-arm64.zip'
           mise run //packages/kuru-memory:bundle:prepare -- --target aarch64-pc-windows-msvc --archive $archive --offline
           if ($LASTEXITCODE -ne 0) { throw 'Windows arm64 engine import failed' }
       - name: Build and package native executable
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && steps.retained.outputs.found != 'true'
         env:
           RELEASE_TARGET: ${{ matrix.target }}
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
@@ -386,11 +441,38 @@ jobs:
           export KURU_SHELL_SUPPORT_BINARY="$binary"
           export KURU_SHELL_SUPPORT_OUTPUT="$RUNNER_TEMP/kuru-shell-support-$RELEASE_TARGET"
           mise run //apps/kuru-tui:shell-support:generate
-          mise run package -- --binary "$binary" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
           mise run //packages/kuru-delivery:package:shell-support -- --input "$KURU_SHELL_SUPPORT_OUTPUT" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
           test "$before" = "$(openssl dgst -sha256 "$binary")"
+      - name: Sign and notarize private macOS executable
+        if: runner.os == 'macOS' && steps.retained.outputs.found != 'true'
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          KURU_SIGNING_BINARY: ${{ runner.temp }}/kuru-signing-output/kuru
+          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          binary="$PWD/target/$RELEASE_TARGET/release/kuru"
+          before="$(openssl dgst -sha256 "$binary")"
+          mise run release:tool -- signing-prepare --binary "$binary" --target "$RELEASE_TARGET" --output "$RUNNER_TEMP/kuru-signing-output"
+          mise run //packages/kuru-delivery:sign:macos
+          mise run release:tool -- signing-verify --binary "$KURU_SIGNING_BINARY" --target "$RELEASE_TARGET" --publisher "$APPLE_TEAM_ID"
+          test "$before" = "$(openssl dgst -sha256 "$binary")"
+      - name: Package verified Unix executable
+        if: runner.os != 'Windows' && steps.retained.outputs.found != 'true'
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          binary="$PWD/target/$RELEASE_TARGET/release/kuru"
+          if [ "$RUNNER_OS" = macOS ]; then binary="$RUNNER_TEMP/kuru-signing-output/kuru"; fi
+          mise run package -- --binary "$binary" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
       - name: Build and package native Windows executable
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.retained.outputs.found != 'true'
         shell: pwsh
         env:
           RELEASE_TARGET: ${{ matrix.target }}
@@ -406,26 +488,154 @@ jobs:
           $env:KURU_SHELL_SUPPORT_OUTPUT = Join-Path $env:RUNNER_TEMP "kuru-shell-support-$env:RELEASE_TARGET"
           mise run //apps/kuru-tui:shell-support:generate
           if ($LASTEXITCODE -ne 0) { throw 'Shell support generation failed' }
-          mise run package -- --binary $binary --target $env:RELEASE_TARGET --version $env:RELEASE_VERSION
-          if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed' }
-          mise run //packages/kuru-delivery:package:shell-support -- --input $env:KURU_SHELL_SUPPORT_OUTPUT --target $env:RELEASE_TARGET --version $env:RELEASE_VERSION
+          mise run release:tool -- signing-prepare --binary $binary --target $env:RELEASE_TARGET --output "$env:RUNNER_TEMP/kuru-signing-input"
+          if ($LASTEXITCODE -ne 0) { throw 'Signing copy preparation failed' }
+          mise run //packages/kuru-delivery:package:shell-support -- --input $env:KURU_SHELL_SUPPORT_OUTPUT --target $env:RELEASE_TARGET --version $env:RELEASE_VERSION --output "$env:RUNNER_TEMP/kuru-signing-input"
           if ($LASTEXITCODE -ne 0) { throw 'Shell support packaging failed' }
           if ($before -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash) { throw 'Release binary changed during support generation' }
       - name: Verify packaged offline runtime
+        if: steps.retained.outputs.found != 'true'
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
         run: mise run //apps/kuru-tui:test:embedded-runtime
       - name: Inspect native shipping DLL imports
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.retained.outputs.found != 'true'
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru.exe
         run: mise run //apps/kuru-tui:verify:windows-imports
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Retain unsigned Windows signing inputs
+        if: runner.os == 'Windows' && steps.retained.outputs.found != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-${{ matrix.target }}
-          path: dist/*
+          name: signing-input-${{ needs.plan.outputs.version }}-${{ needs.bump.outputs.sha }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/kuru-signing-input/*
           if-no-files-found: error
           overwrite: true
+      - name: Retain signed native package
+        if: runner.os != 'Windows' && steps.retained.outputs.found != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.retained.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  sign-windows:
+    name: Sign Windows package (${{ matrix.target }})
+    needs: [plan, bump, build]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      MISE_NO_HOOKS: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.18
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Find retained signed native package
+        id: retained
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_RUN_ID: ${{ github.run_id }}
+        run: |
+          mise run release:tool -- retained-package --version $env:RELEASE_VERSION --sha $env:RELEASE_SHA --target $env:RELEASE_TARGET --run-id $env:RELEASE_RUN_ID
+          if ($LASTEXITCODE -ne 0) { throw 'Retained package lookup failed' }
+      - name: Restore retained signed native package
+        if: steps.retained.outputs.found == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.retained.outputs.name }}
+          path: dist
+      - name: Download native Windows signing inputs
+        if: steps.retained.outputs.found != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signing-input-${{ needs.plan.outputs.version }}-${{ needs.bump.outputs.sha }}-${{ matrix.target }}
+          path: signing-input
+      - name: Prepare private Windows signing copy
+        if: steps.retained.outputs.found != 'true'
+        shell: pwsh
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          mise run release:tool -- signing-prepare --binary "$PWD/signing-input/kuru.exe" --target $env:RELEASE_TARGET --output "$env:RUNNER_TEMP/kuru-signing-output"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows signing preparation failed' }
+      - name: Authenticate to Azure with OIDC
+        if: steps.retained.outputs.found != 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign exact Windows executable
+        if: steps.retained.outputs.found != 'true'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files: ${{ runner.temp }}/kuru-signing-output/kuru.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-managed-identity-credential: true
+          exclude-workload-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+          exclude-azure-cli-credential: false
+      - name: Verify signature and package Windows executable
+        if: steps.retained.outputs.found != 'true'
+        shell: pwsh
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+        run: |
+          $binary = "$env:RUNNER_TEMP/kuru-signing-output/kuru.exe"
+          mise run release:tool -- signing-verify --binary $binary --target $env:RELEASE_TARGET --publisher $env:WINDOWS_SIGNING_SUBJECT
+          if ($LASTEXITCODE -ne 0) { throw 'Authenticode verification failed' }
+          mise run package -- --binary $binary --target $env:RELEASE_TARGET --version $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Signed Windows packaging failed' }
+          Copy-Item -LiteralPath (Get-ChildItem 'signing-input/*shell-support*').FullName -Destination dist
+      - name: Validate signed native package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          mise run release:tool -- verify-package --directory dist --version $env:RELEASE_VERSION --target $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Signed package validation failed' }
+      - name: Retain signed native package
+        if: steps.retained.outputs.found != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.retained.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
 
   notes:
     # Generate read-only notes alongside final validation to surface failures
@@ -465,7 +675,7 @@ jobs:
           overwrite: true
 
   assemble-candidate:
-    needs: [plan, bump, build, notes]
+    needs: [plan, bump, build, sign-windows, notes]
     runs-on: ubuntu-latest
     outputs:
       artifact_name: ${{ steps.artifact.outputs.name }}
@@ -483,7 +693,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: release-*-*-*
+          pattern: release-package-${{ needs.plan.outputs.version }}-${{ needs.bump.outputs.sha }}-*
           merge-multiple: true
           path: dist
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -562,11 +772,48 @@ jobs:
           mkdir "$RUNNER_TEMP/kuru-staged"
           tar -xzf "candidate/dist/$RELEASE_ARCHIVE" -C "$RUNNER_TEMP/kuru-staged"
           test -x "$RUNNER_TEMP/kuru-staged/kuru"
+      - name: Verify exact staged publisher signature
+        if: runner.os != 'Linux'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+        run: |
+          if ($env:RUNNER_OS -eq 'Windows') {
+            $archive = "$PWD/candidate/dist/kuru-$env:RELEASE_VERSION-$env:RELEASE_TARGET.zip"
+            $extract = "$env:RUNNER_TEMP/kuru-signature-input"
+            Expand-Archive -LiteralPath $archive -DestinationPath $extract
+            $binary = "$extract/kuru.exe"
+            $publisher = $env:WINDOWS_SIGNING_SUBJECT
+            $name = 'kuru.exe'
+          } else {
+            $binary = "$env:RUNNER_TEMP/kuru-staged/kuru"
+            $publisher = $env:APPLE_TEAM_ID
+            $name = 'kuru'
+          }
+          mise run release:tool -- signing-prepare --binary $binary --target $env:RELEASE_TARGET --output "$env:RUNNER_TEMP/kuru-signature-check"
+          if ($LASTEXITCODE -ne 0) { throw 'Staged signature copy failed' }
+          mise run release:tool -- signing-verify --binary "$env:RUNNER_TEMP/kuru-signature-check/$name" --target $env:RELEASE_TARGET --publisher $publisher
+          if ($LASTEXITCODE -ne 0) { throw 'Staged publisher signature failed' }
       - name: Verify the staged Unix executable's offline runtime
         if: runner.os != 'Windows'
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-staged/kuru
         run: mise run //apps/kuru-tui:test:embedded-runtime
+      - name: Set up native Homebrew
+        if: runner.os != 'Windows'
+        uses: Homebrew/actions/setup-homebrew@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        with:
+          stable: true
+      - name: Accept native Homebrew install and previous-release upgrade
+        if: runner.os != 'Windows'
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          KURU_HOMEBREW_RELEASE_DIR: ${{ github.workspace }}/candidate/dist
+          GITHUB_TOKEN: ${{ github.token }}
+        run: mise run //packages/kuru-delivery:test:homebrew
       - name: Accept the staged Unix executable from the previous published release
         if: runner.os != 'Windows'
         env:
@@ -690,6 +937,44 @@ jobs:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
           RELEASE_SHA: ${{ needs.bump.outputs.sha }}
         run: mise run release:tool -- publish --version "$RELEASE_VERSION" --sha "$RELEASE_SHA" --directory dist --notes RELEASE_NOTES.md
+
+  publish-homebrew:
+    name: Update Homebrew tap
+    needs: [plan, bump, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      MISE_NO_HOOKS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.18
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: tap
+        with:
+          app-id: ${{ vars.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: replygirl
+          repositories: homebrew-kuru
+          permission-contents: write
+      - name: Update tap from the actual immutable public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HOMEBREW_TOKEN: ${{ steps.tap.outputs.token }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
+        run: mise run release:tool -- homebrew-publish --version "$RELEASE_VERSION" --sha "$RELEASE_SHA"
+
 
   verify-published-windows:
     name: Verify published Windows download (${{ matrix.target }})

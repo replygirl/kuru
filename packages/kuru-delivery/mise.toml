@@ -121,7 +121,22 @@ run_windows = "cargo clippy -p kuru-delivery --target x86_64-pc-windows-msvc --a
 
 [tasks."lint:shell"]
 description = "Check the compiler-free release bootstrap"
-run = "shellcheck support/install.sh support/windows-lint-cc.sh support/windows-lint-ar.sh"
+run = "shellcheck support/install.sh support/windows-lint-cc.sh support/windows-lint-ar.sh support/sign-macos.sh"
+
+[tasks."sign:macos"]
+description = "Sign a private executable and require Accepted Apple notarization"
+run = "bash support/sign-macos.sh"
+
+[tasks."test:homebrew"]
+description = "Accept exact staged release bytes through native Homebrew installation and upgrade"
+run = "cargo test -p kuru-delivery --features tooling --locked --test homebrew_acceptance native_homebrew_install_and_upgrade -- --ignored --exact --nocapture --test-threads=1"
+
+[tasks."test:release-contracts"]
+description = "Check release ordering, signing boundaries and Homebrew HTTP contracts"
+env.RUST_TEST_THREADS = "2"
+tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"
+tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
+run = "cargo test -p kuru-delivery --all-features --locked --test release_workflow --test homebrew --test signing --test delivery_cli --test homebrew_acceptance"
 
 [tasks.tool]
 dir = "{{config_root}}/../.."

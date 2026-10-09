@@ -10,6 +10,8 @@ pub mod command;
 pub mod coverage;
 #[cfg(feature = "tooling")]
 pub mod docs;
+#[cfg(feature = "tooling")]
+pub mod homebrew;
 pub mod notice;
 #[cfg(unix)]
 pub mod ownership;
@@ -41,6 +43,8 @@ pub mod release;
 #[cfg(feature = "tooling")]
 pub mod repo;
 pub mod shell_support;
+#[cfg(feature = "tooling")]
+pub mod signing;
 mod staging;
 pub mod targets;
 #[cfg(unix)]

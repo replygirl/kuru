@@ -35,6 +35,28 @@ Mise's GitHub backend applies a default release-age cooldown to latest-version
 resolution. A full `major.minor.patch` pin bypasses that cooldown when installing
 a newly published release. See [available releases](https://github.com/replygirl/kuru/releases).
 
+## Install with Homebrew
+
+On Apple Silicon macOS or Linux on ARM64/x86-64:
+
+```sh
+brew install replygirl/kuru/kuru
+kuru --version
+```
+
+The dedicated tap is [replygirl/homebrew-kuru](https://github.com/replygirl/homebrew-kuru).
+It installs the same native release executable, embedded Dolt engine, licenses,
+manual and shell completions. It requires no Rust compiler or separately installed
+Dolt. Intel macOS is not supported. Homebrew manages upgrades:
+
+```sh
+brew update
+brew upgrade kuru
+```
+
+`kuru update` refuses Homebrew-owned executables before downloading or staging
+anything. Use Homebrew's upgrade command to retain its installation ownership.
+
 ## Install with the shell bootstrap
 
 On macOS or Linux:

@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kuru_delivery::{
-    notes,
+    homebrew, notes,
     release::{self, GitHub, Version},
+    signing,
 };
 use std::{
     fs::OpenOptions,
@@ -65,6 +66,56 @@ enum Action {
         sha: String,
         #[arg(long)]
         output: PathBuf,
+    },
+    SigningPrepare {
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    SigningVerify {
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        publisher: String,
+    },
+    RetainedPackage {
+        #[arg(long)]
+        run_id: u64,
+        #[arg(long)]
+        version: Version,
+        #[arg(long)]
+        sha: String,
+        #[arg(long)]
+        target: String,
+    },
+    VerifyPackage {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        version: Version,
+        #[arg(long)]
+        target: String,
+    },
+    HomebrewGenerate {
+        #[arg(long)]
+        version: Version,
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        repository: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    HomebrewPublish {
+        #[arg(long)]
+        version: Version,
+        #[arg(long)]
+        sha: String,
     },
 }
 fn github() -> Result<GitHub> {
@@ -145,6 +196,65 @@ async fn execute(root: &Path, action: Action) -> Result<()> {
             )
             .await?;
             println!("{}", output.display());
+        }
+        Action::SigningPrepare {
+            binary,
+            target,
+            output,
+        } => {
+            println!("{}", signing::prepare(&binary, &target, &output)?.display());
+        }
+        Action::SigningVerify {
+            binary,
+            target,
+            publisher,
+        } => {
+            signing::verify(&binary, &target, &publisher).await?;
+        }
+        Action::RetainedPackage {
+            run_id,
+            version,
+            sha,
+            target,
+        } => {
+            let found =
+                release::retained_package(&github()?, run_id, version, &sha, &target).await?;
+            emit(&[
+                ("found", if found { "true" } else { "false" }),
+                (
+                    "name",
+                    &release::package_artifact_name(version, &sha, &target)?,
+                ),
+            ])?;
+        }
+        Action::VerifyPackage {
+            directory,
+            version,
+            target,
+        } => {
+            release::verify_package(&directory, version, &target)?;
+        }
+        Action::HomebrewGenerate {
+            version,
+            directory,
+            repository,
+            output,
+        } => {
+            let hashes = release::verified_assets(&directory, version)?;
+            std::fs::write(output, homebrew::generate(version, &repository, &hashes)?)?;
+        }
+        Action::HomebrewPublish { version, sha } => {
+            let source = github()?;
+            let hashes = release::published_assets(&source, version, &sha).await?;
+            let formula = homebrew::generate(version, &source.repository, &hashes)?;
+            let tap = GitHub::new(
+                "replygirl/homebrew-kuru",
+                &std::env::var("HOMEBREW_TOKEN").context("HOMEBREW_TOKEN is required")?,
+            )?;
+            println!(
+                "Homebrew formula updated: {}",
+                homebrew::publish(&tap, version, &formula).await?
+            );
         }
     }
     Ok(())

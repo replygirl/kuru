@@ -53,7 +53,11 @@ fn required_release_checks_precede_the_only_publication_job() {
     // prevent their dependent jobs from running under GitHub's default policy.
     for (name, needs) in [
         ("build", "needs: [plan, bump, verify, dolt-windows-arm64]"),
-        ("assemble-candidate", "needs: [plan, bump, build, notes]"),
+        ("sign-windows", "needs: [plan, bump, build]"),
+        (
+            "assemble-candidate",
+            "needs: [plan, bump, build, sign-windows, notes]",
+        ),
         (
             "verify-staged",
             "needs: [plan, bump, assemble-candidate, dolt-windows-arm64]",
@@ -76,7 +80,7 @@ fn required_release_checks_precede_the_only_publication_job() {
             "{name} must fail on unsuccessful required work"
         );
         // Native matrix jobs select their platform's steps with runner.os.
-        if name != "build" && name != "verify-staged" {
+        if !["build", "sign-windows", "verify-staged"].contains(&name) {
             assert!(
                 !body
                     .lines()
@@ -184,7 +188,12 @@ fn required_release_checks_precede_the_only_publication_job() {
         let import = position("Import the pin-verified Windows arm64 engine");
         assert!(download < import && import < position(before));
         for step in [steps[download], steps[import]] {
-            assert!(step.contains("if: matrix.target == 'aarch64-pc-windows-msvc'\n"));
+            let condition = if before.starts_with("Build") {
+                "if: matrix.target == 'aarch64-pc-windows-msvc' && steps.retained.outputs.found != 'true'\n"
+            } else {
+                "if: matrix.target == 'aarch64-pc-windows-msvc'\n"
+            };
+            assert!(step.contains(condition));
         }
         assert!(steps[download].contains(
             "uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1\n"
@@ -358,8 +367,191 @@ fn required_release_checks_precede_the_only_publication_job() {
         assert!(published.contains(required), "missing {required}");
     }
     assert!(
-        workflow.trim_end().ends_with("if-no-files-found: error"),
-        "public verification receipt upload must be the final workflow step"
+        published.trim_end().ends_with("if-no-files-found: error"),
+        "public verification receipt upload must be the final step of its job"
+    );
+}
+
+#[test]
+fn native_signing_and_homebrew_are_required_before_and_after_promotion() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap();
+    let jobs = &yaml["jobs"];
+    let steps = |job: &str| jobs[job]["steps"].as_sequence().unwrap();
+    let named = |job: &str, name: &str| {
+        steps(job)
+            .iter()
+            .find(|step| step["name"].as_str() == Some(name))
+            .unwrap()
+    };
+    let position = |job: &str, name: &str| {
+        steps(job)
+            .iter()
+            .position(|step| step["name"].as_str() == Some(name))
+            .unwrap()
+    };
+    let preflight = named("plan", "Check release prerequisites");
+    for name in [
+        "MACOS_SIGNING_P12_BASE64",
+        "MACOS_SIGNING_P12_PASSWORD",
+        "MACOS_SIGNING_IDENTITY",
+        "APPLE_TEAM_ID",
+        "APPLE_NOTARY_KEY_P8",
+        "APPLE_NOTARY_KEY_ID",
+        "APPLE_NOTARY_ISSUER_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_TENANT_ID",
+        "AZURE_SUBSCRIPTION_ID",
+        "AZURE_SIGNING_ENDPOINT",
+        "AZURE_SIGNING_ACCOUNT",
+        "AZURE_SIGNING_PROFILE",
+        "WINDOWS_SIGNING_SUBJECT",
+        "HOMEBREW_APP_ID",
+        "HOMEBREW_APP_PRIVATE_KEY",
+    ] {
+        assert!(
+            preflight["env"][name].as_str().is_some(),
+            "missing preflight setting {name}"
+        );
+        assert!(preflight["run"].as_str().unwrap().contains(name));
+    }
+    assert!(
+        position("plan", "Check release prerequisites")
+            < position("plan", "Select immutable release base and version")
+    );
+    assert!(
+        position("build", "Sign and notarize private macOS executable")
+            < position("build", "Package verified Unix executable")
+    );
+    assert!(
+        !named("build", "Build and package native Windows executable")["run"]
+            .as_str()
+            .unwrap()
+            .contains("mise run package --")
+    );
+    assert_eq!(
+        jobs["sign-windows"]["runs-on"].as_str(),
+        Some("windows-latest")
+    );
+    assert_eq!(
+        jobs["sign-windows"]["permissions"]["id-token"].as_str(),
+        Some("write")
+    );
+    assert_eq!(
+        jobs["build"]["permissions"]["id-token"],
+        serde_yaml_ng::Value::Null
+    );
+    let signer = named("sign-windows", "Sign exact Windows executable");
+    assert!(
+        signer["uses"]
+            .as_str()
+            .unwrap()
+            .starts_with("Azure/artifact-signing-action@")
+    );
+    assert_eq!(signer["with"]["timestamp-digest"].as_str(), Some("SHA256"));
+    assert!(
+        signer["with"]["timestamp-rfc3161"]
+            .as_str()
+            .unwrap()
+            .contains("timestamp.acs.microsoft.com")
+    );
+    let package = named(
+        "sign-windows",
+        "Verify signature and package Windows executable",
+    )["run"]
+        .as_str()
+        .unwrap();
+    assert!(package.find("signing-verify").unwrap() < package.find("mise run package").unwrap());
+    for job in ["build", "sign-windows"] {
+        assert!(
+            named(job, "Find retained signed native package")["run"]
+                .as_str()
+                .unwrap()
+                .contains("retained-package")
+        );
+        let upload = named(job, "Retain signed native package");
+        assert!(
+            upload["if"]
+                .as_str()
+                .unwrap()
+                .contains("steps.retained.outputs.found != 'true'")
+        );
+        assert_eq!(upload["with"]["overwrite"], serde_yaml_ng::Value::Null);
+    }
+    assert!(
+        position("verify-staged", "Verify exact staged publisher signature")
+            < position(
+                "verify-staged",
+                "Verify the staged Unix executable's offline runtime"
+            )
+    );
+    assert!(
+        named(
+            "verify-staged",
+            "Accept native Homebrew install and previous-release upgrade"
+        )["run"]
+            .as_str()
+            .unwrap()
+            .contains("test:homebrew")
+    );
+    assert_eq!(
+        jobs["publish-homebrew"]["needs"].as_sequence().unwrap(),
+        &vec![
+            serde_yaml_ng::Value::from("plan"),
+            serde_yaml_ng::Value::from("bump"),
+            serde_yaml_ng::Value::from("publish")
+        ]
+    );
+    let app = steps("publish-homebrew")
+        .iter()
+        .find(|step| step["id"].as_str() == Some("tap"))
+        .unwrap();
+    assert_eq!(app["with"]["repositories"].as_str(), Some("homebrew-kuru"));
+    assert!(
+        named(
+            "publish-homebrew",
+            "Update tap from the actual immutable public release"
+        )["run"]
+            .as_str()
+            .unwrap()
+            .contains("homebrew-publish")
+    );
+    let script =
+        fs::read_to_string(root.join("packages/kuru-delivery/support/sign-macos.sh")).unwrap();
+    assert!(script.contains("--options runtime --timestamp"));
+    assert!(script.contains(".status == \"Accepted\""));
+    assert!(script.contains("security delete-keychain"));
+    assert!(!script.contains("stapler") && !script.contains("set -x"));
+
+    let native: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap(),
+    )
+    .unwrap();
+    let install = native["jobs"]["install"]["steps"].as_sequence().unwrap();
+    let acceptance = install
+        .iter()
+        .find(|step| {
+            step["name"].as_str()
+                == Some("Accept source-installed executable through native Homebrew")
+        })
+        .unwrap();
+    assert_eq!(acceptance["if"].as_str(), Some("runner.os != 'Windows'"));
+    assert!(
+        acceptance["env"]["KURU_HOMEBREW_CANDIDATE_BINARY"]
+            .as_str()
+            .unwrap()
+            .ends_with("/kuru-bin/kuru")
+    );
+    assert_eq!(
+        acceptance["env"]["KURU_HOMEBREW_RELEASE_DIR"],
+        serde_yaml_ng::Value::Null
+    );
+    assert!(
+        acceptance["run"]
+            .as_str()
+            .unwrap()
+            .contains("test:homebrew")
     );
 }
 
@@ -3063,6 +3255,8 @@ struct Remote {
     manifest: Vec<u8>,
     manifest_redirect: Option<String>,
     lose_publish_response: bool,
+    artifacts: Vec<Value>,
+    jobs: Vec<Value>,
 }
 struct Server {
     api: GitHub,
@@ -3118,6 +3312,25 @@ async fn handler(State(shared): State<Arc<Mutex<Remote>>>, request: Request) -> 
     }
     let suffix = path.strip_prefix("/repos/fixture/kuru/").unwrap_or(&path);
     let value = match (method.clone(), suffix) {
+        (Method::GET, "actions/runs/42/artifacts") => {
+            let page: usize = url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "page")
+                .unwrap()
+                .1
+                .parse()
+                .unwrap();
+            json!({"artifacts": state.artifacts.iter().skip((page - 1) * 100).take(100).collect::<Vec<_>>()})
+        }
+        (Method::GET, "actions/runs/42/jobs") => {
+            assert!(query.contains("filter=all"));
+            let page: usize = url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "page")
+                .unwrap()
+                .1
+                .parse()
+                .unwrap();
+            json!({"jobs": state.jobs.iter().skip((page - 1) * 100).take(100).collect::<Vec<_>>()})
+        }
         (Method::POST, "/graphql") => {
             if payload["variables"]["input"]["expectedHeadOid"].as_str() != Some(&state.head) {
                 return response(
@@ -3471,6 +3684,191 @@ struct Archives {
     temp: TempDir,
     directory: PathBuf,
     notes: PathBuf,
+}
+
+#[tokio::test]
+async fn retained_signatures_reuse_exact_identity_and_refuse_expired_or_deleted_packages() {
+    let server = Server::new(A).await;
+    let target = "aarch64-apple-darwin";
+    let name = release::package_artifact_name(v("0.1.0"), A, target).unwrap();
+    assert!(name.contains(A) && name.contains(target));
+    assert!(release::package_artifact_name(v("0.1.0"), "bad", target).is_err());
+    assert!(release::package_artifact_name(v("0.1.0"), A, "x86_64-apple-darwin").is_err());
+    assert!(
+        release::retained_package(&server.api, 0, v("0.1.0"), A, target)
+            .await
+            .is_err()
+    );
+    assert!(
+        !release::retained_package(&server.api, 42, v("0.1.0"), A, target)
+            .await
+            .unwrap()
+    );
+    let retained = json!({"name":name, "id":7, "expired":false});
+    // Artifacts from another commit never authorize reuse; selected artifact
+    // after the first page must still be found.
+    {
+        let mut state = server.state.lock().unwrap();
+        state.artifacts = (0..100)
+            .map(|i| json!({"name":format!("other-{i}"),"id":i,"expired":false}))
+            .collect();
+        state.artifacts.push(retained.clone());
+    }
+    assert!(
+        release::retained_package(&server.api, 42, v("0.1.0"), A, target)
+            .await
+            .unwrap()
+    );
+    for bad in [
+        json!({"name":name,"id":7,"expired":true}),
+        json!({"name":name,"expired":false}),
+    ] {
+        server.state.lock().unwrap().artifacts = vec![bad];
+        assert!(
+            release::retained_package(&server.api, 42, v("0.1.0"), A, target)
+                .await
+                .is_err()
+        );
+    }
+    server.state.lock().unwrap().artifacts = vec![retained.clone(), retained];
+    assert!(
+        release::retained_package(&server.api, 42, v("0.1.0"), A, target)
+            .await
+            .is_err()
+    );
+    for target in ["aarch64-apple-darwin", "aarch64-pc-windows-msvc"] {
+        let job = if target.contains("windows") {
+            format!("Sign Windows package ({target})")
+        } else {
+            format!("Build native package ({target})")
+        };
+        {
+            let mut state = server.state.lock().unwrap();
+            state.artifacts.clear();
+            state.jobs = (0..100)
+                .map(|_| json!({"name":"unrelated","steps":[]}))
+                .collect();
+            state.jobs.push(json!({"name":job,"steps":[{"name":"Retain signed native package","conclusion":"failure"}]}));
+        }
+        assert!(
+            !release::retained_package(&server.api, 42, v("0.1.0"), A, target)
+                .await
+                .unwrap()
+        );
+        server.state.lock().unwrap().jobs[100]["steps"][0]["conclusion"] = json!("success");
+        let error = release::retained_package(&server.api, 42, v("0.1.0"), A, target)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deleted"));
+    }
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
+}
+
+#[test]
+fn restored_native_package_has_a_closed_verified_inventory() {
+    let archives = Archives::new();
+    for target in release::TARGETS {
+        let restored = tempfile::tempdir().unwrap();
+        let core = kuru_delivery::archive::archive_name("0.1.0", target).unwrap();
+        let support = shell_support::archive_name("0.1.0", target).unwrap();
+        let names = [
+            core.clone(),
+            format!("{core}.sha256"),
+            support.clone(),
+            format!("{support}.sha256"),
+        ];
+        for name in &names {
+            fs::copy(archives.directory.join(name), restored.path().join(name)).unwrap();
+        }
+        release::verify_package(restored.path(), v("0.1.0"), target).unwrap();
+        fs::write(restored.path().join("unexpected"), "extra").unwrap();
+        assert!(release::verify_package(restored.path(), v("0.1.0"), target).is_err());
+        fs::remove_file(restored.path().join("unexpected")).unwrap();
+        fs::create_dir(restored.path().join("unexpected-dir")).unwrap();
+        assert!(release::verify_package(restored.path(), v("0.1.0"), target).is_err());
+        fs::remove_dir(restored.path().join("unexpected-dir")).unwrap();
+        for name in [&core, &support] {
+            let bytes = fs::read(restored.path().join(name)).unwrap();
+            fs::write(restored.path().join(name), b"corrupt").unwrap();
+            assert!(release::verify_package(restored.path(), v("0.1.0"), target).is_err());
+            fs::write(
+                restored.path().join(format!("{name}.sha256")),
+                format!("{}  {name}\n", digest(b"corrupt")),
+            )
+            .unwrap();
+            assert!(release::verify_package(restored.path(), v("0.1.0"), target).is_err());
+            fs::write(restored.path().join(name), bytes).unwrap();
+            fs::copy(
+                archives.directory.join(format!("{name}.sha256")),
+                restored.path().join(format!("{name}.sha256")),
+            )
+            .unwrap();
+        }
+        fs::remove_file(restored.path().join(&core)).unwrap();
+        assert!(release::verify_package(restored.path(), v("0.1.0"), target).is_err());
+    }
+}
+
+#[tokio::test]
+async fn homebrew_public_manifest_uses_actual_public_assets_without_writes() {
+    let archives = Archives::new();
+    let manifest = fs::read(archives.directory.join("SHA256SUMS")).unwrap();
+    let hashes = release::verified_assets(&archives.directory, v("0.1.0")).unwrap();
+    assert_eq!(
+        fs::read(archives.directory.join("SHA256SUMS")).unwrap(),
+        manifest
+    );
+    let server = Server::new(A).await;
+    assert!(
+        release::published_assets(&server.api, v("0.1.0"), A)
+            .await
+            .is_err()
+    );
+    archives.publish(&server.api).await.unwrap();
+    let before = server.state.lock().unwrap().calls.len();
+    assert_eq!(
+        release::published_assets(&server.api, v("0.1.0"), A)
+            .await
+            .unwrap(),
+        hashes
+    );
+    assert!(
+        server.state.lock().unwrap().calls[before..]
+            .iter()
+            .all(|(method, _, _)| *method == Method::GET)
+    );
+    for field in ["draft", "prerelease", "body"] {
+        let original = server.state.lock().unwrap().release.clone().unwrap();
+        server.state.lock().unwrap().release.as_mut().unwrap()[field] = if field == "body" {
+            json!("foreign source")
+        } else {
+            json!(true)
+        };
+        assert!(
+            release::published_assets(&server.api, v("0.1.0"), A)
+                .await
+                .is_err()
+        );
+        server.state.lock().unwrap().release = Some(original);
+    }
+    assert!(
+        release::published_assets(&server.api, v("0.1.0"), B)
+            .await
+            .is_err()
+    );
+    assert!(
+        release::published_assets(&server.api, v("0.1.0"), "bad")
+            .await
+            .is_err()
+    );
 }
 impl Archives {
     fn new() -> Self {

@@ -1,5 +1,15 @@
 # Development
 
+Homebrew delivery acceptance runs in ordinary Unix native installation CI through
+`//packages/kuru-delivery:test:homebrew`, using
+`KURU_HOMEBREW_CANDIDATE_BINARY` to select the actual source-installed executable.
+This creates isolated target-shaped formula fixtures and exercises only the
+native host, including a genuine previous published release upgrade, byte
+preservation, bundled offline memory and cleanup. Foreign fixture archives do
+not establish architecture or publisher-signing support. Release staged jobs
+instead provide `KURU_HOMEBREW_RELEASE_DIR` and `RELEASE_VERSION` for the complete
+real candidate. See [release signing and Homebrew](release.md#native-signing-setup).
+
 Install pinned tooling with `mise install`, then run `mise run setup`. Rust 1.99.0
 is declared in both mise and rust-toolchain.toml. Cargo.lock pins runtime
 transitives. The [dependency audit](dependencies.md) records latest stable
