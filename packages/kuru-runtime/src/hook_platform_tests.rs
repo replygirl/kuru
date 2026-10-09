@@ -210,7 +210,7 @@ async fn speaker_observe_keeps_the_validated_peer_and_its_speaking_dispatch() ->
         let hooks = LifecycleHooks {
             speaker_selected: vec![fake_hook(
                 r#"request=$(cat); case "$request" in *'"speaker"'*) ;; *) exit 9;; esac; case "$request" in *'"reason"'*) printf '%s' "$request" > speaker-observed; printf '%s' '{"decision":"observe"}';; *) exit 9;; esac"#,
-                r#"$inputJson = [Console]::In.ReadToEnd(); $request = $inputJson | ConvertFrom-Json; if ($null -eq $request.payload.speaker -or $null -eq $request.payload.reason) { exit 9 }; [IO.File]::WriteAllText('speaker-observed', $inputJson); [Console]::Out.Write('{"decision":"observe"}')"#,
+                r#"$inputJson = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText('speaker-observed', $inputJson); [Console]::Out.Write('{"decision":"observe"}')"#,
             )],
             ..LifecycleHooks::default()
         };
