@@ -2047,4 +2047,180 @@ mod tests {
             hash(path.as_os_str().as_encoded_bytes())
         );
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn sharing_refused_file_effects_retain_uncertain_receipts_until_exact_discard() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temporary = tempfile::tempdir()?;
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project)?;
+        let root = Arc::new(Directory::open(
+            &project,
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )?);
+        let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable)?;
+        let private_parent =
+            Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable)?;
+        let private = private_parent.create_private_directory(OsStr::new("private"))?;
+        let adjacent = parent.create_private_directory(OsStr::new(".kuru-edit-adjacent"))?;
+        adjacent
+            .create_new(OsStr::new("payload"))?
+            .write_all(b"unrelated private stage")?;
+        let adjacent_identity = adjacent.identity();
+        let store = CheckpointStore::new(private.path(), root.clone())?;
+        let lease = store.lease()?;
+        lease.mutate(
+            "adjacent-operation",
+            &hash(b"adjacent-operation"),
+            "adjacent.txt",
+            FileEffect::Write,
+            &parent,
+            OsStr::new("adjacent.txt"),
+            |_| Ok(Some(b"unrelated applied bytes".to_vec())),
+        )?;
+        drop(lease);
+        drop(store);
+        // Retain the actual neighboring receipt bytes through each selected
+        // discard; its pathname is obtained from the reopened checked store.
+        for (id, effect, after) in [
+            (
+                "sharing-replace",
+                FileEffect::Write,
+                Some(&b"replacement"[..]),
+            ),
+            ("sharing-delete", FileEffect::Delete, None),
+        ] {
+            let relative = format!("{id}.txt");
+            let name = OsStr::new(&relative);
+            let path = project.join(&relative);
+            std::fs::write(&path, b"original bytes")?;
+            let original_identity = regular_file_info(&parent.read(name)?)?.identity;
+            let store = CheckpointStore::new(private.path(), root.clone())?;
+            let adjacent_record = std::fs::read(
+                store
+                    .directory
+                    .path()
+                    .join(receipt_name("adjacent-operation")?),
+            )?;
+            let lease = store.lease()?;
+            // FILE_SHARE_READ | FILE_SHARE_WRITE permits checked snapshots,
+            // while omitting FILE_SHARE_DELETE forbids replacement/removal.
+            let blocker = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(3)
+                .open(&path)?;
+            let failed = lease.mutate(
+                id,
+                &hash(id.as_bytes()),
+                &relative,
+                effect,
+                &parent,
+                name,
+                |_| Ok(after.map(<[u8]>::to_vec)),
+            );
+            drop(blocker);
+            let failure = failed.unwrap_err();
+            ensure!(
+                failure.to_string().contains("unresolved"),
+                "sharing refusal lost its unresolved effect diagnostic: {failure:#}"
+            );
+            ensure!(
+                regular_file_info(&parent.read(name)?)?.identity == original_identity
+                    && std::fs::read(&path)? == b"original bytes",
+                "sharing refusal changed the original target"
+            );
+            let record = lease.read(id)?.context("uncertain receipt is absent")?;
+            ensure!(
+                record.state == CheckpointState::Uncertain
+                    && record.bytes(true)?.as_deref() == Some(&b"original bytes"[..])
+                    && record.bytes(false)?.as_deref() == after
+                    && record.post_identity.is_none(),
+                "sharing refusal fabricated an applied outcome"
+            );
+            drop(lease);
+            drop(store);
+
+            let reopened = CheckpointStore::new(private.path(), root.clone())?;
+            let lease = reopened.lease()?;
+            ensure!(
+                lease
+                    .inspect(id)?
+                    .is_some_and(|summary| summary.state == CheckpointState::Uncertain),
+                "uncertainty did not survive reopen"
+            );
+            let replay = lease
+                .mutate(
+                    id,
+                    &hash(id.as_bytes()),
+                    &relative,
+                    effect,
+                    &parent,
+                    name,
+                    |_| Ok(after.map(<[u8]>::to_vec)),
+                )
+                .unwrap_err();
+            ensure!(replay.to_string().contains("uncertain"), "{replay:#}");
+            ensure!(
+                regular_file_info(&parent.read(name)?)?.identity == original_identity
+                    && std::fs::read(&path)? == b"original bytes",
+                "reopened exact retry replayed the refused effect"
+            );
+            let ordinary = lease.prune(id, false).unwrap_err();
+            ensure!(ordinary.to_string().contains("uncertain"), "{ordinary:#}");
+            ensure!(lease.prune(id, true)?, "explicit selected discard failed");
+            ensure!(
+                lease.inspect(id)?.is_none(),
+                "discard retained selected receipt"
+            );
+            ensure!(
+                !project
+                    .join(format!(".kuru-edit-{}", hash(id.as_bytes())))
+                    .try_exists()?
+                    && regular_file_info(&parent.read(name)?)?.identity == original_identity
+                    && std::fs::read(&path)? == b"original bytes",
+                "discard retained selected private stage"
+            );
+            let fresh = format!("fresh-{id}");
+            let applied = lease.mutate(
+                &fresh,
+                &hash(fresh.as_bytes()),
+                &relative,
+                effect,
+                &parent,
+                name,
+                |_| Ok(after.map(<[u8]>::to_vec)),
+            )?;
+            ensure!(
+                applied.state == CheckpointState::Applied,
+                "fresh effect did not settle"
+            );
+            if let Some(bytes) = after {
+                ensure!(
+                    std::fs::read(&path)? == bytes
+                        && regular_file_info(&parent.read(name)?)?.identity != original_identity,
+                    "fresh replacement bytes or native identity differ"
+                );
+            } else {
+                ensure!(!path.try_exists()?, "fresh delete retained its target");
+            }
+            adjacent.revalidate()?;
+            ensure!(
+                std::fs::read(
+                    reopened
+                        .directory
+                        .path()
+                        .join(receipt_name("adjacent-operation")?)
+                )? == adjacent_record
+                    && std::fs::read(project.join("adjacent.txt"))? == b"unrelated applied bytes"
+                    && adjacent.identity() == adjacent_identity
+                    && std::fs::read(adjacent.path().join("payload"))?
+                        == b"unrelated private stage",
+                "selected recovery changed adjacent evidence or state"
+            );
+        }
+        Ok(())
+    }
 }

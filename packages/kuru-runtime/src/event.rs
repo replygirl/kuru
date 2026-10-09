@@ -776,6 +776,92 @@ mod tests {
     }
 
     #[test]
+    fn v2_peer_adapter_preserves_exact_routing_and_withholds_mismatched_envelopes() {
+        let message = crate::bus::PeerMessage::new(
+            "sender",
+            "recipient",
+            "session",
+            "PRIVATE_PEER_SENTINEL e\u{301} 猫",
+        )
+        .unwrap();
+        let envelope = message.rpc();
+        let accepted = Event::from_wire_v2("peer".into(), "sender".into(), envelope.to_string());
+        assert!(matches!(&accepted, Event::Peer { .. }));
+        assert_eq!(accepted.actor(), "sender");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&accepted.detail()).unwrap(),
+            envelope
+        );
+
+        let mut refused = Vec::new();
+        let mut different_id = envelope.clone();
+        different_id["id"] = json!("different-id");
+        refused.push(("different envelope ID", "sender", different_id));
+        refused.push(("different public actor", "not-the-sender", envelope.clone()));
+        let mut empty_sender = envelope.clone();
+        empty_sender["params"]["message"]["metadata"]["sender"] = json!("");
+        refused.push(("empty sender", "", empty_sender));
+        let mut empty_recipient = envelope.clone();
+        empty_recipient["params"]["message"]["metadata"]["recipient"] = json!("");
+        refused.push(("empty recipient", "sender", empty_recipient));
+        let mut no_parts = envelope.clone();
+        no_parts["params"]["message"]["parts"] = json!([]);
+        refused.push(("no text parts", "sender", no_parts));
+        let mut blank_part = envelope.clone();
+        blank_part["params"]["message"]["parts"][0]["text"] = json!(" \n\t");
+        refused.push(("blank text part", "sender", blank_part));
+        let mut oversized_part = envelope.clone();
+        oversized_part["params"]["message"]["parts"][0]["text"] = json!("x".repeat(32_769));
+        refused.push(("oversized text part", "sender", oversized_part));
+        let mut wrong_protocol = envelope.clone();
+        wrong_protocol["jsonrpc"] = json!("1.0");
+        refused.push(("wrong JSON-RPC version", "sender", wrong_protocol));
+        let mut wrong_method = envelope.clone();
+        wrong_method["method"] = json!("OtherMethod");
+        refused.push(("wrong method", "sender", wrong_method));
+        let mut extra_field = envelope.clone();
+        extra_field["unexpected"] = json!("PRIVATE_PEER_SENTINEL");
+        refused.push(("extra envelope authority", "sender", extra_field));
+        refused.push(("nonobject envelope", "sender", json!([envelope])));
+        for (label, actor, envelope) in refused {
+            // Check the parser before its separate projection limit, so the
+            // oversized-part refusal cannot pass solely because of that cap.
+            assert!(
+                super::strict_peer(actor, &envelope.to_string()).is_none(),
+                "{label}"
+            );
+            let event = Event::from_wire_v2("peer".into(), actor.into(), envelope.to_string());
+            assert!(matches!(&event, Event::Withheld { .. }), "{label}");
+            assert_eq!(event.kind(), "peer", "{label}");
+            assert_eq!(event.actor(), actor, "{label}");
+            assert_eq!(event.detail(), "[event detail withheld]", "{label}");
+            assert!(
+                !serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("PRIVATE_PEER_SENTINEL"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_peer_text_bound_is_distinct_from_public_projection_bound() {
+        let maximum =
+            crate::bus::PeerMessage::new("sender", "recipient", "session", &"x".repeat(32_768))
+                .unwrap()
+                .rpc();
+        assert!(matches!(
+            super::strict_peer("sender", &maximum.to_string()),
+            Some(Event::Peer { .. })
+        ));
+        // A valid native peer payload can exceed the smaller public event cap;
+        // retaining routing validity must not expose an oversized projection.
+        let projected = Event::from_wire_v2("peer".into(), "sender".into(), maximum.to_string());
+        assert!(matches!(projected, Event::Withheld { .. }));
+        assert_eq!(projected.detail(), "[event detail withheld]");
+    }
+
+    #[test]
     fn malformed_v2_structured_payloads_and_oversized_peer_are_withheld() {
         let invalid_state = Event::from_wire_v2(
             "state".into(),

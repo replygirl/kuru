@@ -346,7 +346,6 @@ fn canary_requires_an_explicit_model_without_opening_workspace_authority_or_memo
     assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() -> anyhow::Result<()>
 {
@@ -358,10 +357,47 @@ async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() 
         let marker = env.project.join("post-turn-hook-ran");
         let config_path = env.root.path().join("config/kuru/config.toml");
         let mut config = std::fs::read_to_string(&config_path)?;
-        config.push_str(&format!(
-            "\n[[hooks.post_turn]]\ncommand = '/bin/sh'\nargs = ['-c', 'cat >/dev/null; printf x > \"$1\"; printf RAW_HOOK_SECRET >&2; printf \"{{\"', 'hook', {}]\n",
-            toml::Value::String(marker.to_string_lossy().into_owned())
-        ));
+        #[cfg(unix)]
+        let hook = kuru_core::HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "cat >/dev/null; printf x > \"$1\"; printf RAW_HOOK_SECRET >&2; printf \"{\"".into(),
+                "hook".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            ..kuru_core::HookCommand::default()
+        };
+        #[cfg(windows)]
+        let hook = {
+            kuru_connectors::shell_warmup::warm_up_stock_powershell_hook_launch().await?;
+            kuru_core::HookCommand {
+                command: kuru_platform::windows::process::system_directory()?
+                    .join("WindowsPowerShell/v1.0/powershell.exe")
+                    .to_string_lossy()
+                    .into_owned(),
+                args: vec![
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    format!(
+                        "$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllBytes('{}', [byte[]](120)); [Console]::Error.Write('RAW_HOOK_SECRET'); [Console]::Out.Write('{{')",
+                        marker.to_string_lossy().replace('\'', "''")
+                    ),
+                ],
+                ..kuru_core::HookCommand::default()
+            }
+        };
+        let mut hook_config = toml::Table::new();
+        hook_config.insert(
+            "hooks".into(),
+            toml::Value::try_from(kuru_core::LifecycleHooks {
+                post_turn: vec![hook],
+                ..kuru_core::LifecycleHooks::default()
+            })?,
+        );
+        config.push_str(&toml::to_string(&hook_config)?);
         std::fs::write(config_path, config)?;
 
         // Retain a checked managed attachment across the CLI process boundary so
@@ -376,15 +412,25 @@ async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() 
         );
         let memory = opening.await?;
 
-        let output = tokio::task::block_in_place(|| {
-            env.run(&["run", "a completed answer survives its post hook", "--json"])
-        });
+        let observed = async {
+            let output = tokio::task::block_in_place(|| {
+                env.run(&["run", "a completed answer survives its post hook", "--json"])
+            });
+            let answer: Value = serde_json::from_slice(&output.stdout)?;
+            let session = answer["session"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("completed answer did not identify its session"))?;
+            let page = memory.public_transcript_page(session, None, 8).await?;
+            Ok::<_, anyhow::Error>((output, answer, page))
+        }
+        .await;
+        memory.close().await?;
+        let (output, answer, page) = observed?;
         assert!(
             output.status.success(),
             "settled answer failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let answer: Value = serde_json::from_slice(&output.stdout)?;
         assert!(answer["text"].as_str().is_some_and(|text| !text.is_empty()));
         let session = answer["session"].as_str().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -392,13 +438,11 @@ async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() 
         assert!(!stderr.contains("RAW_HOOK_SECRET"), "{stderr}");
         assert_eq!(std::fs::read(marker)?, b"x");
 
-        let page = memory.public_transcript_page(session, None, 8).await?;
         assert!(page.records.iter().any(|entry| {
             matches!(entry, PublicTranscriptEntry::Turn { record }
                 if record.origin_session_id == session
                     && record.settlement == PublicTurnSettlement::Completed)
         }));
-        memory.close().await?;
         Ok(())
     })
     .await

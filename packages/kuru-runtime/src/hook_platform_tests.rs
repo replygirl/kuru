@@ -70,6 +70,7 @@ async fn wait_for_file(path: &std::path::Path, bound: Duration) -> bool {
 struct Recording {
     deliberation_call: bool,
     denied_file_call: bool,
+    read_call: bool,
     requests: Mutex<Vec<CompletionRequest>>,
 }
 
@@ -91,7 +92,18 @@ impl Provider for Recording {
             .take(current)
             .any(|message| message.role == "tool");
         self.requests.lock().unwrap().push(request);
-        let completion = if self.denied_file_call && !deliberate && !saw_tool_result {
+        let completion = if self.read_call && !deliberate && !saw_tool_result {
+            Completion::from_legacy(
+                "read the proposed file",
+                vec![ToolCall {
+                    id: "platform-root-check".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"first.txt"}),
+                }],
+                1,
+                1,
+            )
+        } else if self.denied_file_call && !deliberate && !saw_tool_result {
             Completion::from_legacy(
                 "proposed write",
                 vec![ToolCall {
@@ -140,6 +152,291 @@ fn hook_seen(events: &[Event], hook_event: &str, outcome: &str, call_id: Option<
                 && observation.outcome == outcome
                 && observation.call_id.as_deref() == call_id)
     })
+}
+
+#[tokio::test]
+async fn speaker_stop_preserves_the_selected_peer_before_speaking_dispatch() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        use anyhow::ensure;
+
+        warm_hook_launch().await;
+        let project = tempfile::tempdir()?;
+        let memory = MemoryStore::temporary().await?;
+        let provider = Arc::new(Recording::default());
+        let hooks = LifecycleHooks {
+            speaker_selected: vec![fake_hook(
+                r#"cat >/dev/null; printf x > speaker-hook-ran; printf '%s' '{"decision":"stop","reason":"fixture stopped speaker"}'"#,
+                r#"$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText('speaker-hook-ran', 'x'); [Console]::Out.Write('{"decision":"stop","reason":"fixture stopped speaker"}')"#,
+            )],
+            ..LifecycleHooks::default()
+        };
+        let opening = Harness::new(config(hooks), project.path(), memory.clone(), provider.clone(), None).await;
+        let mut harness = match opening {
+            Ok(harness) => harness,
+            Err(error) => { memory.close().await?; return Err(error); }
+        };
+        let target = harness.topology.parts[0].id.clone();
+        let checked = async {
+            let original = serde_json::to_value(&harness.topology)?;
+            let error = harness.run_for("stop before speaking", Some(&target)).await
+                .err().ok_or_else(|| anyhow::anyhow!("speaker stop allowed a speaking dispatch"))?;
+            ensure!(error.to_string().contains("fixture stopped speaker"), "{error:#}");
+            let requests = provider.requests.lock().unwrap().clone();
+            ensure!(requests.len() == 1 && requests[0].instructions.contains("Phase: deliberate"));
+            ensure!(std::fs::read(project.path().join("speaker-hook-ran"))? == b"x");
+            ensure!(serde_json::to_value(&harness.topology)? == original);
+            ensure!(harness.history().await?.iter().any(|message|
+                message == &Message::text("user", "stop before speaking")));
+            ensure!(harness.hook_host().in_flight_hooks() == 0);
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        let shutdown = harness.shutdown(false).await;
+        let closed = memory.close().await;
+        shutdown?;
+        closed?;
+        checked
+    }).await
+}
+
+#[tokio::test]
+async fn speaker_observe_keeps_the_validated_peer_and_its_speaking_dispatch() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        use anyhow::ensure;
+
+        warm_hook_launch().await;
+        let project = tempfile::tempdir()?;
+        let memory = MemoryStore::temporary().await?;
+        let provider = Arc::new(Recording::default());
+        let hooks = LifecycleHooks {
+            speaker_selected: vec![fake_hook(
+                r#"request=$(cat); case "$request" in *'"speaker"'*) ;; *) exit 9;; esac; case "$request" in *'"reason"'*) printf '%s' "$request" > speaker-observed; printf '%s' '{"decision":"observe"}';; *) exit 9;; esac"#,
+                r#"$inputJson = [Console]::In.ReadToEnd(); $request = $inputJson | ConvertFrom-Json; if ($null -eq $request.payload.speaker -or $null -eq $request.payload.reason) { exit 9 }; [IO.File]::WriteAllText('speaker-observed', $inputJson); [Console]::Out.Write('{"decision":"observe"}')"#,
+            )],
+            ..LifecycleHooks::default()
+        };
+        let opening = Harness::new(config(hooks), project.path(), memory.clone(), provider.clone(), None).await;
+        let mut harness = match opening {
+            Ok(harness) => harness,
+            Err(error) => { memory.close().await?; return Err(error); }
+        };
+        let target = harness.topology.parts[0].id.clone();
+        let checked = async {
+            let original = serde_json::to_value(&harness.topology)?;
+            let output = harness.run_for("address the selected peer", Some(&target)).await?;
+            ensure!(output.text == "final answer");
+            let observed: serde_json::Value = serde_json::from_slice(&std::fs::read(project.path().join("speaker-observed"))?)?;
+            ensure!(observed["actor"] == target && observed["payload"]["speaker"] == target);
+            ensure!(observed["payload"]["reason"].as_str().is_some_and(|reason| !reason.is_empty()));
+            ensure!(serde_json::to_value(&harness.topology)? == original);
+            let requests = provider.requests.lock().unwrap().clone();
+            ensure!(requests.len() == 2 && requests.iter().any(|request|
+                request.instructions.contains("Phase: speak") && request.actor.contains(&target)));
+            ensure!(hook_seen(&output.events, "speaker_selected", "observed", None));
+            ensure!(harness.hook_host().in_flight_hooks() == 0);
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        let shutdown = harness.shutdown(false).await;
+        let closed = memory.close().await;
+        shutdown?;
+        closed?;
+        checked
+    }).await
+}
+
+#[tokio::test]
+async fn speaker_hook_cannot_rewrite_or_substitute_the_selected_peer() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        use anyhow::ensure;
+
+        warm_hook_launch().await;
+        // These are the existing Unix refusal shapes. No timing failure is
+        // needed to prove that hook text cannot grant a different peer.
+        for decision in [
+            json!({"decision":"rewrite", "value":{"actor":"another-peer"}}),
+            json!({"decision":"observe", "actor":"another-peer"}),
+            json!({"decision":"observe", "reason":"switch selection"}),
+            json!({"decision":"stop", "reason":"switch peer", "actor":"another-peer"}),
+        ] {
+            let project = tempfile::tempdir()?;
+            let memory = MemoryStore::temporary().await?;
+            let provider = Arc::new(Recording::default());
+            let reply = serde_json::to_string(&decision)?;
+            let unix = format!("cat >/dev/null; printf '%s' '{}'", reply);
+            let windows = format!(
+                "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('{}')",
+                reply
+            );
+            let hooks = LifecycleHooks {
+                speaker_selected: vec![fake_hook(&unix, &windows)],
+                ..LifecycleHooks::default()
+            };
+            let opening = Harness::new(
+                config(hooks),
+                project.path(),
+                memory.clone(),
+                provider.clone(),
+                None,
+            )
+            .await;
+            let mut harness = match opening {
+                Ok(harness) => harness,
+                Err(error) => {
+                    memory.close().await?;
+                    return Err(error);
+                }
+            };
+            let target = harness.topology.parts[0].id.clone();
+            let checked =
+                async {
+                    let original = serde_json::to_value(&harness.topology)?;
+                    let error = harness
+                        .run_for("address the selected peer", Some(&target))
+                        .await
+                        .err()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("invalid speaker decision dispatched: {decision}")
+                        })?;
+                    ensure!(error.to_string().contains("hook"), "{error:#}");
+                    ensure!(serde_json::to_value(&harness.topology)? == original);
+                    let requests = provider.requests.lock().unwrap().clone();
+                    ensure!(
+                        requests.len() == 1
+                            && requests[0].instructions.contains("Phase: deliberate")
+                    );
+                    ensure!(
+                        harness.history().await?.iter().any(|message| message
+                            == &Message::text("user", "address the selected peer"))
+                    );
+                    ensure!(harness.hook_host().in_flight_hooks() == 0);
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+            let shutdown = harness.shutdown(false).await;
+            let closed = memory.close().await;
+            shutdown?;
+            closed?;
+            checked?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn rewritten_file_read_is_checked_against_the_final_root_before_execution() -> Result<()> {
+    kuru_memory::test_support::closing(async {
+        use anyhow::{Context as _, ensure};
+
+        warm_hook_launch().await;
+        let project = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::write(project.path().join("first.txt"), "ORIGINAL_FILE_SENTINEL")?;
+        let outside_path = outside.path().join("outside.txt");
+        std::fs::write(&outside_path, "OUTSIDE_FILE_SENTINEL")?;
+        let reply = serde_json::to_string(&json!({
+            "decision":"rewrite", "value":{"name":"file_read", "arguments":{"path":outside_path}},
+        }))?;
+        let unix = format!(
+            "cat >/dev/null; printf '%s' '{}'",
+            reply.replace('\'', "'\\''")
+        );
+        let windows = format!(
+            "$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('{}')",
+            reply.replace('\'', "''")
+        );
+        let hooks = LifecycleHooks {
+            pre_tool: vec![fake_hook(&unix, &windows)],
+            ..LifecycleHooks::default()
+        };
+        let memory = MemoryStore::temporary().await?;
+        let provider = Arc::new(Recording {
+            read_call: true,
+            ..Recording::default()
+        });
+        let opening = Harness::new(
+            config(hooks),
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await;
+        let mut harness = match opening {
+            Ok(harness) => harness,
+            Err(error) => {
+                memory.close().await?;
+                return Err(error);
+            }
+        };
+        let target = harness.topology.parts[0].id.clone();
+        let checked = async {
+            let output = harness.run_for("read the file", Some(&target)).await?;
+            ensure!(output.text == "final answer");
+            let requests = provider.requests.lock().unwrap().clone();
+            let continuation = requests
+                .iter()
+                .find(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == "tool")
+                })
+                .context("rewritten read produced no tool continuation")?;
+            let receipt = crate::test_receipt(
+                continuation
+                    .messages
+                    .iter()
+                    .find(|message| message.role == "tool")
+                    .context("missing settled read message")?,
+            )
+            .context("missing settled read receipt")?;
+            ensure!(receipt["call_id"] == "platform-root-check" && receipt["is_error"] == true);
+            let cards = harness.tool_card_feed().snapshot().0;
+            let card = cards
+                .iter()
+                .find(|card| card.call_id == "platform-root-check")
+                .context("missing rewritten read card")?;
+            ensure!(card.name == "file_read");
+            let arguments = card
+                .arguments
+                .as_deref()
+                .context("missing rewritten card arguments")?;
+            ensure!(arguments.contains("outside.txt") && !arguments.contains("first.txt"));
+            ensure!(
+                serde_json::from_str::<serde_json::Value>(arguments)?
+                    == json!({"path":outside_path})
+            );
+            ensure!(card.state == crate::ToolCardState::Settled(crate::ToolOutcome::Error));
+            ensure!(hook_seen(
+                &output.events,
+                "pre_tool",
+                "rewritten",
+                Some("platform-root-check")
+            ));
+            for request in &requests {
+                let exposed = format!(
+                    "{} {}",
+                    request.instructions,
+                    serde_json::to_string(&request.messages)?
+                );
+                ensure!(
+                    !exposed.contains("ORIGINAL_FILE_SENTINEL")
+                        && !exposed.contains("OUTSIDE_FILE_SENTINEL")
+                );
+            }
+            ensure!(std::fs::read(project.path().join("first.txt"))? == b"ORIGINAL_FILE_SENTINEL");
+            ensure!(std::fs::read(&outside_path)? == b"OUTSIDE_FILE_SENTINEL");
+            ensure!(harness.hook_host().in_flight_hooks() == 0);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        let shutdown = harness.shutdown(false).await;
+        let closed = memory.close().await;
+        shutdown?;
+        closed?;
+        checked
+    })
+    .await
 }
 
 #[tokio::test]
