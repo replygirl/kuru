@@ -391,9 +391,9 @@ async fn cancelled_pre_turn_hook_is_reaped_before_the_turn_returns() {
 #[tokio::test]
 async fn lost_post_hook_reply_keeps_private_annotations_and_exact_retry_without_replaying_effects()
 -> Result<()> {
-    use anyhow::{Context as _, ensure};
-
     kuru_memory::test_support::closing(async {
+        use anyhow::{Context as _, ensure};
+
         warm_hook_launch().await;
         let project = tempfile::tempdir()?;
         let project_path = project.path().canonicalize()?;

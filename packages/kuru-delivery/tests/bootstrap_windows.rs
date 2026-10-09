@@ -1179,6 +1179,14 @@ async fn observer_stdin_eof_after_old_move_recovers_exact_original_identity() ->
     reaped?;
 
     let receipt_path = fixture.install.join(".kuru-update/receipt.json");
+    let reported_path = marker["receipt"]
+        .as_str()
+        .context("reported receipt path")?;
+    let reported_receipt = fs::File::open(reported_path)?;
+    let expected_receipt = fs::File::open(&receipt_path)?;
+    let same_receipt = regular_file_info(&reported_receipt)?.identity
+        == regular_file_info(&expected_receipt)?.identity;
+    drop((reported_receipt, expected_receipt));
     let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
     let name = receipt["displaced"].as_str().context("displaced name")?;
     kuru_platform::fs::validate_component(OsStr::new(name))?;
@@ -1190,7 +1198,7 @@ async fn observer_stdin_eof_after_old_move_recovers_exact_original_identity() ->
 
     ensure!(!status.success(), "EOF interruption unexpectedly succeeded");
     ensure!(String::from_utf8_lossy(&diagnostic).contains("failed to fill whole buffer"));
-    ensure!(marker["receipt"] == receipt_path.to_string_lossy().as_ref());
+    ensure!(same_receipt, "acknowledgment named a different receipt");
     ensure!(missing && displaced_identity == original && displaced_bytes == fixture.original);
     success(&recovery);
     fixture.unchanged();
