@@ -2,7 +2,7 @@
 
 ## Why
 
-The completed9b1426dd Windows native suite passes but canonical coverage is165513/174401 (94.903699%), below the unchanged95% goal. Saved shard exports identify real lifecycle, hook, inspection, publication and terminal-state contracts whose existing acceptance is absent on Windows or whose forcibly terminated fixtures cannot emit their profiles.
+The completed853aff8b Windows native suite passes but canonical coverage is165979/174737 (94.987896%), below the unchanged95% goal. Saved shard exports identify real lifecycle, hook, inspection, publication and terminal-state contracts whose existing acceptance is absent on Windows or whose forcibly terminated fixtures cannot emit their profiles.
 
 ## What Changes
 
@@ -11,7 +11,8 @@ The completed9b1426dd Windows native suite passes but canonical coverage is16551
 - Port existing cross-platform ToolHost MCP tests; exercise native speaker decisions and hook boundaries through existing helpers; cover successful public-page/search installation and checked terminal card rendering.
 - Exercise rejected managed session-switch outcome recovery and captured remote exports; port existing public command/session controls through ConPTY, and cover real hook request/output cancellation and denial-receipt continuity through existing native fixtures.
 - Verify cold advisory checkout provisioning and executable-config refusal with the existing local Git fixture; verify actual Windows sharing-refused file effects retain uncertain receipts and cannot replay before explicit discard.
-- Promote the completed-answer/failed-post-hook CLI contract to Windows and extend checked nonblocking stdout acknowledgement; cover selected-peer hook authority, rewritten final-root refusal and public v2 peer-event validation through existing portable runtime fixtures.
+- Promote the completed-answer/failed-post-hook CLI contract to Windows and extend checked nonblocking stdout acknowledgement; cover selected-peer hook authority, rewritten final-root refusal and public v2 peer/relationship-event validation through existing portable runtime fixtures. Relationship history must retain canonical identity on v1/v2 round-trip and withhold forged IDs, invalid membership and oversized public projections.
+- Extend the existing actor search fixture to verify approved/unchanged and denied nested instruction review, with exact permitted results and publication counts. A real Windows hard-link change during review must prevent instruction publication and search-result exposure; preserve the original and adjacent bytes.
 
 ## Impact
 

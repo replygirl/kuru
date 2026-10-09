@@ -862,6 +862,74 @@ mod tests {
     }
 
     #[test]
+    fn relationship_history_keeps_canonical_identity_and_withholds_invalid_payloads() {
+        let relationship = kuru_core::Relationship::new(
+            kuru_core::RelationshipKind::Alliance,
+            vec!["peer-a".into(), "peer-b".into()],
+        )
+        .unwrap();
+        let payload = serde_json::to_value(&relationship).unwrap();
+        for version in [1, 2] {
+            let event = if version == 1 {
+                Event::from_wire_v1("relationship".into(), "peer-a".into(), payload.to_string())
+            } else {
+                Event::from_wire_v2("relationship".into(), "peer-a".into(), payload.to_string())
+            };
+            assert!(
+                matches!(&event, Event::Relationship { relationship: restored, .. }
+                if restored == &relationship)
+            );
+            assert_eq!(event.kind(), "relationship");
+            assert_eq!(event.actor(), "peer-a");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&event.detail()).unwrap(),
+                payload
+            );
+        }
+
+        let mut forged_id = payload.clone();
+        forged_id["id"] = json!("PRIVATE_RELATIONSHIP_SENTINEL");
+        let mut duplicate_members = payload.clone();
+        duplicate_members["members"] = json!(["peer-a", "peer-a"]);
+        let mut blank_member = payload;
+        blank_member["members"] = json!(["peer-a", ""]);
+        let oversized = kuru_core::Relationship::new(
+            kuru_core::RelationshipKind::Alliance,
+            vec![
+                "peer-a".into(),
+                format!(
+                    "PRIVATE_RELATIONSHIP_SENTINEL{}",
+                    "x".repeat(super::MAX_EVENT_PAYLOAD_BYTES)
+                ),
+            ],
+        )
+        .unwrap();
+        let oversized = serde_json::to_value(oversized).unwrap();
+        // Canonical native identity is valid; the separate public projection
+        // still must withhold a payload exceeding its own bound.
+        assert!(super::strict_relationship("peer-a", &oversized.to_string()).is_some());
+        for value in [
+            forged_id,
+            duplicate_members,
+            blank_member,
+            json!("PRIVATE_RELATIONSHIP_SENTINEL"),
+            oversized,
+        ] {
+            let event =
+                Event::from_wire_v2("relationship".into(), "peer-a".into(), value.to_string());
+            assert!(matches!(&event, Event::Withheld { .. }));
+            assert_eq!(event.kind(), "relationship");
+            assert_eq!(event.actor(), "peer-a");
+            assert_eq!(event.detail(), "[event detail withheld]");
+            assert!(
+                !serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("PRIVATE_RELATIONSHIP_SENTINEL")
+            );
+        }
+    }
+
+    #[test]
     fn malformed_v2_structured_payloads_and_oversized_peer_are_withheld() {
         let invalid_state = Event::from_wire_v2(
             "state".into(),
