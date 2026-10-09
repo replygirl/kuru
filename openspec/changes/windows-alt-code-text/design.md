@@ -35,3 +35,7 @@ Actual native execution must prove protocol recognition and command behavior; cr
 
 - https://github.com/microsoft/terminal/pull/16916
 - https://github.com/microsoft/terminal/wiki/Console%3A-Potential-Breaking-Changes
+
+## Native cursor observation
+
+77a04cdf x64 fails with VT-projected cursor(row23,col21) despite the canonical18-cell draft ending atcol22. Its bounded raw output omits the separating space and final correcting cursor sequence. This does not prove the actual console caret is wrong. Use released crossterm's safe `cursor::position()` in the existing sibling fixture control channel to observe the shared active console directly. The released Windows implementation opens CONOUT$ and uses native screen-buffer information. Require exact canonical column/row plus visible composer anchor; keep all retries within the original READY deadline, and retain native/projected cursor diagnostics. Do not accept a shorter caret or enumerate lossy strings. Extend the existing request/ack channel only; no production API, new backend, dependency or unsafe consumer code.

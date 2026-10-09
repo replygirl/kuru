@@ -180,12 +180,17 @@ async fn main() -> anyhow::Result<()> {
             let command = directory.join(format!("control-{sequence}.json"));
             if command.exists() {
                 let value: serde_json::Value = serde_json::from_slice(&std::fs::read(command)?)?;
-                let focus = value["focus"].as_bool().context("focus command required")?;
-                inject_focus(focus)?;
-                publish(
-                    &directory.join(format!("ack-{sequence}.json")),
-                    &json!({"focus":focus}),
-                )?;
+                let reply = if let Some(focus) = value["focus"].as_bool() {
+                    inject_focus(focus)?;
+                    json!({"focus":focus})
+                } else if value["cursor"].as_bool() == Some(true) {
+                    // On Windows this reads the active CONOUT$ screen buffer,
+                    // independently of ConPTY's lossy VT text projection.
+                    json!({"cursor":crossterm::cursor::position()?})
+                } else {
+                    anyhow::bail!("unknown terminal control request");
+                };
+                publish(&directory.join(format!("ack-{sequence}.json")), &reply)?;
                 sequence += 1;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

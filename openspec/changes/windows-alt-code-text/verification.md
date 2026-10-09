@@ -4,7 +4,7 @@
 
 - [x] 1.1 @regression (agent) same owned ConPTY and public EventStream, documented native committed-key transport -> exactly one U+0301 Press and Release; filtered bytes equal the original decomposed draft. Original raw-text CI37853387922 demonstrated Release-only loss on x64 and ARM; it is not evidence that all ordinary keyboard input loses the accent.
 - [ ] 1.2 @integration (agent) actual mode negotiation and explicit controls -> no silent raw fallback, duplicate ordinary characters, release-triggered commands or ambiguous bare Escape after native protocol activation.
-- [ ] 1.3 @e2e (agent) public renderer/native recall -> all seven completed synthetic prompts remain exact at120/80 columns on Windows x64 and ARM; restore terminal modes and owned processes before comparison. Exact TestBackend cells/cursor must retain combining grapheme, following space and wide glyph; native projection synchronization must require the full canonical cursor with diagnostic coordinates, without claiming native glyph fidelity.
+- [ ] 1.3 @e2e (agent) public renderer/native recall -> all seven completed synthetic prompts remain exact at120/80 columns on Windows x64 and ARM; restore terminal modes and owned processes before comparison. Exact TestBackend cells/cursor must retain combining grapheme, following space and wide glyph; native synchronization must query the actual console through released crossterm and require the full canonical cursor with native/projected diagnostic coordinates, without claiming native glyph fidelity.
 
 ## 2. Repository and dependency boundaries
 

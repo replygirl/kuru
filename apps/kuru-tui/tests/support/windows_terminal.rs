@@ -456,19 +456,31 @@ impl Terminal {
     }
 
     pub fn focus(&mut self, focused: bool) -> Result<()> {
+        let reply = self.control(serde_json::json!({"focus":focused}), READY)?;
+        ensure!(
+            reply["focus"] == focused,
+            "native focus receipt differs: {reply}"
+        );
+        Ok(())
+    }
+
+    fn control(
+        &mut self,
+        command: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
         let path = self
             .directory
             .join(format!("control-{}.json", self.sequence));
         let temporary = path.with_extension("pending");
-        std::fs::write(
-            &temporary,
-            serde_json::to_vec(&serde_json::json!({"focus":focused}))?,
-        )?;
+        std::fs::write(&temporary, serde_json::to_vec(&command)?)?;
         std::fs::rename(temporary, path)?;
         let ack = self.directory.join(format!("ack-{}.json", self.sequence));
-        self.wait("native focus record acknowledged", READY, |_| ack.is_file())?;
+        self.wait("native console control acknowledged", timeout, |_| {
+            ack.is_file()
+        })?;
         self.sequence += 1;
-        Ok(())
+        Ok(serde_json::from_slice(&std::fs::read(ack)?)?)
     }
 
     pub fn composer(&mut self, draft: &str) -> Result<()> {
@@ -486,39 +498,55 @@ impl Terminal {
         })
     }
 
-    /// ConPTY can change the visible tail after a combining glyph. Bind this
-    /// short draft to its stable composer anchor and full canonical caret,
-    /// independent of that lossy text projection. Durable bytes are checked
-    /// separately; this does not establish native glyph fidelity.
+    /// Bind the short draft to its actual native console caret. ConPTY's VT
+    /// projection can lose a space/cursor advance after a combining glyph;
+    /// it is not authority for canonical text or native cursor coordinates.
     pub fn composer_projection(&mut self, canonical: &str, anchor: &str) -> Result<()> {
-        self.wait(
-            &format!("completed canonical composer cursor after {canonical:?}"),
-            READY,
-            |terminal| {
-                let screen = terminal.parser.screen();
-                screen
-                    .rows(0, screen.size().1)
-                    .enumerate()
-                    .any(|(row, line)| {
-                        line.find(anchor).is_some_and(|start| {
-                            let column = unicode_width::UnicodeWidthStr::width(&line[..start])
-                                + unicode_width::UnicodeWidthStr::width(canonical);
-                            line[..start].trim_end().ends_with('›')
-                                && screen.cursor_position() == (row as u16, column as u16)
-                                && !screen.hide_cursor()
-                        })
-                    })
-            },
-        )
-        .with_context(|| {
-            format!(
-                "canonical width={}, native cursor={:?}, hidden={}, last 2048 output bytes={:?}",
-                unicode_width::UnicodeWidthStr::width(canonical),
-                self.parser.screen().cursor_position(),
-                self.parser.screen().hide_cursor(),
-                String::from_utf8_lossy(&self.output[self.output.len().saturating_sub(2048)..])
-            )
-        })
+        let target = |terminal: &Self| {
+            let screen = terminal.parser.screen();
+            if screen.hide_cursor() {
+                return None;
+            }
+            screen
+                .rows(0, screen.size().1)
+                .enumerate()
+                .find_map(|(row, line)| {
+                    let start = line.find(anchor)?;
+                    if !line[..start].trim_end().ends_with('›') {
+                        return None;
+                    }
+                    let column = unicode_width::UnicodeWidthStr::width(&line[..start])
+                        + unicode_width::UnicodeWidthStr::width(canonical);
+                    Some((column as u16, row as u16))
+                })
+        };
+        let deadline = Instant::now() + READY;
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .context("canonical native composer cursor did not settle within READY")
+        };
+        let mut native = None;
+        let outcome = (|| -> Result<()> {
+            loop {
+                self.wait("visible native composer anchor", remaining()?, |terminal| {
+                    target(terminal).is_some()
+                })?;
+                let reply = self.control(serde_json::json!({"cursor":true}), remaining()?)?;
+                let [column, row]: [u16; 2] = serde_json::from_value(reply["cursor"].clone())
+                    .context("native console cursor receipt absent")?;
+                native = Some((column, row));
+                if native == target(self) {
+                    return Ok(());
+                }
+            }
+        })();
+        outcome.with_context(|| format!(
+            "canonical width={}, target={:?}, native={native:?}, projected cursor={:?}, hidden={}, last 2048 output bytes={:?}",
+            unicode_width::UnicodeWidthStr::width(canonical), target(self),
+            self.parser.screen().cursor_position(), self.parser.screen().hide_cursor(),
+            String::from_utf8_lossy(&self.output[self.output.len().saturating_sub(2048)..])
+        ))
     }
 
     /// Assert the entire observation interval, without first waiting for silence.
