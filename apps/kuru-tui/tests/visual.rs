@@ -382,6 +382,28 @@ fn long_model_catalog_scrolls_selection_into_view_and_preserves_draft() {
 }
 
 #[test]
+fn combining_draft_keeps_the_following_space_wide_glyph_and_canonical_cursor() {
+    let draft = "literal draft e\u{301} 猫";
+    let mut view = fixture(Mode::Freudian);
+    view.show_scene = false;
+    for ch in draft.chars() {
+        view.key(key(KeyCode::Char(ch)));
+    }
+    for width in [120, 80] {
+        let (buffer, cursor) = render(&view, width, 30, "combining-draft");
+        assert_eq!(view.input, draft);
+        assert_eq!(view.cursor, draft.len());
+        assert_eq!(cursor.0, 4 + draft.width() as u16);
+        let row = cursor.1;
+        assert_eq!(buffer.cell((18, row)).unwrap().symbol(), "e\u{301}");
+        assert_eq!(buffer.cell((19, row)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((20, row)).unwrap().symbol(), "猫");
+        assert!(text(&buffer).contains(draft));
+    }
+    assert_eq!(view.key(key(KeyCode::Enter)).as_deref(), Some(draft));
+}
+
+#[test]
 fn unicode_editor_and_cursor_survive_resize_even_below_supported_layout_size() {
     let mut view = fixture(Mode::Jungian);
     for ch in "long draft 猫 🌿 ".repeat(6).chars() {

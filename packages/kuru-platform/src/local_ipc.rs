@@ -7,11 +7,13 @@
 use crate::fs::{Directory, NameRetention, Privacy, validate_component};
 use std::{
     ffi::{OsStr, OsString},
-    fs, io,
+    fs,
+    future::Future as _,
+    io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{UnixListener, UnixSocket, UnixStream};
 
 /// A checked, short owner-private socket directory. Unix-domain socket names
 /// have a fixed native path limit, so a configured data directory cannot be
@@ -50,6 +52,13 @@ fn short_directory_path(locator: &str) -> io::Result<PathBuf> {
         .join(locator))
 }
 
+// Mio sets close-on-exec in a separate step on Darwin. Listener creation
+// must not overlap an owned child's copy of the descriptor table.
+fn bind_listener(path: &Path) -> io::Result<UnixListener> {
+    let _spawning = crate::unix::spawn_lock();
+    UnixListener::bind(path)
+}
+
 pub struct PrivateServiceListener {
     directory: Directory,
     name: OsString,
@@ -73,7 +82,7 @@ impl PrivateServiceListener {
         }
         let directory = private;
         let path = directory.path().join(name);
-        let listener = UnixListener::bind(&path)?;
+        let listener = bind_listener(&path)?;
         let result = (|| {
             directory.revalidate()?;
             let metadata = fs::symlink_metadata(&path)?;
@@ -120,7 +129,14 @@ impl PrivateServiceListener {
 
     pub async fn accept(&self) -> io::Result<UnixStream> {
         self.directory.revalidate()?;
-        let (stream, _) = self.listener.accept().await?;
+        // Guard each synchronous poll, including accept's descriptor creation,
+        // while retaining the existing future's independent readiness waiter.
+        let mut accepting = std::pin::pin!(self.listener.accept());
+        let (stream, _) = std::future::poll_fn(|cx| {
+            let _spawning = crate::unix::spawn_lock();
+            accepting.as_mut().poll(cx)
+        })
+        .await?;
         self.directory.revalidate()?;
         Ok(stream)
     }
@@ -165,7 +181,146 @@ pub async fn connect(directory: &Directory, name: &OsStr) -> io::Result<UnixStre
             "private service endpoint is not an owner-private socket",
         ));
     }
-    let stream = UnixStream::connect(&path).await?;
+    let socket = {
+        let _spawning = crate::unix::spawn_lock();
+        UnixSocket::new_stream()?
+    };
+    let stream = socket.connect(&path).await?;
     private.revalidate()?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod refusal_contracts {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn short_directory_cold_probe_preserves_the_shared_prefix_and_only_owns_its_leaf() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            ^ (u128::from(std::process::id()) << 64);
+        let locator = format!("{nonce:024x}");
+        let path = short_directory_path(&locator).unwrap();
+        assert!(!path.exists());
+        let prefix = path.parent().unwrap();
+        let prefix_existed = prefix.exists();
+        assert_eq!(
+            open_short_directory(&locator).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!path.exists(), "a cold client must not create state");
+        assert_eq!(prefix.exists(), prefix_existed);
+        let retained_prefix = prefix_existed
+            .then(|| Directory::open(prefix, Privacy::OwnerOnly, NameRetention::Pinned).unwrap());
+        let prefix_mode =
+            prefix_existed.then(|| fs::metadata(prefix).unwrap().permissions().mode());
+        // Product preparation may create its checked private prefix when
+        // absent. The fixture never chmods or removes that shared prefix.
+        let prepared = prepare_short_directory(&locator).unwrap();
+        let reopened = open_short_directory(&locator).unwrap();
+        assert_eq!(prepared.identity(), reopened.identity());
+        drop(reopened);
+        prepared.remove_tree().unwrap();
+        assert!(!path.exists());
+        assert!(prefix.exists());
+        if let Some(retained_prefix) = retained_prefix {
+            retained_prefix.revalidate().unwrap();
+            assert_eq!(
+                fs::metadata(prefix).unwrap().permissions().mode(),
+                prefix_mode.unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_endpoint_names_and_stale_sockets_never_adopt_or_remove_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let path = directory.path().to_path_buf();
+        fs::write(path.join("adjacent"), b"unchanged").unwrap();
+        fs::set_permissions(path.join("adjacent"), fs::Permissions::from_mode(0o600)).unwrap();
+        for name in ["", "..", "nested/endpoint", "endpoint\0outside"] {
+            assert_eq!(
+                connect(&directory, OsStr::new(name))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                PrivateServiceListener::bind_at(
+                    Directory::ensure_private(&path).unwrap(),
+                    OsStr::new(name),
+                )
+                .err()
+                .unwrap()
+                .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            connect(&directory, OsStr::new("missing"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let endpoint = path.join("stale.sock");
+        {
+            let _spawning = crate::unix::spawn_lock();
+            let native = UnixSocket::new_stream().unwrap();
+            native.bind(&endpoint).unwrap();
+            // Never listen: even a temporary forked copy must not accept a
+            // connection before closing and turn refusal into peer reset.
+            fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
+            drop(native);
+        }
+        let stale = fs::symlink_metadata(&endpoint).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect(&directory, OsStr::new("stale.sock")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        let retained = fs::symlink_metadata(&endpoint).unwrap();
+        assert!(retained.file_type().is_socket());
+        assert_eq!((retained.dev(), retained.ino()), (stale.dev(), stale.ino()));
+        assert!(
+            PrivateServiceListener::bind_at(
+                Directory::ensure_private(&path).unwrap(),
+                OsStr::new("stale.sock"),
+            )
+            .is_err()
+        );
+        let retained = fs::symlink_metadata(&endpoint).unwrap();
+        assert_eq!((retained.dev(), retained.ino()), (stale.dev(), stale.ino()));
+        assert_eq!(fs::read(path.join("adjacent")).unwrap(), b"unchanged");
+    }
+
+    #[tokio::test]
+    async fn listener_drop_preserves_another_native_socket_at_the_same_name() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let listener =
+            PrivateServiceListener::bind_at(directory, OsStr::new("generation.sock")).unwrap();
+        let original = listener.path();
+        let moved = original.with_file_name("displaced.sock");
+        fs::rename(&original, &moved).unwrap();
+        let replacement = bind_listener(&original).unwrap();
+        let identity = fs::symlink_metadata(&original).unwrap().ino();
+        drop(listener);
+        assert_eq!(fs::symlink_metadata(&original).unwrap().ino(), identity);
+        assert!(
+            fs::symlink_metadata(&moved)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        drop(replacement);
+    }
 }

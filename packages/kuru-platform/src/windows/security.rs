@@ -831,6 +831,43 @@ mod tests {
     }
 
     #[test]
+    fn sid_allocation_checks_reject_truncation_and_invalid_revisions_before_native_use() {
+        // The input buffer is synthetic public SID bytes, never credentials or
+        // a live token. Invalid pointers are bounds-checked before dereference.
+        let mut bytes = [0_u8; 16];
+        for length in [0, 7] {
+            // SAFETY: the entire supplied allocation remains live; bounded_sid
+            // must refuse the incomplete header before reading any SID field.
+            let error = unsafe { bounded_sid(bytes.as_mut_ptr().cast(), bytes.as_ptr(), length) }
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        bytes[0] = 1;
+        bytes[1] = 3;
+        // SAFETY: the fixed header is allocated; the declared subauthority
+        // extent is deliberately larger and must be refused before native use.
+        assert!(
+            unsafe { bounded_sid(bytes.as_mut_ptr().cast(), bytes.as_ptr(), bytes.len()) }
+                .unwrap_err()
+                .to_string()
+                .contains("extends outside")
+        );
+        bytes[0] = 255;
+        bytes[1] = 0;
+        // SAFETY: a complete fixed header with zero subauthorities is live;
+        // IsValidSid is allowed to inspect this bounded but invalid revision.
+        assert_eq!(
+            unsafe { bounded_sid(bytes.as_mut_ptr().cast(), bytes.as_ptr(), bytes.len()) }
+                .unwrap_err()
+                .to_string(),
+            "invalid SID"
+        );
+        // SAFETY: null is an intentionally invalid candidate pointer, whereas
+        // buffer is allocated. The extent check must never dereference null.
+        assert!(unsafe { bounded_sid(null_mut(), bytes.as_ptr(), bytes.len()) }.is_err());
+    }
+
+    #[test]
     fn retired_access_comparison_ignores_only_inherited_ace_provenance() {
         fn token(flags: u8, mask: u32, payload: [u8; 4]) -> Vec<u8> {
             let mut dacl = vec![2, 0, 0, 0, 0, 0, 1, 0];
@@ -1701,5 +1738,522 @@ mod tests {
         let error = require_private(file.as_handle(), false).unwrap_err();
         assert!(error.to_string().contains("another user"), "{error}");
         assert_eq!(security_text(&file), before);
+    }
+
+    #[test]
+    fn null_and_empty_dacls_refuse_public_access_work_without_repair() {
+        use crate::fs::{copy_file_access, finalize_file_access, regular_file_info};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut source = private.create_new(OsStr::new("source")).unwrap();
+        source.write_all(b"source evidence").unwrap();
+        let mut candidate = private.create_new(OsStr::new("candidate")).unwrap();
+        candidate.write_all(b"candidate evidence").unwrap();
+        let source_identity = regular_file_info(&source).unwrap().identity;
+        let candidate_identity = regular_file_info(&candidate).unwrap().identity;
+        let original = descriptor(&security_text(&source));
+        let candidate_acl = security_text(&candidate);
+        set_dacl_on_handle(source.as_handle(), null());
+        let null_acl = security_text(&source);
+        let copied = copy_file_access(&source, &candidate);
+        let finalized = finalize_file_access(&source, &candidate);
+        let null_after = security_text(&source);
+        let candidate_after_null = security_text(&candidate);
+        // Restore through the existing WRITE_DAC handle, never reopen a name
+        // after a deliberately restrictive ACL has been installed.
+        set_dacl_on_handle(source.as_handle(), original.dacl().unwrap());
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let empty = descriptor(&format!("O:{sid}D:P"));
+        set_dacl_on_handle(source.as_handle(), empty.dacl().unwrap());
+        let empty_acl = security_text(&source);
+        let admitted = require_private(source.as_handle(), false);
+        let empty_after = security_text(&source);
+        set_dacl_on_handle(source.as_handle(), original.dacl().unwrap());
+
+        assert_eq!(
+            copied
+                .err()
+                .expect("NULL DACL must not be copied")
+                .to_string(),
+            "file access descriptor is incomplete"
+        );
+        assert_eq!(
+            finalized.unwrap_err().to_string(),
+            "source file has no bounded DACL"
+        );
+        assert_eq!(
+            admitted.unwrap_err().to_string(),
+            "private object has no effective owner grant"
+        );
+        assert_eq!(null_after, null_acl);
+        assert_eq!(empty_after, empty_acl);
+        assert_eq!(candidate_after_null, candidate_acl);
+        assert_eq!(
+            regular_file_info(&source).unwrap().identity,
+            source_identity
+        );
+        assert_eq!(
+            regular_file_info(&candidate).unwrap().identity,
+            candidate_identity
+        );
+        assert_eq!(
+            std::fs::read(private.path().join("source")).unwrap(),
+            b"source evidence"
+        );
+        assert_eq!(
+            std::fs::read(private.path().join("candidate")).unwrap(),
+            b"candidate evidence"
+        );
+        drop((source, candidate));
+        private.remove_tree().unwrap();
+    }
+
+    #[test]
+    fn unprotected_private_child_uses_its_verified_ancestor_without_policy_repair() {
+        use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let child = parent
+            .create_private_directory(OsStr::new("child"))
+            .unwrap();
+        let identity = child.identity();
+        let acl_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(child.path())
+            .unwrap();
+        let original = descriptor(&security_text(&acl_handle));
+        // SAFETY: this retained fixture-only WRITE_DAC handle identifies the
+        // child; the descriptor remains live, and its parent is owner-private.
+        let status = unsafe {
+            SetSecurityInfo(
+                acl_handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                original.dacl().unwrap(),
+                null(),
+            )
+        };
+        assert_eq!(status, 0, "fixture could not unprotect its private child");
+        let unprotected = security_text(&acl_handle);
+        let descendant_check = require_private(acl_handle.as_handle(), false);
+        let root_check = require_private(acl_handle.as_handle(), true);
+        let admitted = Directory::open(child.path(), Privacy::OwnerOnly, NameRetention::Movable);
+        let unchanged = security_text(&acl_handle);
+        set_dacl_on_handle(acl_handle.as_handle(), original.dacl().unwrap());
+        drop(acl_handle);
+
+        descendant_check.unwrap();
+        assert_eq!(
+            root_check.unwrap_err().to_string(),
+            "private root must have a protected DACL"
+        );
+        let admitted = admitted.unwrap();
+        assert_eq!(admitted.identity(), identity);
+        assert!(admitted.is_within(&parent).unwrap());
+        assert_eq!(unchanged, unprotected);
+        drop((child, admitted));
+        parent.remove_tree().unwrap();
+    }
+
+    #[test]
+    fn retained_named_source_refuses_changed_dacl_and_preserves_both_files() {
+        use crate::fs::{
+            copy_file_access, regular_file_info, verify_file_access, verify_retained_file_access,
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut source = private.create_new(OsStr::new("source")).unwrap();
+        source.write_all(b"source evidence").unwrap();
+        let mut candidate = private.create_new(OsStr::new("candidate")).unwrap();
+        candidate.write_all(b"candidate evidence").unwrap();
+        let source_identity = regular_file_info(&source).unwrap().identity;
+        let candidate_identity = regular_file_info(&candidate).unwrap().identity;
+        let token = copy_file_access(&source, &candidate).unwrap();
+        let original = descriptor(&security_text(&source));
+        let candidate_acl = security_text(&candidate);
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let changed = descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"));
+        set_dacl_on_handle(source.as_handle(), changed.dacl().unwrap());
+        let changed_acl = security_text(&source);
+        let ordinary = verify_file_access(&source, &token);
+        let retained = verify_retained_file_access(&source, &token);
+        let after = security_text(&source);
+        let candidate_after = security_text(&candidate);
+        set_dacl_on_handle(source.as_handle(), original.dacl().unwrap());
+
+        assert_eq!(
+            ordinary.unwrap_err().to_string(),
+            "file access policy changed during publication"
+        );
+        assert_eq!(
+            retained.unwrap_err().to_string(),
+            "file access policy changed during publication"
+        );
+        assert_eq!(after, changed_acl);
+        assert_eq!(candidate_after, candidate_acl);
+        assert_eq!(
+            regular_file_info(&source).unwrap().identity,
+            source_identity
+        );
+        assert_eq!(
+            regular_file_info(&candidate).unwrap().identity,
+            candidate_identity
+        );
+        assert_eq!(
+            std::fs::read(private.path().join("source")).unwrap(),
+            b"source evidence"
+        );
+        assert_eq!(
+            std::fs::read(private.path().join("candidate")).unwrap(),
+            b"candidate evidence"
+        );
+        drop((source, candidate, token));
+        private.remove_tree().unwrap();
+    }
+
+    #[test]
+    fn readonly_published_handle_cannot_settle_inheritance_without_write_dac() {
+        use crate::fs::{Publication, copy_file_access, finalize_file_access, regular_file_info};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let (mut source, _) = default_owned_file(&parent);
+        source.write_all(b"source evidence").unwrap();
+        let stage = parent
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let mut candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"published evidence").unwrap();
+        let identity = regular_file_info(&candidate).unwrap().identity;
+        let access = copy_file_access(&source, &candidate).unwrap();
+        let unprotected_source = file_access_token(source.as_handle()).unwrap()[0];
+        parent
+            .publish_file_with_access(
+                &stage,
+                OsStr::new("payload"),
+                &candidate,
+                &access,
+                OsStr::new("published"),
+                Publication::New,
+            )
+            .unwrap();
+        let readonly = parent.read(OsStr::new("published")).unwrap();
+        let before = security_text(&readonly);
+        let result = finalize_file_access(&source, &readonly);
+        let after = security_text(&readonly);
+        let held_identity = regular_file_info(&readonly).unwrap().identity;
+        let bytes = std::fs::read(parent.path().join("published")).unwrap();
+        // Settle through the actual retained writable stage handle only after
+        // collecting the refusal; the readonly handle grants no WRITE_DAC.
+        let settled = finalize_file_access(&source, &candidate);
+        drop((source, candidate, readonly, access, stage));
+        parent.remove_tree().unwrap();
+
+        assert_eq!(
+            unprotected_source, 0,
+            "fixture source must require inheritance finalization"
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(after, before);
+        assert_eq!(held_identity, identity);
+        assert_eq!(bytes, b"published evidence");
+        settled.unwrap();
+    }
+
+    #[test]
+    fn metadata_only_source_refuses_public_security_operations_without_read_control() {
+        use crate::fs::{copy_file_access, finalize_file_access, regular_file_info};
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut source = private.create_new(OsStr::new("source")).unwrap();
+        source.write_all(b"metadata-only source evidence").unwrap();
+        let mut candidate = private.create_new(OsStr::new("candidate")).unwrap();
+        candidate
+            .write_all(b"untouched candidate evidence")
+            .unwrap();
+        // A real, valid file handle can inspect identity but carries neither
+        // READ_CONTROL nor WRITE_DAC. The private ACL itself remains unchanged.
+        let metadata = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(private.path().join("source"))
+            .unwrap();
+        let before = [
+            (
+                regular_file_info(&source).unwrap(),
+                file_access_token(source.as_handle()).unwrap(),
+            ),
+            (
+                regular_file_info(&candidate).unwrap(),
+                file_access_token(candidate.as_handle()).unwrap(),
+            ),
+        ];
+        let metadata_identity = regular_file_info(&metadata);
+        let private_check = crate::fs::require_private(&metadata);
+        let copied = copy_file_access(&metadata, &candidate).map(drop);
+        let finalized = finalize_file_access(&metadata, &candidate);
+        let owner = file_owner(metadata.as_handle()).map(|(allocation, _)| drop(allocation));
+        let after = [
+            (
+                regular_file_info(&source),
+                file_access_token(source.as_handle()),
+            ),
+            (
+                regular_file_info(&candidate),
+                file_access_token(candidate.as_handle()),
+            ),
+        ];
+        let bytes = [
+            std::fs::read(private.path().join("source")),
+            std::fs::read(private.path().join("candidate")),
+        ];
+        drop((metadata, source, candidate));
+        private.remove_tree().unwrap();
+
+        assert_eq!(metadata_identity.unwrap(), before[0].0);
+        for (operation, result) in [
+            ("private admission", private_check),
+            ("access copy", copied),
+            ("inheritance finalization", finalized),
+            ("owner read", owner),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(5), "{operation}: {error}");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{operation}");
+        }
+        for ((metadata, acl), expected) in after.into_iter().zip(before) {
+            assert_eq!((metadata.unwrap(), acl.unwrap()), expected);
+        }
+        assert_eq!(bytes[0].as_ref().unwrap(), b"metadata-only source evidence");
+        assert_eq!(bytes[1].as_ref().unwrap(), b"untouched candidate evidence");
+    }
+
+    #[test]
+    fn readonly_private_handle_cannot_seal_without_write_dac() {
+        use crate::fs::{regular_file_info, seal_private};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut writable = private.create_new(OsStr::new("payload")).unwrap();
+        writable.write_all(b"readonly seal evidence").unwrap();
+        let readonly = private.read(OsStr::new("payload")).unwrap();
+        let before = (
+            regular_file_info(&writable).unwrap(),
+            file_access_token(writable.as_handle()).unwrap(),
+        );
+        let readable_private = crate::fs::require_private(&readonly);
+        let result = seal_private(&readonly, false);
+        let after = (
+            regular_file_info(&writable),
+            file_access_token(writable.as_handle()),
+        );
+        let bytes = std::fs::read(private.path().join("payload"));
+        drop((readonly, writable));
+        private.remove_tree().unwrap();
+
+        readable_private.unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!((after.0.unwrap(), after.1.unwrap()), before);
+        assert_eq!(bytes.unwrap(), b"readonly seal evidence");
+    }
+
+    #[test]
+    fn installed_conditional_ace_refuses_private_admission_and_sealing_without_repair() {
+        use crate::fs::{regular_file_info, seal_private};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut file = private.create_new(OsStr::new("payload")).unwrap();
+        file.write_all(b"conditional ACL evidence").unwrap();
+        let original = descriptor(&security_text(&file));
+        let original_access = file_access_token(file.as_handle()).unwrap();
+        let original_info = regular_file_info(&file).unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        // Native SDDL constructs a valid callback ACE. The unconditional owner
+        // grant remains; private admission may not assume what its condition
+        // means or discard it while repairing the object's access policy.
+        let conditional = descriptor(&format!(
+            "O:{sid}D:P(A;;FA;;;{sid})(XA;;FR;;;WD;(@User.Title==\"KuruFixture\"))"
+        ));
+        let set_fixture_dacl = |handle: BorrowedHandle<'_>, dacl| {
+            // SAFETY: this isolated file and the supplied fixture descriptor
+            // remain retained through this synchronous DACL-only update.
+            let status = unsafe {
+                SetSecurityInfo(
+                    handle.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    dacl,
+                    null(),
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(status as i32))
+            }
+        };
+        let installation = set_fixture_dacl(file.as_handle(), conditional.dacl().unwrap());
+        let installed = file_access_token(file.as_handle());
+        let admitted = crate::fs::require_private(&file);
+        let sealed = seal_private(&file, false);
+        let opened = private.read(OsStr::new("payload")).map(drop);
+        let after = file_access_token(file.as_handle());
+        let after_info = regular_file_info(&file);
+        let bytes = std::fs::read(private.path().join("payload"));
+        // Restore the exact captured native DACL before any outcome assertion
+        // or checked tree removal, including an unexpectedly accepted result.
+        let restoration = set_fixture_dacl(file.as_handle(), original.dacl().unwrap());
+        let restored = file_access_token(file.as_handle());
+        let binding = private.verify(OsStr::new("payload"), &file);
+        drop(file);
+        private.remove_tree().unwrap();
+
+        installation.expect("native conditional ACL installation must succeed");
+        restoration.expect("native original ACL restoration must succeed");
+        let installed = installed.unwrap();
+        assert_ne!(
+            installed, original_access,
+            "conditional ACE was not installed"
+        );
+        for (operation, result) in [
+            ("private admission", admitted),
+            ("private sealing", sealed),
+            ("owner-only opening", opened),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{operation}");
+            assert_eq!(
+                error.to_string(),
+                "unmodeled private ACL entry",
+                "{operation}"
+            );
+        }
+        assert_eq!(
+            after.unwrap(),
+            installed,
+            "refusal repaired or lost the conditional ACE"
+        );
+        assert_eq!(after_info.unwrap(), original_info);
+        assert_eq!(bytes.unwrap(), b"conditional ACL evidence");
+        assert_eq!(
+            restored.unwrap(),
+            original_access,
+            "original ACL was not restored exactly"
+        );
+        binding.unwrap();
+    }
+
+    #[test]
+    fn malformed_policy_extents_cannot_supply_retirement_authority_even_to_themselves() {
+        let owner = [1, 1, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0];
+        let dacl = [
+            2,
+            0,
+            28,
+            0,
+            1,
+            0,
+            0,
+            0,
+            ACCESS_ALLOWED_ACE_TYPE as u8,
+            INHERITED_ACE as u8,
+            20,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            5,
+            21,
+            0,
+            0,
+            0,
+        ];
+        let original_dacl = dacl;
+        for (allocation, used) in [(&dacl[..7], 7), (&dacl[..], 7), (&dacl[..], 29)] {
+            let error = canonical_access_token(false, &owner, allocation, used, 1).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "file DACL used extent is invalid");
+        }
+        assert_eq!(
+            dacl, original_dacl,
+            "encoder changed caller-owned ACL storage"
+        );
+        let valid = canonical_access_token(false, &owner, &dacl, dacl.len(), 1).unwrap();
+        assert!(same_retired_file_access(&valid, &valid));
+        for length in 0..valid.len() {
+            let truncated = &valid[..length];
+            assert!(
+                !same_retired_file_access(truncated, truncated),
+                "truncated extent {length}"
+            );
+        }
+        let owner_end = 5 + owner.len();
+        let ace_start = owner_end + 9;
+        let mut malformed = Vec::new();
+        let mut oversized_owner = valid.clone();
+        oversized_owner[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed.push(("owner extent", oversized_owner));
+        let mut excessive_count = valid.clone();
+        excessive_count[owner_end + 1..owner_end + 5].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed.push(("ACE count", excessive_count));
+        let mut excessive_extent = valid.clone();
+        excessive_extent[owner_end + 5..owner_end + 9].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed.push(("ACE allocation", excessive_extent));
+        let mut unaccounted_payload = valid.clone();
+        unaccounted_payload[owner_end + 1..owner_end + 5].copy_from_slice(&0_u32.to_le_bytes());
+        malformed.push(("unaccounted ACE payload", unaccounted_payload));
+        for (label, size) in [
+            ("short ACE", 3_u16),
+            ("oversized ACE", 21),
+            ("unused ACE extent", 4),
+        ] {
+            let mut record = valid.clone();
+            record[ace_start + 2..ace_start + 4].copy_from_slice(&size.to_le_bytes());
+            malformed.push((label, record));
+        }
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        malformed.push(("trailing allocation", trailing));
+        for (label, record) in malformed {
+            let untouched = record.clone();
+            assert!(
+                !same_retired_file_access(&record, &record),
+                "{label} accepted itself"
+            );
+            assert!(
+                !same_retired_file_access(&record, &valid),
+                "{label} accepted valid authority"
+            );
+            assert!(
+                !same_retired_file_access(&valid, &record),
+                "valid authority accepted {label}"
+            );
+            assert_eq!(record, untouched, "decoder mutated {label}");
+        }
     }
 }

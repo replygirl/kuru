@@ -2,14 +2,17 @@
 
 use kuru_platform::windows::pipe::Pipe;
 use kuru_platform::windows::process::{
-    NativeChild, NativeSpawnSpec, StandardStream, Stdio, configured_command,
+    CommandSyntax, NativeChild, NativeSpawnSpec, StandardStream, Stdio, configured_command,
     current_process_handle, duplicate_inherited_process_handle, environment_key_eq,
     inherited_stdio, merge_environment, resolve_executable, system_directory, wait_process_handle,
 };
 use std::{
     ffi::{OsStr, OsString},
-    os::windows::{ffi::OsStringExt, io::AsRawHandle},
-    path::{Path, PathBuf},
+    os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        io::AsRawHandle,
+    },
+    path::{Component, Path, PathBuf, Prefix},
     time::Duration,
 };
 use tokio::io::AsyncReadExt;
@@ -100,6 +103,117 @@ async fn batch_transport_runs_the_native_capture_fixture_with_literal_data() {
 }
 
 #[tokio::test]
+async fn batch_verbatim_identity_and_unc_working_directory_are_checked_before_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let peer = root.path().join("batch peer.exe");
+    let marker = root.path().join("batch-reached");
+    std::fs::copy(env!("CARGO_BIN_EXE_kuru-platform-process-fixture"), &peer).unwrap();
+    let script = format!(
+        "@echo reached> \"{}\"\r\n@\"{}\" capture %*\r\n",
+        marker.display(),
+        peer.display(),
+    );
+    let target = root.path().join("verbatim shim.cmd");
+    std::fs::write(&target, &script).unwrap();
+    let target = target.canonicalize().unwrap();
+    // NativeSpawnSpec keeps this exact spelling; configured_command normally
+    // shortens ordinary canonical paths before this explicit batch transport.
+    assert!(matches!(
+        target.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+    ));
+    assert!(target.as_os_str().encode_wide().count() < 260);
+    let mut spec = NativeSpawnSpec::new(target.clone(), root.path().to_owned());
+    spec.syntax = CommandSyntax::CmdInvocation {
+        switches: Vec::new(),
+    };
+    spec.args = vec!["two words".into(), "literal %PATH%".into()];
+    spec.environment = environment(root.path());
+    spec.stdout = Stdio::Pipe;
+    let mut child = spec.spawn().await.unwrap();
+    let mut output = child.take_stdout().unwrap();
+    let mut bytes = Vec::new();
+    let captured = tokio::time::timeout(
+        Duration::from_secs(10),
+        (&mut output).take(1 << 20).read_to_end(&mut bytes),
+    )
+    .await;
+    if !matches!(captured, Ok(Ok(_))) {
+        child.terminate().unwrap();
+    }
+    let status = child.wait(Duration::from_secs(5)).await;
+    if status.is_err() {
+        child.terminate().unwrap();
+        child.wait(Duration::from_secs(5)).await.unwrap();
+    }
+    let closed = output.close(Duration::from_secs(5)).await;
+    captured.unwrap().unwrap();
+    let status = status.unwrap();
+    closed.unwrap();
+    assert!(
+        status.success(),
+        "{status}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["args"],
+        serde_json::json!(["two words", "literal %PATH%"])
+    );
+    assert!(marker.is_file());
+    std::fs::remove_file(&marker).unwrap();
+
+    let mut long = root.path().canonicalize().unwrap();
+    while long.as_os_str().encode_wide().count() < 270 {
+        long.push("bounded-batch-path-component");
+        std::fs::create_dir(&long).unwrap();
+    }
+    let long_target = long.join("shim.cmd");
+    std::fs::write(&long_target, script).unwrap();
+    let mut failures = Vec::new();
+    // These UNC spellings must fail representation checks before any path
+    // lookup or child creation; no network share is needed by this fixture.
+    for (executable, cwd) in [
+        (long_target, root.path().to_owned()),
+        (
+            PathBuf::from(r"\\?\UNC\localhost\kuru-absent-share\shim.cmd"),
+            root.path().to_owned(),
+        ),
+        (
+            target,
+            PathBuf::from(r"\\localhost\kuru-absent-share\fixture"),
+        ),
+    ] {
+        let mut spec = NativeSpawnSpec::new(executable, cwd);
+        spec.syntax = CommandSyntax::CmdInvocation {
+            switches: Vec::new(),
+        };
+        spec.environment = environment(root.path());
+        let failure = match spec.spawn().await {
+            Err(error) => Some(error),
+            Ok(mut child) => {
+                child.terminate().unwrap();
+                child.wait(Duration::from_secs(5)).await.unwrap();
+                None
+            }
+        };
+        failures.push(failure);
+    }
+    for failure in failures {
+        assert_eq!(
+            failure
+                .expect("unrepresentable batch started a child")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+    assert!(
+        !marker.exists(),
+        "rejected batch transport executed its marker"
+    );
+}
+
+#[tokio::test]
 async fn command_resolution_and_representability_fail_before_execution() {
     let root = tempfile::tempdir().unwrap();
     for name in ["tool.exe", "tool.com", "shim.cmd", "bad%name.cmd"] {
@@ -144,6 +258,34 @@ async fn command_resolution_and_representability_fail_before_execution() {
     let spec =
         configured_command(OsStr::new("bad%name.cmd"), &[], root.path(), env.clone()).unwrap();
     assert!(spec.spawn().await.is_err());
+    let marker = root.path().join("source-must-not-execute");
+    let mut source_refusals = Vec::new();
+    for separator in ['\0', '\n', '\r'] {
+        let source = format!("echo reached> \"{}\"{separator}", marker.display());
+        let spec = configured_command(
+            OsStr::new("cmd"),
+            &["/c".into(), source.into()],
+            root.path(),
+            env.clone(),
+        )
+        .unwrap();
+        let refusal = match spec.spawn().await {
+            Err(error) => Some(error),
+            Ok(mut child) => {
+                child.terminate().unwrap();
+                child.wait(Duration::from_secs(5)).await.unwrap();
+                None
+            }
+        };
+        source_refusals.push(refusal);
+    }
+    for refusal in source_refusals {
+        assert_eq!(
+            refusal.expect("unrepresentable cmd source executed").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+    assert!(!marker.exists(), "rejected source executed its marker");
     let mut oversized = env.clone();
     oversized.push(("BIG".into(), "x".repeat(8192).into()));
     let spec = configured_command(
@@ -472,6 +614,18 @@ async fn process_capabilities_and_case_equivalent_environment_are_checked() {
     );
     assert!(merge_environment([("bad=key".into(), "no".into())], []).is_err());
     assert!(merge_environment([("=C:".into(), "C:\\fixture".into())], []).is_ok());
+    assert!(merge_environment([("=c:".into(), "C:\\fixture".into())], []).is_ok());
+    let duplicate_drive = merge_environment(
+        [
+            ("=C:".into(), "C:\\private-first".into()),
+            ("=c:".into(), "C:\\private-second".into()),
+        ],
+        [],
+    )
+    .unwrap_err();
+    assert_eq!(duplicate_drive.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!duplicate_drive.to_string().contains("private-first"));
+    assert!(!duplicate_drive.to_string().contains("private-second"));
     assert!(
         merge_environment([(OsString::from_wide(&[b'A' as u16, 0]), "no".into())], []).is_err()
     );

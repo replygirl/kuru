@@ -7,7 +7,7 @@
 //! and its line export, which must reproduce cargo-llvm-cov's own summary of
 //! the partition exactly, then writes its receipt. `coverage merge` accepts an
 //! OS's partitions only when their receipts agree and their plans are disjoint
-//! and complete, then enforces that OS's 90% gate on cargo-llvm-cov's line
+//! and complete, then enforces that OS's 95% gate on cargo-llvm-cov's line
 //! metric over their union.
 //!
 //! Every process this module starts goes through [`Host`], so the sequencing

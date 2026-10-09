@@ -5969,6 +5969,195 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[tokio::test]
+    async fn native_separate_cold_starters_share_one_owner_and_preserve_both_writes() -> Result<()>
+    {
+        use kuru_platform::windows::{
+            pipe::Pipe,
+            process::{Console, Lifetime, NativeSpawnSpec, Stdio},
+        };
+        use tokio::io::AsyncReadExt;
+
+        crate::test_support::warm_runtime_cache().await?;
+        let (root, project, mut options, executable) = windows_service_fixture()?;
+        options.config.service_idle_timeout_secs = 0;
+        let barrier = root.path().join("both-starters-go");
+        let ready = [
+            root.path().join("starter-one-ready"),
+            root.path().join("starter-two-ready"),
+        ];
+        let mut children = Vec::new();
+        let mut outputs: Vec<Pipe> = Vec::new();
+        let mut diagnostics = Vec::new();
+        let _gate = crate::spawn_gate::spawning().await;
+        let started = tokio::time::timeout(crate::test_support::fixture_deadline(1, 0), async {
+            for (index, ready) in ready.iter().enumerate() {
+                let (stderr, diagnostic) =
+                    open_starter_stderr(root.path(), &format!("cold-starter-{index}-stderr"))?;
+                diagnostics.push(diagnostic);
+                let mut command = NativeSpawnSpec::new(executable.clone(), project.clone());
+                command.args = service_arguments(&options, &project, None);
+                command.args[0] = "--internal-memory-service-client-fixture".into();
+                command.args.push(barrier.as_os_str().to_owned());
+                command.args.push(ready.as_os_str().to_owned());
+                command.lifetime = Lifetime::FixtureBreakawayJob;
+                command.console = Console::PrivateHidden;
+                command.stdin = Stdio::Pipe;
+                command.stdout = Stdio::Pipe;
+                command.stderr = Stdio::Handle(stderr.into());
+                command.environment = owner_environment(
+                    kuru_platform::windows::process::system_directory()?,
+                    std::env::var_os("LLVM_PROFILE_FILE"),
+                    false,
+                    Vec::new(),
+                )?;
+                children.push(command.spawn().await?);
+                outputs.push(
+                    children
+                        .last_mut()
+                        .unwrap()
+                        .take_stdout()
+                        .context("cold starter stdout missing")?,
+                );
+            }
+            let at = tokio::time::Instant::now() + crate::test_support::CHILD_START_MARGIN;
+            while !ready.iter().all(|path| path.exists()) {
+                for child in &mut children {
+                    ensure!(
+                        child.try_wait()?.is_none(),
+                        "cold starter exited before its start barrier"
+                    );
+                }
+                ensure!(
+                    tokio::time::Instant::now() < at,
+                    "independent cold starters did not reach their barrier"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            std::fs::write(&barrier, b"go")?;
+            let mut generations = Vec::new();
+            for output in &mut outputs {
+                let bytes = tokio::time::timeout(windows_starter_readiness(), async {
+                    let mut bytes = Vec::new();
+                    loop {
+                        let byte = output.read_u8().await?;
+                        if byte == b'\n' {
+                            break;
+                        }
+                        ensure!(
+                            bytes.len() < 64,
+                            "cold starter generation exceeded its bound"
+                        );
+                        bytes.push(byte);
+                    }
+                    Ok::<_, anyhow::Error>(bytes)
+                })
+                .await
+                .context("cold starter did not report its attached generation")??;
+                generations.push(String::from_utf8(bytes)?);
+            }
+            Ok::<_, anyhow::Error>(generations)
+        })
+        .await
+        .context("native cold starter fixture exceeded its startup backstop")
+        .and_then(std::convert::identity);
+
+        // Release even a starter that has not yet seen the barrier; normal stdin
+        // EOF lets both compiled clients drop their connections and emit profiles.
+        let mut cleanup_error = std::fs::write(&barrier, b"go")
+            .err()
+            .map(anyhow::Error::from);
+        for child in &mut children {
+            if let Some(mut input) = child.take_stdin()
+                && let Err(error) = input.close(HANDSHAKE_TIMEOUT).await
+            {
+                cleanup_error = Some(error.into());
+            }
+        }
+        for output in &mut outputs {
+            if let Err(error) = output.close(HANDSHAKE_TIMEOUT).await {
+                cleanup_error = Some(error.into());
+            }
+        }
+        let expected = children
+            .iter()
+            .map(|child| child.id().to_string())
+            .collect::<Vec<_>>();
+        for (index, child) in children.iter_mut().enumerate() {
+            match child.wait(windows_starter_readiness()).await {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    let tail =
+                        fixture_diagnostic_tail(&mut diagnostics[index], STARTER_STDERR_LABEL)
+                            .unwrap_or_else(|error| {
+                                format!("stderr observation failed: {error:#}")
+                            });
+                    cleanup_error = Some(anyhow::anyhow!(
+                        "cold starter failed: {status}; stderr tail: {tail:?}"
+                    ));
+                }
+                Err(error) => cleanup_error = Some(error.into()),
+            }
+        }
+        let retired = crate::test_support::await_managed_quiescence(&options).await;
+        let outcome = async {
+            let generations = started?;
+            if let Some(error) = cleanup_error {
+                return Err(error);
+            }
+            retired?;
+            ensure!(
+                generations.len() == 2
+                    && !generations[0].is_empty()
+                    && generations[0] == generations[1],
+                "independent cold starters reached different generations: {generations:?}"
+            );
+            ensure!(
+                EndpointRecord::read(&options.data_dir, &options.project_scope)?.is_none(),
+                "last cold starter detach did not retire its exact endpoint"
+            );
+            let mut successor = attach_or_start(&options, &project, &executable).await?;
+            let checked = async {
+                ensure!(
+                    successor.generation() != generations[0],
+                    "cold successor reused a retired owner generation"
+                );
+                let ServiceValue::HistoryWindow(window) = successor
+                    .call(ServiceCall::HistoryWindow {
+                        namespace: "multiprocess-fixture".into(),
+                        limit: 4,
+                    })
+                    .await?
+                else {
+                    bail!("cold successor returned the wrong history result")
+                };
+                let mut rows = window
+                    .messages
+                    .iter()
+                    .map(|message| message.plain_text().unwrap_or_default().to_owned())
+                    .collect::<Vec<_>>();
+                let mut expected = expected;
+                rows.sort_unstable();
+                expected.sort_unstable();
+                ensure!(
+                    window.total_rows == 2 && rows == expected,
+                    "cold successor lost or duplicated one starter's durable message"
+                );
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            successor.close();
+            let closed = crate::test_support::await_managed_quiescence(&options).await;
+            checked?;
+            closed?;
+            ensure!(EndpointRecord::read(&options.data_dir, &options.project_scope)?.is_none());
+            Ok(())
+        }
+        .await;
+        root.release(outcome)
+    }
+
+    #[cfg(windows)]
     fn windows_starter_fixture(
         project: &Path,
         options: &crate::store::OpenOptions,

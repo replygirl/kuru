@@ -93,7 +93,7 @@ runtime is involved.
    `mise run test` on Ubuntu with its own Secret Service session) concurrently
    on the selected main revision. Format, lint, typecheck, tooling, docs and
    cospec have independent jobs. Both must pass before planning and checking
-   publication prerequisites. The 90% coverage gate and per-OS installation and
+   publication prerequisites. The 95% coverage gate and per-OS installation and
    update checks are required by CI (`ci-gate` in the merge queue) before a
    commit reaches `main`; the release run does not repeat them or read that
    result.

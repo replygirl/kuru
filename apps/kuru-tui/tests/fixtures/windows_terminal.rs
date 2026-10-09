@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         &directory.join("before.json"),
         &json!({"input":before.input,"output":before.output}),
     )?;
+    let mut input_events = None;
     let result: anyhow::Result<i32> = async {
         if plan.mode == "partial-error" {
             struct Broken;
@@ -89,6 +90,70 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(1);
         }
+        if plan.mode == "input-events" {
+            use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+            use futures::StreamExt;
+
+            let mut session = kuru::ui::TerminalSession::enter(&mut std::io::stdout())?;
+            let mut stream = EventStream::new();
+            let mut keys = Vec::new();
+            let mut all_characters = String::new();
+            let mut filtered_text = String::new();
+            let mut record_bytes = 0usize;
+            // Reuse the existing terminal fixture's total child deadline and
+            // support/windows_terminal.rs's 16 MiB observation bound.
+            let captured: anyhow::Result<()> = async {
+                tokio::time::timeout(Duration::from_secs(240), async {
+                    publish(&directory.join("ready.json"), &json!({"raw_input":true}))?;
+                    loop {
+                        let event = stream.next().await.context("native input stream ended")??;
+                        let Event::Key(key) = event else { continue };
+                        let character = match key.code {
+                            KeyCode::Char(character) => Some(character),
+                            _ => None,
+                        };
+                        let record = json!({
+                            "code":format!("{:?}",key.code),
+                            "character":character.map(|character|character.to_string()),
+                            "scalar":character.map(u32::from),
+                            "kind":format!("{:?}",key.kind),
+                            "modifiers":format!("{:?}",key.modifiers),
+                            "state":format!("{:?}",key.state),
+                        });
+                        record_bytes =
+                            record_bytes.saturating_add(serde_json::to_vec(&record)?.len());
+                        ensure!(
+                            record_bytes <= 16 * 1024 * 1024,
+                            "native input receipt exceeds fixture observation bound"
+                        );
+                        keys.push(record);
+                        if let Some(character) = character {
+                            all_characters.push(character);
+                            if key.kind != KeyEventKind::Release
+                                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                filtered_text.push(character);
+                            }
+                        }
+                        if key.code == KeyCode::Enter && key.kind == KeyEventKind::Press {
+                            break Ok::<(), anyhow::Error>(());
+                        }
+                    }
+                })
+                .await
+                .context("native input fixture child deadline exceeded")?
+            }
+            .await;
+            drop(stream);
+            let restored = session.restore();
+            input_events = Some(json!({
+                "keys":keys, "all_characters":all_characters, "filtered_text":filtered_text,
+                "error":captured.as_ref().err().map(|error|format!("{error:#}")),
+            }));
+            captured?;
+            restored?;
+            return Ok(0);
+        }
         ensure!(plan.mode == "app", "unknown terminal fixture mode");
         let mut spec = NativeSpawnSpec::new(plan.binary, plan.cwd);
         spec.lifetime = kuru_platform::windows::process::Lifetime::FixtureBreakawayJob;
@@ -115,12 +180,17 @@ async fn main() -> anyhow::Result<()> {
             let command = directory.join(format!("control-{sequence}.json"));
             if command.exists() {
                 let value: serde_json::Value = serde_json::from_slice(&std::fs::read(command)?)?;
-                let focus = value["focus"].as_bool().context("focus command required")?;
-                inject_focus(focus)?;
-                publish(
-                    &directory.join(format!("ack-{sequence}.json")),
-                    &json!({"focus":focus}),
-                )?;
+                let reply = if let Some(focus) = value["focus"].as_bool() {
+                    inject_focus(focus)?;
+                    json!({"focus":focus})
+                } else if value["cursor"].as_bool() == Some(true) {
+                    // On Windows this reads the active CONOUT$ screen buffer,
+                    // independently of ConPTY's lossy VT text projection.
+                    json!({"cursor":crossterm::cursor::position()?})
+                } else {
+                    anyhow::bail!("unknown terminal control request");
+                };
+                publish(&directory.join(format!("ack-{sequence}.json")), &reply)?;
                 sequence += 1;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -135,7 +205,8 @@ async fn main() -> anyhow::Result<()> {
         &json!({
             "before":{"input":before.input,"output":before.output},
             "after":{"input":after.input,"output":after.output},
-            "status":result.as_ref().ok(), "error":result.as_ref().err().map(|error|format!("{error:#}"))
+            "status":result.as_ref().ok(), "error":result.as_ref().err().map(|error|format!("{error:#}")),
+            "input_events":input_events
         }),
     )?;
     result?;

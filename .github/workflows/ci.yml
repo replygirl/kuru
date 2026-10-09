@@ -478,7 +478,7 @@ jobs:
           if-no-files-found: error
 
   native-platform:
-    # The x64 leg enforces the 90% platform coverage gate. Windows on Arm runs
+    # The x64 leg enforces the 95% platform coverage gate. Windows on Arm runs
     # the same package tests through the distinct uninstrumented test task, as
     # separately named behavioral evidence that never reports or satisfies
     # coverage, until a pinned toolchain carries the fix for rust-lang/rust#150123.
@@ -523,7 +523,7 @@ jobs:
           shared-key: native-platform-${{ matrix.target }}
           # Restrict saves to main so PR runs never thrash the shared cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test native platform primitives and require 90% coverage
+      - name: Test native platform primitives and require 95% coverage
         if: matrix.mode == 'coverage'
         run: mise run //packages/kuru-platform:coverage
       - name: Test native platform primitives uninstrumented as behavioral evidence

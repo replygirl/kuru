@@ -1372,7 +1372,15 @@ fn normalize_current_receipt(message: &Message) -> Result<Message> {
                 .get("output")
                 .context("current tool receipt lacks output")?
                 .clone();
-            Ok(Message::tool_result(call_id, output, false))
+            let is_error = value
+                .get("is_error")
+                .map(|flag| {
+                    flag.as_bool()
+                        .context("current tool receipt is_error must be boolean")
+                })
+                .transpose()?
+                .unwrap_or(false);
+            Ok(Message::tool_result(call_id, output, is_error))
         }
         _ => anyhow::bail!("invalid current tool receipt blocks"),
     }

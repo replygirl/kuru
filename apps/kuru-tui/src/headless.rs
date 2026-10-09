@@ -961,6 +961,7 @@ mod tests {
             .unwrap();
             writer.submit(vec![b'x'; 1024]).unwrap();
             observed.await.unwrap();
+            assert!(!writer.try_acknowledge().unwrap());
             assert!(writer.submit(vec![b'y']).is_err());
             let cancellation = CancellationToken::new();
             cancellation.cancel();
@@ -972,22 +973,51 @@ mod tests {
             .await
             .unwrap();
             drop(guard);
-            writer.acknowledge().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !writer.try_acknowledge().unwrap() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(writer.try_acknowledge().unwrap());
             writer.join_finished().unwrap();
 
-            struct Closed;
+            struct Closed(io::ErrorKind);
             impl Write for Closed {
                 fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                    Err(io::ErrorKind::BrokenPipe.into())
+                    Err(self.0.into())
                 }
                 fn flush(&mut self) -> io::Result<()> {
                     Ok(())
                 }
             }
-            let mut writer = OutputWriter::with_output(Closed).unwrap();
+            let mut writer = OutputWriter::with_output(Closed(io::ErrorKind::BrokenPipe)).unwrap();
             writer.submit(b"record\n".to_vec()).unwrap();
             let error = writer.acknowledge().await.unwrap_err();
             assert_eq!(error.downcast_ref::<RunExit>().unwrap().0, 141);
+
+            for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+                let mut writer = OutputWriter::with_output(Closed(kind)).unwrap();
+                writer.submit(b"record\n".to_vec()).unwrap();
+                let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        match writer.try_acknowledge() {
+                            Ok(false) => tokio::task::yield_now().await,
+                            Ok(true) => panic!("failed stdout was acknowledged as successful"),
+                            Err(error) => break error,
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                writer.join_finished().unwrap();
+                if kind == io::ErrorKind::BrokenPipe {
+                    assert_eq!(error.downcast_ref::<RunExit>().unwrap().0, 141);
+                } else {
+                    assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+                }
+            }
         })
         .await;
     }

@@ -9,7 +9,9 @@ execution. Providers do not own the actor pool.
 Native continuation state, including encrypted reasoning, stays private to the
 actor and is not reconstructed from stored conversation text. Legacy string
 receipts are interpreted only at the existing live pending-call boundary with
-matching IDs. An old message that happens to contain JSON remains text, and an
+matching IDs. A current legacy receipt preserves a boolean `is_error` flag;
+omitting it retains the legacy success default, while a nonboolean flag refuses
+the receipt before inference. An old message that happens to contain JSON remains text, and an
 unsupported content block fails before provider dispatch rather than being
 silently discarded. The CLI returns a settled text answer; the TUI can display a
 provisional preview of the selected speaker's stream. Image input remains

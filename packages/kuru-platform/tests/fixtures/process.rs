@@ -56,7 +56,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     use std::{
         fs::{self, File},
-        io::{Read, Write},
+        io::{Read, Seek, SeekFrom, Write},
         os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
         process::Command,
         time::{Duration, Instant},
@@ -79,7 +79,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match mode {
         "current-image" => {
             eprintln!("current-image: acquiring initial guard");
-            let (image, diagnostic_file, initial_error) =
+            let (mut image, diagnostic_file, initial_error) =
                 match kuru_platform::windows::process::current_image() {
                     Ok(image) => (Some(image), None, None),
                     Err(error) => {
@@ -99,6 +99,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         (None, Some(file), Some(diagnostic))
                     }
                 };
+            if let Some(image) = image.as_mut() {
+                let invocation = std::env::current_exe()?;
+                let checked_path = image.path().to_path_buf();
+                let file = image.file_mut();
+                file.seek(SeekFrom::Start(0))?;
+                let mut before = [0; 2];
+                file.read_exact(&mut before)?;
+                file.seek(SeekFrom::Start(0))?;
+                let refusal = file.write(b"XX");
+                file.seek(SeekFrom::Start(0))?;
+                let mut after = [0; 2];
+                file.read_exact(&mut after)?;
+                assert_eq!(checked_path, invocation, "checked current-image pathname");
+                assert_eq!(&before, b"MZ", "read the actual Windows executable header");
+                assert_eq!(
+                    refusal.unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+                assert_eq!(
+                    after, before,
+                    "mutable reader granted no image write authority"
+                );
+            }
             eprintln!("current-image: reading held identity");
             let held_file = image
                 .as_ref()
@@ -136,7 +159,70 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "console-check" => {
-            kuru_platform::windows::console::verify_private_console_fixture()?;
+            use kuru_platform::windows::{
+                console::{ConsoleModeGuard, virtual_terminal_output_enabled},
+                process::StandardStream,
+            };
+            // This hidden-console parent deliberately has NUL standard streams.
+            // Console allocation alone must not authorize ANSI on those streams.
+            if ConsoleModeGuard::capture().is_ok()
+                || [
+                    StandardStream::Input,
+                    StandardStream::Output,
+                    StandardStream::Error,
+                ]
+                .into_iter()
+                .any(virtual_terminal_output_enabled)
+            {
+                return Err("NUL standard streams were accepted as a console".into());
+            }
+            let input = File::options().read(true).write(true).open("CONIN$")?;
+            let output = File::options().read(true).write(true).open("CONOUT$")?;
+            let error = File::options().read(true).write(true).open("CONOUT$")?;
+            let receipt = std::env::current_dir()?.join("console-public-result");
+            let mut child = child_spec()?;
+            child.args = vec![
+                "console-inherited-check".into(),
+                receipt.as_os_str().to_owned(),
+            ];
+            child.console = Console::Inherit;
+            child.stdin = Stdio::Handle(input.into());
+            child.stdout = Stdio::Handle(output.into());
+            child.stderr = Stdio::Handle(error.into());
+            let mut child = child.spawn().await?;
+            let status = child.wait(Duration::from_secs(5)).await;
+            if status.is_err() {
+                child.terminate()?;
+                child.wait(Duration::from_secs(5)).await?;
+            }
+            let status = status?;
+            let report = fs::read_to_string(receipt)?;
+            if !status.success() || report != "ok" {
+                return Err(format!("inherited console public contracts failed: {report}").into());
+            }
+        }
+        "console-inherited-check" => {
+            let result = std::panic::catch_unwind(
+                kuru_platform::windows::console::verify_private_console_fixture,
+            );
+            let report = match &result {
+                Ok(Ok(())) => "ok".to_owned(),
+                Ok(Err(error)) => error.to_string(),
+                Err(panic) => panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        panic
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_owned())
+                    })
+                    .unwrap_or_else(|| "console assertion panicked without text".into()),
+            };
+            fs::write(&args[1], report)?;
+            match result {
+                Ok(result) => result?,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
         }
         "capture" => {
             let mut input = String::new();

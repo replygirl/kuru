@@ -35,6 +35,10 @@ a compact chip; expand it to inspect the text or remove the exact pasted span.
 The composer accepts at most 128 KiB of draft text. An oversized paste is
 rejected in full, leaving the draft unchanged.
 
+Paste chips and whole-block rejection require bracketed-paste events, currently
+received on Unix. Windows receives console keystrokes and cannot identify an
+atomic paste block; review multiline input before sending it.
+
 ## Read the conversation
 
 Scrollback fetches bounded pages of the saved public transcript. The window

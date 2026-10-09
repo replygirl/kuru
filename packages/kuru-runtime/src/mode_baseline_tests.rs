@@ -237,6 +237,10 @@ async fn all_four_modes_keep_direct_peer_routes_and_round_budget() {
                 ids.len(),
                 "{mode} must route one direct edge per peer"
             );
+            let wire_peers = peer_events
+                .iter()
+                .map(|event| (event.actor().to_owned(), event.detail()))
+                .collect::<Vec<_>>();
             for event in peer_events {
                 let rpc: Value = serde_json::from_str(&event.detail()).unwrap();
                 assert_eq!(rpc["method"], "SendMessage");
@@ -275,6 +279,18 @@ async fn all_four_modes_keep_direct_peer_routes_and_round_budget() {
             }
             harness.shutdown(false).await.unwrap();
             crate::tests::close_stores([harness.memory.clone()]).await;
+            // Decode the actual emitted envelopes only after this mode's
+            // actors, hooks and store have settled, even on a wire assertion.
+            for (actor, detail) in wire_peers {
+                let expected: Value = serde_json::from_str(&detail).unwrap();
+                let round_trip = crate::Event::from_wire_v2("peer".into(), actor.clone(), detail);
+                assert!(matches!(&round_trip, crate::Event::Peer { .. }));
+                assert_eq!(round_trip.actor(), actor);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&round_trip.detail()).unwrap(),
+                    expected
+                );
+            }
         }
     })
     .await

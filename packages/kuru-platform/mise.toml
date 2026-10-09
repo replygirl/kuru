@@ -55,9 +55,24 @@ run = "cargo clippy -p kuru-platform --all-targets --all-features --locked -- -D
 run = "cargo fmt --package kuru-platform -- --check"
 
 [tasks.coverage]
-description = "Require 90% native platform package line coverage"
+shell = "{% if os() == 'windows' %}powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command{% else %}sh -e -c{% endif %}"
+# This owned stock PowerShell launch reconstructs its standard module paths.
+env.PSModulePath = false
+description = "Require 95% native platform package line coverage"
 dir = "{{config_root}}/../.."
-run = "cargo llvm-cov -p kuru-platform --all-targets --all-features --locked --no-fail-fast --fail-under-lines 90 --lcov --output-path target/kuru-platform-coverage.lcov"
+run = '''
+set -eu
+llvm_cov="$(mise bin-paths aqua:taiki-e/cargo-llvm-cov@0.9.1)/cargo-llvm-cov"
+test "$("$llvm_cov" llvm-cov --version)" = "cargo-llvm-cov 0.9.1"
+"$llvm_cov" llvm-cov -p kuru-platform --all-targets --all-features --locked --no-fail-fast --fail-under-lines 95 --lcov --output-path target/kuru-platform-coverage.lcov
+'''
+run_windows = '''
+$ErrorActionPreference = 'Stop'
+$llvmCov = Join-Path ((mise bin-paths 'aqua:taiki-e/cargo-llvm-cov@0.9.1').Trim()) 'cargo-llvm-cov.exe'
+if ((& $llvmCov llvm-cov --version).Trim() -ne 'cargo-llvm-cov 0.9.1') { throw 'Wrong cargo-llvm-cov version' }
+& $llvmCov llvm-cov -p kuru-platform --all-targets --all-features --locked --no-fail-fast --fail-under-lines 95 --lcov --output-path target/kuru-platform-coverage.lcov
+exit $LASTEXITCODE
+'''
 
 [tasks."check:native"]
 description = "Check platform primitives without building application or database consumers"

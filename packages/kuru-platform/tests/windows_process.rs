@@ -4,14 +4,18 @@ use kuru_platform::windows::{
     pipe::{self, Pipe, PrivateListener, PrivateServiceListener},
     process::{
         Console, Lifetime, NativeChild, NativeSpawnSpec, ProcessStamp, RootObservation, Stdio,
-        current_process_handle, process_object_retained, process_stamp, sample_process,
+        current_process_handle, duplicate_inherited_process_handle, process_object_retained,
+        process_stamp, sample_process, wait_process_handle,
     },
 };
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, TryLockError},
     io,
-    os::windows::ffi::{OsStrExt, OsStringExt},
+    os::windows::{
+        ffi::{OsStrExt, OsStringExt},
+        io::{AsRawHandle, OwnedHandle},
+    },
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -50,6 +54,50 @@ const CHILD_START: Duration = Duration::from_secs(5);
 const LIMIT: Duration = NATIVE_BOUND.saturating_add(CHILD_START);
 const SHORT: Duration = Duration::from_millis(80);
 
+#[tokio::test]
+async fn process_queries_refuse_file_handles_and_mismatched_identity_without_closing_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("retained-file");
+    fs::write(&path, b"retained file bytes").unwrap();
+    let file: OwnedHandle = File::open(&path).unwrap().into();
+    assert!(sample_process(&file).is_err());
+    assert!(process_stamp(&file).is_err());
+    assert!(wait_process_handle(&file, SHORT).await.is_err());
+    assert!(
+        duplicate_inherited_process_handle(file.as_raw_handle() as usize, std::process::id())
+            .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"retained file bytes");
+
+    let process = current_process_handle().unwrap();
+    let stamp = process_stamp(&process).unwrap();
+    for (value, expected_pid) in [
+        (0, stamp.id),
+        (usize::MAX, stamp.id),
+        (process.as_raw_handle() as usize, 0),
+        (process.as_raw_handle() as usize, stamp.id + 1),
+    ] {
+        assert_eq!(
+            duplicate_inherited_process_handle(value, expected_pid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let duplicate =
+        duplicate_inherited_process_handle(process.as_raw_handle() as usize, stamp.id).unwrap();
+    assert_eq!(process_stamp(&duplicate).unwrap(), stamp);
+    drop(duplicate);
+    assert_eq!(process_stamp(&process).unwrap(), stamp);
+    assert_eq!(
+        wait_process_handle(&process, Duration::ZERO)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
 /// The bound of an outer wait over `limits` inner waits bounded by [`LIMIT`]
 /// and `shorts` bounded by [`SHORT`], run in series, so each inner wait has its
 /// own bound first. A caller whose span has a step no inner wait bounds (child
@@ -67,6 +115,122 @@ fn series(limits: u32, shorts: u32) -> Duration {
 /// the parent's waits decide first, and the self-timeout only reaps an orphan.
 fn budget_arg(budget: Duration) -> OsString {
     budget.saturating_add(LIMIT).as_millis().to_string().into()
+}
+
+#[tokio::test]
+async fn pipe_direction_empty_io_and_closed_operations_preserve_child_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let mut spawn = spec(root.path(), &[OsStr::new("capture")]);
+    spawn.stdin = Stdio::Pipe;
+    spawn.stdout = Stdio::Pipe;
+    let mut child = spawn.spawn().await.unwrap();
+    let mut input = child.take_stdin().unwrap();
+    let mut output = child.take_stdout().unwrap();
+    assert_eq!(input.write(&[]).await.unwrap(), 0);
+    assert_eq!(output.read(&mut []).await.unwrap(), 0);
+    assert_eq!(
+        input.read(&mut [0]).await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        output.write(b"wrong direction").await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert!(child.interrupt().is_err(), "no console group was requested");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "refused operations ended the child"
+    );
+    input.write_all(b"owned input").await.unwrap();
+    tokio::time::timeout(LIMIT, input.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(input.is_closed());
+    input.close(LIMIT).await.unwrap();
+    assert_eq!(
+        input.write(b"after close").await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        input.flush().await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    let mut bytes = Vec::new();
+    tokio::time::timeout(LIMIT, output.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report["stdin"], "owned input");
+    assert!(child.wait(LIMIT).await.unwrap().success());
+    child.terminate().unwrap();
+    output.close(LIMIT).await.unwrap();
+    assert_eq!(
+        output.read(&mut [0]).await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn process_diagnostics_retain_failed_observations_and_partial_member_details() {
+    use kuru_platform::windows::process::{JobMember, JobSnapshot, TreeSnapshot};
+
+    let snapshot = TreeSnapshot {
+        root_id: 42,
+        root: Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "root query denied",
+        )),
+        root_sample: Err(io::Error::other("root sample unavailable")),
+        job: Some(Ok(JobSnapshot {
+            active_processes: 2,
+            total_processes: 3,
+            terminated_processes: 1,
+            assigned_processes: 2,
+            members: vec![
+                JobMember {
+                    id: 43,
+                    image: Ok("retained fixture.exe".into()),
+                    sample: Err(io::Error::other("member sample unavailable")),
+                },
+                JobMember {
+                    id: 44,
+                    image: Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "member query denied",
+                    )),
+                    sample: Err(io::Error::other("second sample unavailable")),
+                },
+            ],
+        })),
+    };
+    let text = snapshot.to_string();
+    for expected in [
+        "root pid=42",
+        "state_error=root query denied",
+        "sample_error=root sample unavailable",
+        "active=2",
+        "listed=2/2",
+        "pid=43",
+        "image=retained fixture.exe",
+        "pid=44",
+        "image_error=member query denied",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    let snapshot = TreeSnapshot {
+        root_id: 42,
+        root: Ok(RootObservation::Exited(7)),
+        root_sample: Err(io::Error::other("unavailable")),
+        job: Some(Err(io::Error::other("job query unavailable"))),
+    };
+    assert!(snapshot.to_string().contains("state=exited(7)"));
+    assert!(
+        snapshot
+            .to_string()
+            .contains("job_error=job query unavailable")
+    );
 }
 
 #[tokio::test]
@@ -678,8 +842,14 @@ async fn trusted_child_survives_its_creator_until_private_lifetime_eof() {
     spawn.stdout = Stdio::Pipe;
     let mut owner = spawn.spawn().await.unwrap();
     ready(&mut owner).await;
+    let expected_id = owner.id();
+    let running = owner.diagnostic_snapshot();
+    let running_text = running.to_string();
+    let live_after_observation = owner.try_wait();
     owner.terminate().unwrap();
-    owner.wait(LIMIT).await.unwrap();
+    let status = owner.wait(LIMIT).await.unwrap();
+    let exited = owner.diagnostic_snapshot();
+    let exited_text = exited.to_string();
     tokio::time::timeout(LIMIT, async {
         while !receipt.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -688,6 +858,25 @@ async fn trusted_child_survives_its_creator_until_private_lifetime_eof() {
     .await
     .expect("trusted child did not finish after creator EOF");
     assert_eq!(fs::read(receipt).unwrap(), b"parent-lifetime");
+    assert_eq!(running.root_id, expected_id, "{running_text}");
+    assert!(
+        matches!(running.root, Ok(RootObservation::Running)),
+        "{running_text}"
+    );
+    assert!(running.job.is_none(), "{running_text}");
+    assert!(running_text.contains("state=running") && running_text.contains("job=none"));
+    assert!(
+        live_after_observation.unwrap().is_none(),
+        "diagnostics ended the owner"
+    );
+    assert!(!status.success());
+    assert_eq!(exited.root_id, expected_id, "{exited_text}");
+    assert!(
+        matches!(exited.root, Ok(RootObservation::Exited(1))),
+        "{exited_text}"
+    );
+    assert!(exited.job.is_none(), "{exited_text}");
+    assert!(exited_text.contains("state=exited(1)") && exited_text.contains("job=none"));
 }
 
 #[tokio::test]
@@ -838,6 +1027,243 @@ async fn wrong_peer_and_nonlocal_names_are_rejected_without_payload() {
     );
     expected.terminate().unwrap();
     expected.wait(LIMIT).await.unwrap();
+}
+
+#[tokio::test]
+async fn peer_exit_fails_a_queued_write_without_releasing_an_unrelated_child() {
+    let root = tempfile::tempdir().unwrap();
+    // Accept/read, the pending flush probe, and peer reap are the waits before
+    // this parked peer is ended. Later error observations do not need it alive.
+    // Its readiness, accept/read, peer reap, flush/EOF, two closes and final
+    // peer wait precede unrelated termination; one LIMIT covers child creation.
+    let mut unrelated = idle(root.path(), series(10, 1)).await;
+    let listener = PrivateListener::bind().unwrap();
+    let mut spawn = spec(
+        root.path(),
+        &[OsStr::new("rendezvous-stall"), listener.address()],
+    );
+    spawn.args.push(budget_arg(series(3, 1)));
+    let mut child = spawn.spawn().await.unwrap();
+    let mut channel = listener.accept(&child, LIMIT).await.unwrap();
+    let observed: io::Result<_> = async {
+        let mut hello = [0; 9];
+        tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+            .await
+            .map_err(io::Error::other)??;
+        let queued = channel.write(&vec![b'x'; 8 * 1024 * 1024]).await?;
+        let pending = tokio::time::timeout(SHORT, channel.flush()).await.is_err();
+        child.terminate()?;
+        let status = child.wait(LIMIT).await?;
+        let flush = tokio::time::timeout(LIMIT, channel.flush())
+            .await
+            .map_err(io::Error::other)?;
+        let mut byte = [0];
+        let eof = tokio::time::timeout(LIMIT, channel.read(&mut byte))
+            .await
+            .map_err(io::Error::other)??;
+        Ok((
+            hello,
+            queued,
+            pending,
+            status,
+            flush,
+            eof,
+            unrelated.try_wait()?.is_none(),
+        ))
+    }
+    .await;
+    let closed = channel.close(LIMIT).await;
+    let closed_again = channel.close(LIMIT).await;
+    let child_settled = async {
+        child.terminate()?;
+        child.wait(LIMIT).await
+    }
+    .await;
+    let unrelated_settled = async {
+        unrelated.terminate()?;
+        unrelated.wait(LIMIT).await
+    }
+    .await;
+    closed.unwrap();
+    closed_again.unwrap();
+    child_settled.unwrap();
+    unrelated_settled.unwrap();
+    let (hello, queued, pending, status, flush, eof, unrelated_live) = observed.unwrap();
+    assert_eq!(&hello, b"connected");
+    assert_eq!(queued, 8 * 1024 * 1024);
+    assert!(
+        pending,
+        "the live peer unexpectedly consumed the queued write"
+    );
+    assert!(!status.success());
+    assert_eq!(flush.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(eof, 0);
+    assert!(unrelated_live, "peer I/O failure changed an unrelated Job");
+    assert!(channel.is_closed());
+}
+
+#[tokio::test]
+async fn queued_peer_loss_is_propagated_by_second_write_and_shutdown() {
+    for route in ["second-write", "shutdown"] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = PrivateListener::bind().unwrap();
+        let mut spawn = spec(
+            root.path(),
+            &[OsStr::new("rendezvous-stall"), listener.address()],
+        );
+        // Accept, readiness read and reap enclose one pending-I/O probe. The
+        // later error and close observations do not require the peer alive.
+        spawn.args.push(budget_arg(series(3, 1)));
+        let mut child = spawn.spawn().await.unwrap();
+        let mut channel = listener.accept(&child, LIMIT).await.unwrap();
+        let observed: io::Result<_> = async {
+            let mut hello = [0; 9];
+            tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+                .await
+                .map_err(io::Error::other)??;
+            let queued = channel.write(&vec![b'x'; 8 * 1024 * 1024]).await?;
+            let pending = if route == "second-write" {
+                tokio::time::timeout(SHORT, channel.write(b"not accepted"))
+                    .await
+                    .is_err()
+            } else {
+                tokio::time::timeout(SHORT, channel.shutdown())
+                    .await
+                    .is_err()
+            };
+            let live = child.try_wait()?.is_none();
+            child.terminate()?;
+            let status = child.wait(LIMIT).await?;
+            // Do not consume the native write failure with flush first: each
+            // public operation must propagate that original queued failure.
+            let refusal = if route == "second-write" {
+                tokio::time::timeout(LIMIT, channel.write(b"not accepted"))
+                    .await
+                    .map_err(io::Error::other)?
+                    .map(|_| ())
+            } else {
+                tokio::time::timeout(LIMIT, channel.shutdown())
+                    .await
+                    .map_err(io::Error::other)?
+            };
+            Ok((
+                hello,
+                queued,
+                pending,
+                live,
+                status,
+                refusal,
+                channel.is_closed(),
+            ))
+        }
+        .await;
+        let closed = channel.close(LIMIT).await;
+        let settled = async {
+            child.terminate()?;
+            child.wait(LIMIT).await
+        }
+        .await;
+        closed.unwrap();
+        settled.unwrap();
+        let (hello, queued, pending, live, status, refusal, prematurely_closed) = observed.unwrap();
+        assert_eq!(&hello, b"connected", "{route}");
+        assert_eq!(queued, 8 * 1024 * 1024, "{route}");
+        assert!(
+            pending && live,
+            "{route}: queued work must wait for the live peer"
+        );
+        assert!(!status.success(), "{route}");
+        assert_eq!(
+            refusal.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe,
+            "{route}"
+        );
+        assert!(
+            !prematurely_closed,
+            "{route}: write failure must retain pipe cleanup ownership"
+        );
+        assert!(channel.is_closed(), "{route}");
+    }
+}
+
+#[test]
+fn dropping_pending_pipe_io_does_not_wait_for_peer_or_tokio_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().to_owned();
+    // Accept/read, the two pending probes, and one LIMIT for unbounded child
+    // creation and runtime construction/shutdown. budget_arg adds the gap
+    // through thread join and the parent's subsequent owned termination.
+    let budget = series(3, 2);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (child, observed) = runtime.block_on(async {
+            let listener = PrivateListener::bind().unwrap();
+            let mut spawn = spec(
+                &directory,
+                &[OsStr::new("rendezvous-stall"), listener.address()],
+            );
+            spawn.args.push(budget_arg(budget));
+            let mut child = spawn.spawn().await.unwrap();
+            let mut channel = listener.accept(&child, LIMIT).await.unwrap();
+            let observed: io::Result<_> = async {
+                let mut hello = [0; 9];
+                tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+                    .await
+                    .map_err(io::Error::other)??;
+                let queued = channel.write(&vec![b'x'; 8 * 1024 * 1024]).await?;
+                let write_pending = tokio::time::timeout(SHORT, channel.flush()).await.is_err();
+                let mut byte = [0];
+                let read_pending = tokio::time::timeout(SHORT, channel.read(&mut byte))
+                    .await
+                    .is_err();
+                Ok((
+                    hello,
+                    queued,
+                    write_pending,
+                    read_pending,
+                    child.try_wait()?.is_none(),
+                ))
+            }
+            .await;
+            // Deliberately exercise Drop, not close: native resources must stay
+            // owned until cancellation completes, independently of this runtime.
+            drop(channel);
+            (child, observed)
+        });
+        drop(runtime);
+        sender
+            .send((child, observed))
+            .unwrap_or_else(|_| panic!("pending-I/O cleanup receiver disappeared"));
+    });
+    let (mut child, observed) = receiver
+        .recv_timeout(budget)
+        .expect("pending pipe Drop stranded Tokio runtime shutdown");
+    thread.join().unwrap();
+    let live_after_shutdown = child.try_wait();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    child.terminate().unwrap();
+    let settled = runtime.block_on(child.wait(LIMIT));
+    drop(runtime);
+    settled.unwrap();
+    let (hello, queued, write_pending, read_pending, live_before_drop) = observed.unwrap();
+    assert_eq!(&hello, b"connected");
+    assert_eq!(queued, 8 * 1024 * 1024);
+    assert!(
+        write_pending && read_pending,
+        "both native I/O directions must be pending"
+    );
+    assert!(live_before_drop);
+    assert!(
+        live_after_shutdown.unwrap().is_none(),
+        "Drop relied on peer exit"
+    );
 }
 
 #[test]

@@ -1825,10 +1825,488 @@ mod tests {
         let (phase, _) =
             replace_open_destination(&wrong_parent, &candidate, None, &destination).unwrap_err();
         assert_eq!(phase, PublicationPhase::Rejected);
+
+        let parent = open(
+            destination_dir.path(),
+            FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let filesystem_root = destination_dir.path().ancestors().last().unwrap();
+        for (name, expected) in [
+            (
+                filesystem_root.to_path_buf(),
+                "missing publication parent path",
+            ),
+            (
+                destination_dir.path().join("invalid\0name"),
+                "invalid native publication filename",
+            ),
+        ] {
+            let (phase, error) =
+                replace_open_destination(&parent, &candidate, None, &name).unwrap_err();
+            assert_eq!(phase, PublicationPhase::Rejected);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), expected);
+        }
         assert_eq!(
             std::fs::read(source_dir.path().join("candidate")).unwrap(),
             b"new"
         );
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn public_copy_and_remove_refuse_a_real_delete_sharing_blocker_before_effects() {
+        use crate::fs::{copy_file_access, regular_file_info};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut source = parent.create_new(OsStr::new("source")).unwrap();
+        source.write_all(b"source evidence").unwrap();
+        let mut candidate = parent.create_new(OsStr::new("candidate")).unwrap();
+        candidate.write_all(b"candidate evidence").unwrap();
+        let source_identity = regular_file_info(&source).unwrap().identity;
+        let candidate_identity = regular_file_info(&candidate).unwrap().identity;
+        let source_access = security::file_access_token(source.as_handle()).unwrap();
+        let candidate_access = security::file_access_token(candidate.as_handle()).unwrap();
+        // A real read handle omitting DELETE sharing blocks any late DELETE
+        // authority capture while allowing the already-owned data handles.
+        let blocker = open(
+            &parent.path().join("candidate"),
+            GENERIC_READ | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NameRetention::Pinned,
+            None,
+        )
+        .unwrap();
+        let copied = copy_file_access(&source, &candidate);
+        let removed = parent.remove_file(OsStr::new("candidate"), candidate.try_clone().unwrap());
+        let source_after = security::file_access_token(source.as_handle()).unwrap();
+        let candidate_after = security::file_access_token(candidate.as_handle()).unwrap();
+        drop(blocker);
+
+        let copy_error = copied
+            .err()
+            .expect("DELETE capture must refuse the held blocker");
+        let remove_error = removed.unwrap_err();
+        assert_eq!(copy_error.raw_os_error(), Some(32));
+        assert_eq!(remove_error.phase, PublicationPhase::Rejected);
+        assert_eq!(remove_error.identity, Some(candidate_identity));
+        assert_eq!(remove_error.error.raw_os_error(), Some(32));
+        assert_eq!(
+            regular_file_info(&source).unwrap().identity,
+            source_identity
+        );
+        assert_eq!(
+            regular_file_info(&candidate).unwrap().identity,
+            candidate_identity
+        );
+        assert_eq!(source_after, source_access);
+        assert_eq!(candidate_after, candidate_access);
+        assert_eq!(
+            fs::read(parent.path().join("source")).unwrap(),
+            b"source evidence"
+        );
+        assert_eq!(
+            fs::read(parent.path().join("candidate")).unwrap(),
+            b"candidate evidence"
+        );
+        drop((source, candidate));
+        parent.remove_tree().unwrap();
+    }
+
+    #[test]
+    fn public_readonly_removal_is_uncertain_and_preserves_the_exact_file() {
+        use crate::fs::regular_file_info;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut file = parent.create_new(OsStr::new("readonly")).unwrap();
+        file.write_all(b"readonly evidence").unwrap();
+        let identity = regular_file_info(&file).unwrap().identity;
+        let original_permissions = file.metadata().unwrap().permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        file.set_permissions(readonly).unwrap();
+        let result = parent.remove_file(OsStr::new("readonly"), file.try_clone().unwrap());
+        let after = regular_file_info(&file);
+        let remained_readonly = file
+            .metadata()
+            .map(|metadata| metadata.permissions().readonly());
+        let bytes = fs::read(parent.path().join("readonly"));
+        file.set_permissions(original_permissions).unwrap();
+        drop(file);
+        parent.remove_tree().unwrap();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert_eq!(error.identity, Some(identity));
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(after.unwrap().identity, identity);
+        assert!(remained_readonly.unwrap());
+        assert_eq!(bytes.unwrap(), b"readonly evidence");
+    }
+
+    #[test]
+    fn empty_root_removal_distinguishes_pinned_refusal_from_movable_pending_deletion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pinned_path = temporary.path().join("pinned-root");
+        let root = Directory::ensure_private(&pinned_path).unwrap();
+        let identity = root.identity();
+        let blocker =
+            Directory::open(&pinned_path, Privacy::OwnerOnly, NameRetention::Pinned).unwrap();
+        let refused = root.remove_tree();
+        let still_present = fs::symlink_metadata(&pinned_path);
+        let retained_identity = blocker.identity();
+        drop(blocker);
+        Directory::open(&pinned_path, Privacy::OwnerOnly, NameRetention::Movable)
+            .unwrap()
+            .remove_tree()
+            .unwrap();
+
+        let pending_path = temporary.path().join("pending-root");
+        let root = Directory::ensure_private(&pending_path).unwrap();
+        let pending_identity = root.identity();
+        let retained =
+            Directory::open(&pending_path, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+        let pending = root.remove_tree();
+        let pending_namespace = fs::symlink_metadata(&pending_path);
+        drop(retained);
+        let completed = fs::symlink_metadata(&pending_path);
+
+        let rejected = refused.unwrap_err();
+        assert_eq!(rejected.phase, PublicationPhase::Rejected);
+        assert_eq!(rejected.identity, Some(identity));
+        assert_eq!(rejected.descendant, None);
+        assert_eq!(retained_identity, identity);
+        assert!(still_present.unwrap().is_dir());
+        let uncertain = pending.unwrap_err();
+        assert_eq!(uncertain.phase, PublicationPhase::Uncertain);
+        assert_eq!(uncertain.identity, Some(pending_identity));
+        assert_eq!(uncertain.descendant, None);
+        match pending_namespace {
+            Ok(metadata) => assert!(metadata.is_dir()),
+            Err(error) => assert_ne!(error.kind(), io::ErrorKind::NotFound),
+        }
+        assert_eq!(completed.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn pinned_descendant_refusal_preserves_partial_removal_and_exact_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        parent
+            .create_new(OsStr::new("adjacent"))
+            .unwrap()
+            .write_all(b"adjacent evidence")
+            .unwrap();
+        let root_path = parent.path().join("root");
+        let child_path = root_path.join("child");
+        let root = Directory::ensure_private(&root_path).unwrap();
+        let child = Directory::ensure_private(&child_path).unwrap();
+        child
+            .create_new(OsStr::new("payload"))
+            .unwrap()
+            .write_all(b"removed before child unlink")
+            .unwrap();
+        let root_before = refusal_object_state(&root.anchor().file).unwrap();
+        let child_before = refusal_object_state(&child.anchor().file).unwrap();
+        drop(child);
+        let blocker =
+            Directory::open(&child_path, Privacy::OwnerOnly, NameRetention::Pinned).unwrap();
+
+        // There is one descendant at each level: the payload is removed before
+        // native DELETE sharing refuses its now-empty pinned directory. No
+        // sibling enumeration order or injected filesystem error is involved.
+        let outcome = root.remove_tree();
+        let root_after = Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Movable)
+            .and_then(|retained| refusal_object_state(&retained.anchor().file));
+        let child_after = refusal_object_state(&blocker.anchor().file);
+        let payload_after = fs::symlink_metadata(child_path.join("payload"));
+        let adjacent_after = fs::read(parent.path().join("adjacent"));
+        drop(blocker);
+        let cleaned_root = Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Movable)
+            .map(|retained| retained.remove_tree());
+        let cleaned_parent = parent.remove_tree();
+        let cleaned_fixture = temporary.close();
+
+        let failure = outcome.unwrap_err();
+        assert_eq!(failure.phase, PublicationPhase::Uncertain);
+        assert_eq!(failure.identity, Some(root_before.0.identity));
+        assert_eq!(failure.path, root_path);
+        assert_eq!(failure.descendant, Some(PathBuf::from("child")));
+        assert_eq!(failure.error.raw_os_error(), Some(32));
+        let root_after = root_after.unwrap();
+        let child_after = child_after.unwrap();
+        assert_eq!(root_after.0.identity, root_before.0.identity);
+        assert_eq!(child_after.0.identity, child_before.0.identity);
+        assert!(root_after.1 && child_after.1);
+        assert_eq!(root_after.2, root_before.2, "root ACL changed on refusal");
+        assert_eq!(
+            child_after.2, child_before.2,
+            "child ACL changed on refusal"
+        );
+        assert_eq!(payload_after.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(adjacent_after.unwrap(), b"adjacent evidence");
+        cleaned_root.unwrap().unwrap();
+        cleaned_parent.unwrap();
+        cleaned_fixture.unwrap();
+    }
+
+    fn refusal_object_state(file: &File) -> io::Result<(FileInfo, bool, Vec<u8>)> {
+        let metadata = info(file)?;
+        Ok((
+            metadata.file,
+            metadata.directory,
+            security::file_access_token(file.as_handle())?,
+        ))
+    }
+
+    #[test]
+    fn public_object_admission_refuses_actual_file_directory_type_mismatches() {
+        use crate::fs::regular_file_info;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut file = parent.create_new(OsStr::new("file")).unwrap();
+        file.write_all(b"file admission evidence").unwrap();
+        let child = parent
+            .create_private_directory(OsStr::new("child"))
+            .unwrap();
+        let mut payload = child.create_new(OsStr::new("payload")).unwrap();
+        payload.write_all(b"directory admission evidence").unwrap();
+        let directory_file = open_directory(None, child.path(), NameRetention::Movable).unwrap();
+        let before = [
+            refusal_object_state(&file).unwrap(),
+            refusal_object_state(&directory_file).unwrap(),
+            refusal_object_state(&payload).unwrap(),
+        ];
+        let file_admission = regular_file_info(&directory_file);
+        let directory_admission = Directory::open(
+            &parent.path().join("file"),
+            Privacy::Inherited,
+            NameRetention::Movable,
+        );
+        let after = [
+            refusal_object_state(&file),
+            refusal_object_state(&directory_file),
+            refusal_object_state(&payload),
+        ];
+        let bytes = [
+            fs::read(parent.path().join("file")),
+            fs::read(child.path().join("payload")),
+        ];
+        // Even an unexpectedly admitted object must release its fixture handles
+        // before cleanup. Keep only its success/error observation.
+        let directory_admission = directory_admission.map(drop);
+        drop((file, payload, directory_file, child));
+        parent.remove_tree().unwrap();
+
+        let error = file_admission.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "expected a regular disk file");
+        let error = directory_admission.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "expected a regular directory");
+        for (actual, expected) in after.into_iter().zip(before) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        assert_eq!(bytes[0].as_ref().unwrap(), b"file admission evidence");
+        assert_eq!(bytes[1].as_ref().unwrap(), b"directory admission evidence");
+    }
+
+    #[test]
+    fn native_removal_refuses_real_wrong_types_and_retained_expected_identities() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut first = parent.create_new(OsStr::new("first")).unwrap();
+        first.write_all(b"first retained evidence").unwrap();
+        let mut second = parent.create_new(OsStr::new("second")).unwrap();
+        second.write_all(b"second retained evidence").unwrap();
+        let directory = parent
+            .create_private_directory(OsStr::new("directory"))
+            .unwrap();
+        let other_directory = parent
+            .create_private_directory(OsStr::new("other-directory"))
+            .unwrap();
+        let held_directory =
+            open_directory(None, directory.path(), NameRetention::Movable).unwrap();
+        let before = [
+            refusal_object_state(&first).unwrap(),
+            refusal_object_state(&second).unwrap(),
+            refusal_object_state(&held_directory).unwrap(),
+            refusal_object_state(&other_directory.anchor().file).unwrap(),
+        ];
+        let outcomes = [
+            remove_regular(
+                &parent.path().join("first"),
+                held_directory.try_clone().unwrap(),
+                directory.identity(),
+            ),
+            remove_regular(
+                &parent.path().join("first"),
+                first.try_clone().unwrap(),
+                before[1].0.identity,
+            ),
+            remove_empty_directory(
+                directory.path(),
+                first.try_clone().unwrap(),
+                before[0].0.identity,
+            ),
+            remove_empty_directory(
+                directory.path(),
+                held_directory.try_clone().unwrap(),
+                other_directory.identity(),
+            ),
+        ];
+        let after = [
+            refusal_object_state(&first),
+            refusal_object_state(&second),
+            refusal_object_state(&held_directory),
+            refusal_object_state(&other_directory.anchor().file),
+        ];
+        let bytes = [
+            fs::read(parent.path().join("first")),
+            fs::read(parent.path().join("second")),
+        ];
+        let directory_names = [
+            fs::symlink_metadata(directory.path()),
+            fs::symlink_metadata(other_directory.path()),
+        ];
+        drop((first, second, held_directory, directory, other_directory));
+        parent.remove_tree().unwrap();
+
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let (phase, error) = outcome.unwrap_err();
+            assert_eq!(phase, PublicationPhase::Rejected, "guard {index}");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "guard {index}"
+            );
+            assert_eq!(
+                error.to_string(),
+                if index < 2 {
+                    "retained file no longer has the expected identity"
+                } else {
+                    "retained directory no longer has the expected identity"
+                },
+                "guard {index}"
+            );
+        }
+        for (actual, expected) in after.into_iter().zip(before) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        for metadata in directory_names {
+            assert!(metadata.unwrap().is_dir());
+        }
+        assert_eq!(bytes[0].as_ref().unwrap(), b"first retained evidence");
+        assert_eq!(bytes[1].as_ref().unwrap(), b"second retained evidence");
+    }
+
+    #[test]
+    fn native_named_removal_refuses_a_different_real_retained_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut named = parent.create_new(OsStr::new("named")).unwrap();
+        named.write_all(b"named removal evidence").unwrap();
+        let mut other = parent.create_new(OsStr::new("other")).unwrap();
+        other.write_all(b"other retained evidence").unwrap();
+        let before = [
+            refusal_object_state(&named).unwrap(),
+            refusal_object_state(&other).unwrap(),
+        ];
+        let result = remove(
+            &parent.anchor().file,
+            &parent.path().join("named"),
+            other.try_clone().unwrap(),
+        );
+        let after = [refusal_object_state(&named), refusal_object_state(&other)];
+        let bytes = [
+            fs::read(parent.path().join("named")),
+            fs::read(parent.path().join("other")),
+        ];
+        drop((named, other));
+        parent.remove_tree().unwrap();
+
+        let (phase, error) = result.unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "removal name no longer identifies the held object"
+        );
+        for (actual, expected) in after.into_iter().zip(before) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        assert_eq!(bytes[0].as_ref().unwrap(), b"named removal evidence");
+        assert_eq!(bytes[1].as_ref().unwrap(), b"other retained evidence");
+    }
+
+    #[test]
+    fn native_replacement_refuses_a_missing_leaf_under_the_exact_existing_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_dir = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+        let destination_dir =
+            Directory::ensure_private(&temporary.path().join("destination")).unwrap();
+        let mut candidate = source_dir.create_new(OsStr::new("candidate")).unwrap();
+        candidate
+            .write_all(b"unpublished candidate evidence")
+            .unwrap();
+        let mut adjacent = destination_dir.create_new(OsStr::new("adjacent")).unwrap();
+        adjacent.write_all(b"untouched adjacent evidence").unwrap();
+        let before = [
+            refusal_object_state(&candidate).unwrap(),
+            refusal_object_state(&adjacent).unwrap(),
+            refusal_object_state(&destination_dir.anchor().file).unwrap(),
+        ];
+        // `..` has an existing, retained parent but no publication filename.
+        // The guard must reject it before constructing a native rename record.
+        let destination = destination_dir.path().join("..");
+        let result = replace_open_destination(
+            &destination_dir.anchor().file,
+            &candidate,
+            None,
+            &destination,
+        );
+        let after = [
+            refusal_object_state(&candidate),
+            refusal_object_state(&adjacent),
+            refusal_object_state(&destination_dir.anchor().file),
+        ];
+        let names = [
+            source_dir.verify(OsStr::new("candidate"), &candidate),
+            destination_dir.verify(OsStr::new("adjacent"), &adjacent),
+        ];
+        let bytes = [
+            fs::read(source_dir.path().join("candidate")),
+            fs::read(destination_dir.path().join("adjacent")),
+        ];
+        drop((candidate, adjacent));
+        let removed_source = source_dir.remove_tree();
+        let removed_destination = destination_dir.remove_tree();
+        removed_source.unwrap();
+        removed_destination.unwrap();
+
+        let (phase, error) = result.unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "missing publication filename");
+        for (actual, expected) in after.into_iter().zip(before) {
+            assert_eq!(actual.unwrap(), expected);
+        }
+        for name in names {
+            name.unwrap();
+        }
+        assert_eq!(
+            bytes[0].as_ref().unwrap(),
+            b"unpublished candidate evidence"
+        );
+        assert_eq!(bytes[1].as_ref().unwrap(), b"untouched adjacent evidence");
     }
 }

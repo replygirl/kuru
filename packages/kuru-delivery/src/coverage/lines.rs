@@ -47,7 +47,7 @@ pub const EXPORT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 pub const LINES_LIMIT: u64 = 256 * 1024 * 1024;
 /// The per-OS line gate: the percent `mise run coverage` passes to
 /// cargo-llvm-cov's `--fail-under-lines`, over the same metric.
-pub const GATE_PERCENT: u64 = 90;
+pub const GATE_PERCENT: u64 = 95;
 /// Schema of the per-partition line export.
 pub const LINES_SCHEMA: u32 = 1;
 /// The `llvm-cov export` document type and version this port reproduces.
@@ -1467,18 +1467,20 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_passes_at_exactly_ninety_percent_as_cargo_llvm_cov_does() {
+    fn the_gate_passes_at_exactly_ninety_five_percent_as_cargo_llvm_cov_does() {
         let lines = |count, covered| Lines { count, covered };
-        assert_eq!(GATE_PERCENT, 90);
-        assert!(passes_gate(&lines(1000, 900)));
-        assert!(!passes_gate(&lines(1000, 899)));
+        assert_eq!(GATE_PERCENT, 95);
+        assert!(passes_gate(&lines(1000, 950)));
+        assert!(!passes_gate(&lines(1000, 949)));
         assert!(passes_gate(&lines(10, 10)));
         assert!(!passes_gate(&lines(0, 0)));
-        assert!(!passes_gate(&lines(100_001, 90_000)));
-        // cargo-llvm-cov compares covered * 100 / count as f64 with 90.0.
+        assert!(!passes_gate(&lines(100_001, 95_000)));
+        // cargo-llvm-cov compares covered * 100 / count as f64 with 95.0.
         for (count, covered) in [
-            (1000_u64, 900_u64),
-            (100_001, 90_000),
+            (1000_u64, 950_u64),
+            (100_001, 95_000),
+            (20, 19),
+            (100_000, 94_999),
             (7, 6),
             (9, 8),
             (123_457, 111_111),
@@ -1486,11 +1488,11 @@ mod tests {
             let float = covered as f64 * 100.0 / count as f64;
             assert_eq!(
                 passes_gate(&lines(count, covered)),
-                float >= 90.0,
+                float >= 95.0,
                 "{count} {covered}"
             );
         }
-        assert_eq!(percent(&lines(1000, 900)), "90.00");
+        assert_eq!(percent(&lines(1000, 950)), "95.00");
         assert_eq!(percent(&lines(3, 2)), "66.66");
         assert_eq!(percent(&lines(0, 0)), "0.00");
     }

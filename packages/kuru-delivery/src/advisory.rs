@@ -801,4 +801,90 @@ mod tests {
             .unwrap();
         assert!(refreshed.committed_at > 946_684_800);
     }
+
+    #[tokio::test]
+    async fn cold_refresh_selects_exact_local_revision_and_refuses_executable_config() {
+        let root = tempfile::tempdir().unwrap();
+        templates()
+            .await
+            .copy("refresh", &root.path().join("refresh"));
+        let source = root.path().join("refresh/source");
+        let database = root.path().join("refresh/cold-database");
+        let adjacent = root.path().join("refresh/adjacent");
+        fs::write(&adjacent, b"unrelated fixture state").unwrap();
+        let fixture = FixtureGit::new();
+        let source_head = fixture
+            .git(&source, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await;
+        let source_sha = String::from_utf8(source_head.stdout).unwrap();
+        let source_bytes = fs::read(source.join("README.md")).unwrap();
+
+        assert!(!database.exists(), "cold checkout already exists");
+        let refreshed = refresh_with_origin(&database, REFRESH_ORIGIN)
+            .await
+            .unwrap();
+        let environment = GitEnvironment::new().unwrap();
+        let inspected = inspect_with(&environment, &database, true, REFRESH_ORIGIN)
+            .await
+            .unwrap();
+        let values = local_config(&environment, &database, REFRESH_ORIGIN)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.sha, source_sha.trim());
+        assert_eq!(inspected.sha, refreshed.sha);
+        assert_eq!(values["remote.origin.url"], REFRESH_ORIGIN);
+        assert_eq!(values["remote.origin.fetch"], FETCH_REFSPEC);
+        assert_eq!(
+            fs::read_to_string(database.join(".git/HEAD"))
+                .unwrap()
+                .trim(),
+            refreshed.sha
+        );
+        assert_eq!(fs::read(database.join("README.md")).unwrap(), source_bytes);
+        assert_eq!(fs::read(source.join("README.md")).unwrap(), source_bytes);
+
+        // A fetch would now change FETCH_HEAD, and a checkout would change the
+        // worktree. Rejected executable configuration must permit neither.
+        fs::write(source.join("README.md"), b"new local origin revision\n").unwrap();
+        git(&fixture, &source, &["add", "README.md"]).await;
+        commit(&fixture, &source, "advance local refusal fixture").await;
+        let advanced = fixture
+            .git(&source, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await;
+        let advanced_sha = String::from_utf8(advanced.stdout).unwrap();
+        assert_ne!(advanced_sha.trim(), refreshed.sha);
+        git(
+            &fixture,
+            &database,
+            &["config", "core.hooksPath", "fixture-executable-hooks"],
+        )
+        .await;
+        let head = fs::read(database.join(".git/HEAD")).unwrap();
+        let fetch_head = fs::read(database.join(".git/FETCH_HEAD")).unwrap();
+        let config = fs::read(database.join(".git/config")).unwrap();
+        let error = refresh_with_origin(&database, REFRESH_ORIGIN)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "advisory database local configuration is not an accepted fresh clone"
+        );
+        assert_eq!(fs::read(database.join(".git/HEAD")).unwrap(), head);
+        assert_eq!(
+            fs::read(database.join(".git/FETCH_HEAD")).unwrap(),
+            fetch_head
+        );
+        assert_eq!(fs::read(database.join(".git/config")).unwrap(), config);
+        assert_eq!(fs::read(database.join("README.md")).unwrap(), source_bytes);
+        let unchanged = fixture
+            .git(&source, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await;
+        assert_eq!(unchanged.stdout, advanced_sha.as_bytes());
+        assert_eq!(
+            fs::read(source.join("README.md")).unwrap(),
+            b"new local origin revision\n"
+        );
+        assert_eq!(fs::read(adjacent).unwrap(), b"unrelated fixture state");
+    }
 }

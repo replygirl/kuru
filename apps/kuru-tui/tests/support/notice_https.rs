@@ -17,6 +17,7 @@ pub struct NoticeHttps {
     pub base: String,
     pub ca: PathBuf,
     requests: Arc<Mutex<Vec<String>>>,
+    failures: Arc<Mutex<Vec<String>>>,
     pub held: Arc<Notify>,
     pub disconnected: Arc<Notify>,
     task: JoinHandle<()>,
@@ -25,7 +26,8 @@ pub struct NoticeHttps {
 impl NoticeHttps {
     pub async fn start(root: &Path) -> Result<Self> {
         use rcgen::{
-            BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
+            BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
+            ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
         };
         use tokio_rustls::rustls::{
             ServerConfig,
@@ -33,10 +35,19 @@ impl NoticeHttps {
         };
         let mut ca = CertificateParams::default();
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.distinguished_name = DistinguishedName::new();
+        ca.distinguished_name
+            .push(DnType::CommonName, "Kuru synthetic notice test CA");
         ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         let issuer = CertifiedIssuer::self_signed(ca, KeyPair::generate()?)?;
         let key = KeyPair::generate()?;
-        let leaf = CertificateParams::new(vec!["localhost".into()])?.signed_by(&key, &issuer)?;
+        let mut leaf = CertificateParams::new(vec!["localhost".into()])?;
+        leaf.distinguished_name = DistinguishedName::new();
+        leaf.distinguished_name
+            .push(DnType::CommonName, "localhost");
+        leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = leaf.signed_by(&key, &issuer)?;
         let ca = root.join("notice-fixture-ca.pem");
         std::fs::write(&ca, issuer.pem())?;
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(
@@ -50,11 +61,13 @@ impl NoticeHttps {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("https://localhost:{}", listener.local_addr()?.port());
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let failures = Arc::new(Mutex::new(Vec::new()));
         let held = Arc::new(Notify::new());
         let disconnected = Arc::new(Notify::new());
         let task = tokio::spawn({
-            let (requests, held, disconnected, base) = (
+            let (requests, failures, held, disconnected, base) = (
                 requests.clone(),
+                failures.clone(),
                 held.clone(),
                 disconnected.clone(),
                 base.clone(),
@@ -66,13 +79,21 @@ impl NoticeHttps {
                     tokio::select! {
                         accepted = listener.accept() => {
                             let Ok((socket, _)) = accepted else { break };
-                            let (acceptor, requests, held, disconnected, base) = (acceptor.clone(), requests.clone(), held.clone(), disconnected.clone(), base.clone());
+                            let (acceptor, requests, failures, held, disconnected, base) = (acceptor.clone(), requests.clone(), failures.clone(), held.clone(), disconnected.clone(), base.clone());
                             children.spawn(async move {
-                                let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await else { return };
+                                let mut stream = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await {
+                                    Ok(Ok(stream)) => stream,
+                                    Ok(Err(error)) => { record_failure(&failures, format!("TLS accept: {error}")); return; }
+                                    Err(error) => { record_failure(&failures, format!("TLS accept deadline: {error}")); return; }
+                                };
                                 let mut request = Vec::new();
                                 loop {
                                     let mut bytes = [0u8; 1024];
-                                    let Ok(Ok(count)) = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut bytes)).await else { return };
+                                    let count = match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut bytes)).await {
+                                        Ok(Ok(count)) => count,
+                                        Ok(Err(error)) => { record_failure(&failures, format!("request read: {error}")); return; }
+                                        Err(error) => { record_failure(&failures, format!("request read deadline: {error}")); return; }
+                                    };
                                     if count == 0 || request.len() + count > 8192 { return }
                                     request.extend_from_slice(&bytes[..count]);
                                     if request.windows(4).any(|part| part == b"\r\n\r\n") { break }
@@ -94,7 +115,8 @@ impl NoticeHttps {
                                     return;
                                 }
                                 let target = kuru_delivery::archive::host_target().unwrap();
-                                let manifest = format!("{}  kuru-999.0.0-{target}.tar.gz\n", "a".repeat(64));
+                                let extension = kuru_delivery::targets::find(target).unwrap().format.extension();
+                                let manifest = format!("{}  kuru-999.0.0-{target}.{extension}\n", "a".repeat(64));
                                 let (status, extra, body) = match path.as_str() {
                                     "/manifest" | "/signed?token=fixture" => (200, String::new(), manifest),
                                     "/redirect" => (302, format!("Location: {base}/signed?token=fixture\r\n"), String::new()),
@@ -111,8 +133,12 @@ impl NoticeHttps {
                                 } else {
                                     format!("HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len())
                                 };
-                                let _ = stream.write_all(reply.as_bytes()).await;
-                                let _ = stream.shutdown().await;
+                                if let Err(error) = stream.write_all(reply.as_bytes()).await {
+                                    record_failure(&failures, format!("response write: {error}"));
+                                }
+                                if let Err(error) = stream.shutdown().await {
+                                    record_failure(&failures, format!("TLS shutdown: {error}"));
+                                }
                             });
                         }
                         _ = children.join_next(), if !children.is_empty() => {}
@@ -124,6 +150,7 @@ impl NoticeHttps {
             base,
             ca,
             requests,
+            failures,
             held,
             disconnected,
             task,
@@ -134,9 +161,20 @@ impl NoticeHttps {
         self.requests.lock().unwrap().clone()
     }
 
+    pub fn failures(&self) -> Vec<String> {
+        self.failures.lock().unwrap().clone()
+    }
+
     pub async fn close(mut self) {
         self.task.abort();
         let _ = (&mut self.task).await;
+    }
+}
+
+fn record_failure(failures: &Mutex<Vec<String>>, message: String) {
+    let mut failures = failures.lock().unwrap();
+    if failures.len() < 16 {
+        failures.push(message.chars().take(512).collect());
     }
 }
 

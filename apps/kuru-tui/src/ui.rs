@@ -4830,6 +4830,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tool_cards_render_refused_interrupted_and_partial_candidate_results_at_80_and_120() {
+        use kuru_runtime::{ToolCardState, ToolOutcome};
+        for width in [80, 120] {
+            for (state, label) in [
+                (ToolCardState::Pending, "Pending"),
+                (ToolCardState::Settled(ToolOutcome::Error), "Failed"),
+                (ToolCardState::Settled(ToolOutcome::Denied), "Denied"),
+                (ToolCardState::Settled(ToolOutcome::Cancelled), "Cancelled"),
+                (ToolCardState::Interrupted, "Interrupted"),
+            ] {
+                let mut view = fixture();
+                view.show_scene = false;
+                view.transcript
+                    .push(("user".into(), "inspect this candidate".into()));
+                view.transcript
+                    .bind_user("plain-session", "binding", "candidate");
+                let mut card = (*card_fixture("binding", 1)).clone();
+                card.source_view = "candidate".into();
+                card.turn_key = transcript::turn_key("plain-session", "binding", "candidate");
+                card.state = state;
+                card.checkpoint_id = Some("checked-receipt".into());
+                card.stdout = Some("stdout-prefix\u{1b}[31m".into());
+                card.stderr = Some("stderr-prefix\u{7}".into());
+                card.preview_truncated = true;
+                view.refresh_tool_cards((vec![Arc::new(card)], 0));
+                view.select_tool_card();
+                view.toggle_tool_card();
+                let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                terminal.draw(|frame| draw(frame, &view)).unwrap();
+                let screen: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                for text in [
+                    label,
+                    "Candidate view: candidate",
+                    "stdout-prefix",
+                    "stderr-prefix",
+                    "Partial preview truncated",
+                    "settled result",
+                    "authoritative",
+                    "Checked file diff available after this operation settles",
+                ] {
+                    assert!(
+                        screen.contains(text),
+                        "missing {text:?} at {width}: {screen}"
+                    );
+                }
+                let missing = if state == ToolCardState::Pending {
+                    "Settled result not available yet"
+                } else {
+                    "No settled output available"
+                };
+                assert!(screen.contains(missing), "{screen}");
+                assert!(!screen.contains('\u{1b}') && !screen.contains('\u{7}'));
+                view.tool_cards[0].diff = Some(kuru_connectors::CheckpointDiff::Unavailable {
+                    reason: "Captured revision unavailable",
+                });
+                terminal.draw(|frame| draw(frame, &view)).unwrap();
+                let screen: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(screen.contains("Captured revision unavailable"), "{screen}");
+                assert!(
+                    !screen.contains("Checked file diff available after this operation settles")
+                );
+            }
+        }
+    }
+
     fn session_summary(
         id: &str,
         state: SessionLifecycleState,
@@ -6516,6 +6594,271 @@ mod tests {
         view.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         assert!(view.recall.is_some());
         assert!(view.transcript_search.is_none());
+    }
+
+    fn public_read_page(
+        sequence: i64,
+        body: &str,
+        next: Option<PublicTranscriptCursor>,
+    ) -> PublicTranscriptPage {
+        PublicTranscriptPage {
+            session_id: "plain-session".into(),
+            view: "main".into(),
+            revision: "captured-revision".into(),
+            head_node_id: None,
+            pending: None,
+            records: vec![PublicTranscriptEntry::Legacy {
+                sequence,
+                message: Message::text("user", body),
+            }],
+            total_rows: 3,
+            next,
+        }
+    }
+
+    fn public_read_cursor(sequence: i64) -> PublicTranscriptCursor {
+        PublicTranscriptCursor {
+            session_id: "plain-session".into(),
+            revision: "captured-revision".into(),
+            head_node_id: None,
+            next: kuru_memory::PublicTranscriptPosition::Legacy { sequence },
+        }
+    }
+
+    fn install_public_read(
+        view: &mut View,
+        kind: PublicReadKind,
+        page: Result<PublicTranscriptPage>,
+    ) {
+        let read = PublicRead {
+            session: view.session.clone(),
+            view: "main".into(),
+            epoch: view.transcript_navigation.epoch,
+            kind,
+            page,
+        };
+        apply_public_read(view, "main", read);
+    }
+
+    #[test]
+    fn completed_public_reads_install_checked_older_newer_and_restored_pages_without_changing_draft()
+     {
+        let mut view = fixture();
+        view.paste("unsent 猫 draft");
+        let draft = (
+            view.input.clone(),
+            view.cursor,
+            view.paste_chips.project(&view.input, view.cursor),
+        );
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(public_read_page(2, "newest", Some(public_read_cursor(1)))),
+        );
+        install_public_read(
+            &mut view,
+            PublicReadKind::Older,
+            Ok(public_read_page(1, "middle", Some(public_read_cursor(0)))),
+        );
+        assert_eq!(
+            view.transcript
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["middle", "newest"]
+        );
+        assert_eq!(view.transcript_navigation.pending_rows, -10);
+        let before = view.transcript.clone();
+        let mut changed = public_read_page(0, "unverified revision", None);
+        changed.revision = "different-revision".into();
+        install_public_read(&mut view, PublicReadKind::Older, Ok(changed));
+        assert_eq!(view.transcript, before);
+        assert!(view.notice.as_ref().unwrap().contains("Transcript changed"));
+        install_public_read(
+            &mut view,
+            PublicReadKind::Older,
+            Ok(public_read_page(0, "oldest", None)),
+        );
+        assert_eq!(
+            view.transcript
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["oldest", "middle"]
+        );
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newer {
+                target: public_read_cursor(1),
+                entry: None,
+            },
+            Ok(public_read_page(2, "newest", Some(public_read_cursor(1)))),
+        );
+        assert_eq!(
+            view.transcript
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["middle", "newest"]
+        );
+        assert_eq!(view.transcript_navigation.pending_rows, -10);
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newer {
+                target: public_read_cursor(1),
+                entry: None,
+            },
+            Ok(public_read_page(
+                2,
+                "not the requested page",
+                Some(public_read_cursor(0)),
+            )),
+        );
+        assert!(view.transcript_navigation.newer_needed);
+        assert_eq!(
+            view.transcript_navigation.newer_scan,
+            Some(Some(public_read_cursor(0)))
+        );
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newer {
+                target: public_read_cursor(1),
+                entry: None,
+            },
+            Ok(public_read_page(2, "not the requested page", None)),
+        );
+        assert!(
+            view.notice
+                .as_ref()
+                .unwrap()
+                .contains("Newer public page unavailable")
+        );
+        install_public_read(
+            &mut view,
+            PublicReadKind::Restore,
+            Ok(public_read_page(2, "restored newest", None)),
+        );
+        assert_eq!(
+            view.transcript
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["restored newest"]
+        );
+        install_public_read(
+            &mut view,
+            PublicReadKind::Older,
+            Err(anyhow::anyhow!("private failure details")),
+        );
+        assert!(
+            view.notice
+                .as_ref()
+                .unwrap()
+                .contains("stale or unavailable")
+        );
+        assert!(
+            !view
+                .notice
+                .as_ref()
+                .unwrap()
+                .contains("private failure details")
+        );
+        assert_eq!(
+            (
+                view.input.clone(),
+                view.cursor,
+                view.paste_chips.project(&view.input, view.cursor)
+            ),
+            draft
+        );
+    }
+
+    #[test]
+    fn completed_public_search_continues_to_a_literal_hit_and_reports_exhaustion_without_exposing_errors()
+     {
+        let mut view = fixture();
+        view.paste("unsent e\u{301} draft");
+        let draft = (
+            view.input.clone(),
+            view.cursor,
+            view.paste_chips.project(&view.input, view.cursor),
+        );
+        view.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        view.transcript_search.as_mut().unwrap().query = "needle".into();
+        install_public_read(
+            &mut view,
+            PublicReadKind::Search("needle".into()),
+            Ok(public_read_page(
+                2,
+                "not a match",
+                Some(public_read_cursor(1)),
+            )),
+        );
+        let search = view.transcript_search.as_ref().unwrap();
+        assert!(search.requested && !search.finished);
+        assert_eq!(search.status, "Scanning · 1 public records scanned");
+        assert_eq!(search.cursor, Some(public_read_cursor(1)));
+        let body = "first wrapped line\nsecond wrapped line\nneedle 猫";
+        install_public_read(
+            &mut view,
+            PublicReadKind::Search("needle".into()),
+            Ok(public_read_page(1, body, Some(public_read_cursor(0)))),
+        );
+        let search = view.transcript_search.as_ref().unwrap();
+        assert!(!search.requested && !search.finished);
+        assert_eq!(search.status, "Match · 2 public records scanned");
+        let (item, end) = search.last_match.as_ref().unwrap();
+        let byte = body.find("needle").unwrap();
+        assert_eq!(*end, byte + "needle".len());
+        assert_eq!(
+            view.transcript_navigation.match_byte,
+            Some((item.clone(), byte))
+        );
+        assert!(
+            matches!(&view.transcript_navigation.position, transcript::Position::Reading(anchor) if &anchor.item == item)
+        );
+        assert!(render::source_row(&view, item, byte, 80) > render::source_row(&view, item, 0, 80));
+        assert_eq!(
+            render::source_row(&view, &transcript::ItemId::Legacy(-1), 0, 80),
+            0
+        );
+        let matched = view.transcript.clone();
+        install_public_read(
+            &mut view,
+            PublicReadKind::Search("obsolete query".into()),
+            Ok(public_read_page(0, "obsolete query", None)),
+        );
+        assert_eq!(view.transcript, matched);
+        install_public_read(
+            &mut view,
+            PublicReadKind::Search("needle".into()),
+            Ok(public_read_page(0, "no further match", None)),
+        );
+        let search = view.transcript_search.as_ref().unwrap();
+        assert!(search.finished && !search.requested);
+        assert_eq!(
+            search.status,
+            "Complete · 3 public records scanned · no further match"
+        );
+        assert_eq!(view.transcript, matched);
+        install_public_read(
+            &mut view,
+            PublicReadKind::Search("needle".into()),
+            Err(anyhow::anyhow!("PRIVATE_SQL_ERROR")),
+        );
+        assert_eq!(
+            view.transcript_search.as_ref().unwrap().status,
+            "Stale or unavailable public scan · restart search"
+        );
+        assert!(!rendered(&view).contains("PRIVATE_SQL_ERROR"));
+        assert_eq!(
+            (
+                view.input.clone(),
+                view.cursor,
+                view.paste_chips.project(&view.input, view.cursor)
+            ),
+            draft
+        );
     }
 
     #[tokio::test]

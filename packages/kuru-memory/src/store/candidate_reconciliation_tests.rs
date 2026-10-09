@@ -356,6 +356,74 @@ async fn local_reconciliation_refuses_identical_and_unequal_membership_overlap()
 }
 
 #[tokio::test]
+async fn native_state_conflicts_report_only_bounded_coordinates_and_keep_exact_heads() -> Result<()>
+{
+    kuru_memory::test_support::closing(async {
+        for count in [1, 33] {
+            let store = fixture().await?;
+            let rows = |value: &str| {
+                (0..count)
+                    .map(|index| {
+                        (
+                            format!("private-overlap/{index:02}"),
+                            json!({"private":value}),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            store.put_many(&rows("BASE_PRIVATE_SENTINEL")).await?;
+            let candidate = store.begin_candidate("bounded-state-conflicts").await?;
+            candidate
+                .view()
+                .put_many(&rows("CANDIDATE_PRIVATE_SENTINEL"))
+                .await?;
+            store.put_many(&rows("LIVE_PRIVATE_SENTINEL")).await?;
+            let from = candidate.view().revision().await?;
+            let live = store.revision().await?;
+            let (result, fresh) = candidate.reconcile_with_live(&from, &live).await?;
+            let CandidateReconciliationResult::Conflict {
+                tables,
+                state_keys,
+                coordinates_available,
+            } = &result
+            else {
+                bail!("state overlap produced {result:?}")
+            };
+            assert!(fresh.is_none());
+            if count == 1 {
+                assert!(*coordinates_available);
+                assert_eq!(tables, &["state"]);
+                assert_eq!(state_keys, &["private-overlap/00"]);
+            } else {
+                assert!(!coordinates_available);
+                assert!(tables.is_empty() && state_keys.is_empty());
+            }
+            let metadata = serde_json::to_string(&result)?;
+            assert!(!metadata.contains("PRIVATE_SENTINEL"));
+            assert_eq!(candidate.view().revision().await?, from);
+            assert_eq!(store.revision().await?, live);
+            assert_eq!(
+                candidate.view().get("private-overlap/00").await?,
+                Some(json!({"private":"CANDIDATE_PRIVATE_SENTINEL"}))
+            );
+            assert_eq!(
+                store.get("private-overlap/00").await?,
+                Some(json!({"private":"LIVE_PRIVATE_SENTINEL"}))
+            );
+            assert_eq!(
+                candidate_reconciliation::observe(&store, candidate.branch(), &from, &live).await?,
+                CandidateReconciliationObservation::NotCommitted
+            );
+            assert!(candidate_branch_is_clean(&store, candidate.branch()).await?);
+            candidate.abandon_exact(&from).await?;
+            store.close().await?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn local_reconciliation_checks_exact_inputs_and_private_fast_forward() -> Result<()> {
     kuru_memory::test_support::closing(async {
         let store = fixture().await?;

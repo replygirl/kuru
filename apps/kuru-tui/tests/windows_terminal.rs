@@ -11,15 +11,19 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 #[path = "support/memory.rs"]
 mod memory;
+#[path = "support/notice_https.rs"]
+mod notice_https;
 #[path = "support/windows_terminal.rs"]
 mod terminal;
+#[path = "support/windows_recall.rs"]
+mod windows_recall;
 use terminal::{EXIT, READY, Terminal};
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -71,6 +75,26 @@ fn composer_coordinates_use_physical_rows_after_conpty_autowrap() {
         parser.screen(),
         "focus draft"
     ));
+}
+
+#[test]
+fn empty_composer_waits_for_cursor_at_placeholder_origin() {
+    for placeholder in [
+        "What shall we explore or build?",
+        "Keep your next thought here…",
+    ] {
+        let mut parser = vt100::Parser::new(6, 80, 0);
+        parser.process(format!("\x1b[4;1H › {placeholder}\x1b[?25h").as_bytes());
+        assert!(!terminal::composer_frame_ready(parser.screen(), ""));
+        // Painting the placeholder leaves a visible cursor at its end. Only
+        // the final composer cursor placement completes the native frame.
+        parser.process(b"\x1b[4;4");
+        assert!(!terminal::composer_frame_ready(parser.screen(), ""));
+        parser.process(b"H");
+        assert!(terminal::composer_frame_ready(parser.screen(), ""));
+        parser.process(b"\x1b[5;4H");
+        assert!(!terminal::composer_frame_ready(parser.screen(), ""));
+    }
 }
 
 struct Sandbox {
@@ -638,6 +662,269 @@ impl Drop for ProviderServer {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_session_controls_share_cli_identity_and_public_history() -> Result<()> {
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    let _serial = SERIAL.lock().await;
+    let sandbox = Sandbox::warmed().await?;
+    let outcome = async {
+        let cli_action = |args: &[&str]| -> Result<Value> {
+            let output = BlockingCommand::new(env!("CARGO_BIN_EXE_kuru"))
+                .args(sandbox.args("demo"))
+                .args(["-c", "max_rounds=1"])
+                .args(args)
+                .env_clear()
+                .envs(&sandbox.environment)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(serde_json::from_slice(&output.stdout)?)
+        };
+        let created = cli_action(&["run", "NATIVE-SESSION-ORIGIN", "--json"])?;
+        let source = created["session"]
+            .as_str()
+            .context("CLI source session missing")?
+            .to_owned();
+        ensure!(cli_action(&["sessions", "rename", &source, "CLI-LABEL"])?["session_id"] == source);
+        let catalog = cli_action(&["sessions"])?;
+        let source_record = catalog
+            .as_array()
+            .context("CLI catalog is not an array")?
+            .iter()
+            .find(|row| row["id"] == source)
+            .context("CLI source is absent")?;
+        let source_node = source_record["head_node_id"]
+            .as_str()
+            .context("source head missing")?
+            .to_owned();
+
+        // Command dispatch must not run an inference turn. Unexpected requests
+        // are counted and fail closed, while the real model catalog remains
+        // available to the application's ordinary provider initialization.
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let router = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let counted = Arc::clone(&counted);
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = sandbox.root.join("session-controls.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "api_base='http://{}/v1'\napi_key_env='KURU_NATIVE_CONTROL_KEY'\nmax_rounds=1\n",
+                listener.local_addr()?
+            ),
+        )?;
+        let _server = ProviderServer(tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        }));
+        let config_path = config
+            .to_str()
+            .context("fixture config path is not UTF-8")?;
+        let mut terminal = sandbox.start(
+            "session-controls",
+            "app",
+            &[
+                "--model",
+                "fixture",
+                "--mode",
+                "freudian",
+                "--config",
+                config_path,
+                "--resume",
+                &source,
+            ],
+            true,
+            "responses",
+            &[("KURU_NATIVE_CONTROL_KEY", "fixture")],
+        )?;
+        terminal.frame_text(&["NATIVE-SESSION-ORIGIN", "enter send"], sandbox.startup)?;
+        let submit = |terminal: &mut Terminal, command: &str| -> Result<()> {
+            terminal.frame_text(&["enter send"], READY)?;
+            terminal.committed_text(command)?;
+            terminal.composer(command)?;
+            terminal.committed_key(KeyCode::Enter, KeyModifiers::NONE)
+        };
+        for (command, result) in [
+            ("/file-checkpoints", "[]"),
+            ("/file-inspect missing-id", "file checkpoint does not exist"),
+            ("/file-prune missing-id", "file checkpoint does not exist"),
+            ("/file-undo missing-id", "file checkpoint does not exist"),
+            ("/memory-candidates", "\"candidates\": []"),
+            (
+                "/memory-candidate-status",
+                "usage: /memory-candidate-status BRANCH",
+            ),
+            (
+                "/memory-candidate-abandon",
+                "usage: /memory-candidate-abandon BRANCH BASE HEAD",
+            ),
+        ] {
+            submit(&mut terminal, command)?;
+            terminal.frame_text(&[result, "enter send"], READY)?;
+            ensure!(
+                !terminal.screen().contains("Unknown command"),
+                "registered command was not dispatched: {command}"
+            );
+        }
+
+        submit(
+            &mut terminal,
+            &format!("/session-rename {source} NATIVE-LABEL"),
+        )?;
+        terminal.text(&["Sessions", "NATIVE-LABEL"], READY)?;
+        terminal.committed_key(KeyCode::Esc, KeyModifiers::NONE)?;
+        terminal.frame_text(&["enter send"], READY)?;
+        let catalog = cli_action(&["sessions"])?;
+        ensure!(
+            catalog
+                .as_array()
+                .context("renamed catalog is not an array")?
+                .iter()
+                .any(|row| row["id"] == source && row["label"] == "NATIVE-LABEL")
+        );
+
+        submit(&mut terminal, &format!("/session-boundaries {source}"))?;
+        terminal.text(&["Settled boundaries"], READY)?;
+        terminal.committed_key(KeyCode::Enter, KeyModifiers::NONE)?;
+        terminal.frame_text(
+            &[
+                "current project memory remains",
+                "shared",
+                "NATIVE-SESSION-ORIGIN",
+                "enter send",
+            ],
+            READY,
+        )?;
+        let catalog = cli_action(&["sessions"])?;
+        let child = catalog
+            .as_array()
+            .context("forked catalog is not an array")?
+            .iter()
+            .find(|row| {
+                row["id"] != source && row["fork_provenance"]["source_session_id"] == source
+            })
+            .context("native fork is missing from CLI catalog")?;
+        ensure!(child["fork_provenance"]["source_node_id"] == source_node);
+        let child_id = child["id"]
+            .as_str()
+            .context("native child ID missing")?
+            .to_owned();
+        submit(&mut terminal, "/status")?;
+        terminal.frame_text(&[&format!("Session: {child_id}"), "enter send"], READY)?;
+
+        // The child owns the active claim, so removing its source must preserve
+        // the child's public history and refuse a direct resume until restore.
+        submit(&mut terminal, &format!("/session-remove {source}"))?;
+        terminal.text(&["Sessions", "NATIVE-LABEL", "removed"], READY)?;
+        terminal.committed_key(KeyCode::Esc, KeyModifiers::NONE)?;
+        terminal.frame_text(&["enter send"], READY)?;
+        ensure!(
+            cli_action(&["sessions"])?
+                .as_array()
+                .context("active catalog is not an array")?
+                .iter()
+                .all(|row| row["id"] != source)
+        );
+        submit(&mut terminal, &format!("/resume {source}"))?;
+        terminal.frame_text(
+            &[
+                "session is removed; restore it before resuming",
+                "enter send",
+            ],
+            READY,
+        )?;
+        // Clear only visible history so an earlier child status cannot satisfy
+        // this check of the active claim after the refused source resume.
+        submit(&mut terminal, "/clear")?;
+        terminal.frame_text(
+            &["View cleared · stored history unchanged", "enter send"],
+            READY,
+        )?;
+        submit(&mut terminal, "/status")?;
+        terminal.frame_text(&[&format!("Session: {child_id}"), "enter send"], READY)?;
+        submit(&mut terminal, &format!("/session-restore {source}"))?;
+        terminal.text(&["Sessions", "NATIVE-LABEL"], READY)?;
+        terminal.committed_key(KeyCode::Esc, KeyModifiers::NONE)?;
+        terminal.frame_text(&["enter send"], READY)?;
+        submit(&mut terminal, &format!("/resume {source}"))?;
+        terminal.frame_text(&["NATIVE-SESSION-ORIGIN", "enter send"], READY)?;
+        submit(&mut terminal, "/status")?;
+        terminal.frame_text(&[&format!("Session: {source}"), "enter send"], READY)?;
+        submit(&mut terminal, "/export native-session-export.md")?;
+        terminal.frame_text(&["Exported public session", "enter send"], READY)?;
+        let exported = std::fs::read_to_string(sandbox.project.join("native-session-export.md"))?;
+        ensure!(exported.contains("NATIVE-SESSION-ORIGIN"));
+        ensure!(
+            requests.load(Ordering::SeqCst) == 0,
+            "session controls dispatched an inference turn"
+        );
+        submit(&mut terminal, "/quit")?;
+        ensure!(terminal.finish(EXIT)?["status"] == 0);
+        drop(terminal);
+
+        let mut reopened = sandbox.start(
+            "session-controls-reopened",
+            "app",
+            &[
+                "--model",
+                "fixture",
+                "--mode",
+                "freudian",
+                "--config",
+                config_path,
+                "--resume",
+                &child_id,
+            ],
+            true,
+            "responses",
+            &[("KURU_NATIVE_CONTROL_KEY", "fixture")],
+        )?;
+        reopened.frame_text(&["NATIVE-SESSION-ORIGIN", "enter send"], sandbox.startup)?;
+        submit(&mut reopened, "/status")?;
+        reopened.frame_text(&[&format!("Session: {child_id}"), "enter send"], READY)?;
+        submit(&mut reopened, "/sessions")?;
+        reopened.text(&["Sessions", "NATIVE-LABEL", &child_id], READY)?;
+        reopened.committed_key(KeyCode::Esc, KeyModifiers::NONE)?;
+        reopened.frame_text(&["enter send"], READY)?;
+        let catalog = cli_action(&["sessions"])?;
+        ensure!(
+            catalog
+                .as_array()
+                .context("reopened catalog is not an array")?
+                .iter()
+                .any(|row| row["id"] == source && row["label"] == "NATIVE-LABEL")
+        );
+        submit(&mut reopened, "/quit")?;
+        ensure!(reopened.finish(EXIT)?["status"] == 0);
+        drop(reopened);
+        ensure!(requests.load(Ordering::SeqCst) == 0);
+        Ok(())
+    }
+    .await;
+    sandbox.release(outcome)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_conpty_cancels_provider_work_without_losing_the_next_draft() -> Result<()> {
     let _serial = SERIAL.lock().await;
     let sandbox = Sandbox::warmed().await?;
@@ -710,5 +997,263 @@ async fn cancel_provider_work_and_keep_the_next_draft(sandbox: &Sandbox) -> Resu
     let sessions: Vec<kuru_runtime::Session> = serde_json::from_str(&sandbox.output("sessions")?)?;
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].turns, 1);
+    Ok(())
+}
+
+fn native_notice_start(
+    sandbox: &Sandbox,
+    peer: &notice_https::NoticeHttps,
+    label: &str,
+    path: &str,
+) -> Result<Terminal> {
+    let endpoint = format!("{}{path}", peer.base);
+    let ca = peer.ca.to_str().context("fixture CA path")?;
+    sandbox.start(
+        label,
+        "app",
+        &["-c", "update.notice=true"],
+        true,
+        "demo",
+        &[
+            ("KURU_TEST_UPDATE_NOTICE_ENDPOINT", &endpoint),
+            ("KURU_TEST_UPDATE_NOTICE_CA_PEM", ca),
+            ("NO_PROXY", "localhost,127.0.0.1"),
+        ],
+    )
+}
+
+fn native_notice_cache(sandbox: &Sandbox) -> Result<Value> {
+    let bytes = std::fs::read(sandbox.data.join("update/notice.json"))?;
+    ensure!(bytes.len() <= 4096, "notice cache exceeded its limit");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn finish_native_notice(terminal: &mut Terminal, advice: bool) -> Result<()> {
+    terminal.send(b"/quit\r")?;
+    let report = terminal.finish(EXIT)?;
+    ensure!(report["status"] == 0, "{report}");
+    let output = String::from_utf8_lossy(&terminal.output);
+    ensure!(
+        output.matches("Kuru 999.0.0 is available").count() == usize::from(advice),
+        "unexpected native notice output: {output}"
+    );
+    ensure!(
+        !output.contains("PRIVATE_HOSTILE") && !output.contains("PRIVATE_ERROR_BODY"),
+        "raw release response reached terminal output"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_notice_https_bounds_failure_cache_and_console_restoration() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let sandbox = Sandbox::warmed().await?;
+    let outcome = async {
+        let peer = notice_https::NoticeHttps::start(&sandbox.root).await?;
+        let cache = sandbox.data.join("update/notice.json");
+        for (index, (path, failure)) in [
+            ("/redirect", None),
+            ("/malformed", Some("malformed")),
+            ("/oversize", Some("malformed")),
+            ("/loop", Some("offline")),
+            ("/downgrade", Some("offline")),
+            ("/unavailable", Some("http")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if cache.exists() {
+                std::fs::remove_file(&cache)?;
+            }
+            let before = peer.requests().len();
+            let mut terminal =
+                native_notice_start(&sandbox, &peer, &format!("notice-{index}"), path)?;
+            terminal.resize(30, 80)?;
+            terminal.text(&["enter send"], sandbox.startup)?;
+            terminal.wait("native notice cache published", READY, |_| cache.is_file())?;
+            let stored = native_notice_cache(&sandbox)?;
+            match failure {
+                Some(failure) => ensure!(
+                    stored["outcome"] == "failed"
+                        && stored["failure"] == failure
+                        && stored["latest"].is_null(),
+                    "unexpected failed cache for {path}: {stored}; requests={}; transport={:?}",
+                    peer.requests().len(),
+                    peer.failures()
+                ),
+                None => ensure!(
+                    stored["outcome"] == "newer" && stored["latest"] == "999.0.0",
+                    "unexpected successful cache for {path}: {stored}; requests={}; transport={:?}",
+                    peer.requests().len(),
+                    peer.failures()
+                ),
+            }
+            finish_native_notice(&mut terminal, failure.is_none())?;
+            let after = peer.requests().len();
+            ensure!(after > before && after <= before + 6);
+            if failure.is_none() {
+                ensure!(after == before + 2, "HTTPS redirect was not followed");
+            }
+            // A fresh native process must honor both successful and failed
+            // cache entries without sending another release request.
+            let mut cached =
+                native_notice_start(&sandbox, &peer, &format!("cached-{index}"), path)?;
+            cached.text(&["enter send"], sandbox.startup)?;
+            finish_native_notice(&mut cached, failure.is_none())?;
+            ensure!(peer.requests().len() == after, "native cache was ignored");
+        }
+        for request in peer.requests() {
+            let lower = request.to_ascii_lowercase();
+            ensure!(request.starts_with("GET "));
+            ensure!(lower.contains("user-agent: kuru-update-notice\r\n"));
+            for forbidden in [
+                "authorization:",
+                "cookie:",
+                "x-api-key:",
+                "project",
+                "session",
+                "provider",
+            ] {
+                ensure!(
+                    !lower.contains(forbidden),
+                    "identifying notice request field"
+                );
+            }
+        }
+        peer.close().await;
+        Ok(())
+    }
+    .await;
+    sandbox.release(outcome)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_notice_quit_releases_held_https_response_without_cache() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let sandbox = Sandbox::warmed().await?;
+    let outcome = async {
+        let peer = notice_https::NoticeHttps::start(&sandbox.root).await?;
+        let mut terminal = native_notice_start(&sandbox, &peer, "notice-held", "/held")?;
+        terminal.text(&["enter send"], sandbox.startup)?;
+        tokio::time::timeout(READY, peer.held.notified())
+            .await
+            .with_context(|| {
+                format!(
+                    "held notice request absent; requests={}; transport={:?}",
+                    peer.requests().len(),
+                    peer.failures()
+                )
+            })?;
+        finish_native_notice(&mut terminal, false)?;
+        tokio::time::timeout(READY, peer.disconnected.notified())
+            .await
+            .with_context(|| {
+                format!(
+                    "held notice response remained open; requests={}; transport={:?}",
+                    peer.requests().len(),
+                    peer.failures()
+                )
+            })?;
+        ensure!(!sandbox.data.join("update/notice.json").exists());
+        ensure!(peer.requests().len() == 1);
+        peer.close().await;
+        Ok(())
+    }
+    .await;
+    sandbox.release(outcome)
+}
+
+async fn native_permission_response(
+    axum::Json(request): axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    let speaking = request["instructions"]
+        .as_str()
+        .is_some_and(|text| text.contains("Phase: speak and act"));
+    let continued = request["input"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    });
+    let output = if speaking && !continued {
+        json!([{"type":"function_call","call_id":"native-permission","name":"file_write","arguments":json!({"path":"literal[1].txt","content":"approved"}).to_string()}])
+    } else {
+        json!([{"type":"message","content":[{"type":"output_text","text":"NATIVE_PERMISSION_FINAL"}]}])
+    };
+    let event = json!({"type":"response.completed","response":{"id":"native-permission","status":"completed","output":output,"usage":{"input_tokens":8,"output_tokens":5}}});
+    (
+        [("content-type", "text/event-stream")],
+        format!("data: {event}\n\n"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_permission_choices_preserve_exact_scope_and_revoke_authority() -> Result<()>
+{
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    let _serial = SERIAL.lock().await;
+    for (choice, granted, remembered) in [
+        (b'1', true, false),
+        (b'2', true, true),
+        (b'3', true, true),
+        (b'4', false, false),
+    ] {
+        let sandbox = Sandbox::warmed().await?;
+        let outcome = async {
+            let marker = sandbox.project.join("literal[1].txt");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let config = sandbox.root.join("native-permission.toml");
+            std::fs::write(&config, format!("api_base='http://{}/v1'\napi_key_env='KURU_NATIVE_PERMISSION_KEY'\nmax_rounds=3\n", listener.local_addr()?))?;
+            let app = Router::new()
+                .route("/v1/models", get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }))
+                .route("/v1/responses", post(native_permission_response));
+            let _server = ProviderServer(tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); }));
+            let mut terminal = sandbox.start(
+                "native-permission", "app", &["--model", "fixture", "--mode", "freudian", "--config", config.to_str().context("provider fixture path")?],
+                true, "responses", &[("KURU_NATIVE_PERMISSION_KEY", "fixture")],
+            )?;
+            terminal.resize(30, if choice % 2 == 0 { 80 } else { 120 })?;
+            terminal.frame_text(&["enter send"], sandbox.startup)?;
+            terminal.send(b"Native permission turn")?;
+            terminal.composer("Native permission turn")?;
+            terminal.send(b"\r")?;
+            terminal.frame_text(&["Permission request", "literal[1].txt", "1 once", "esc cancel"], READY)?;
+            ensure!(!marker.exists(), "native effect preceded a permission choice");
+            terminal.send(&[choice])?;
+            terminal.wait("native permission choice settled", READY, |terminal| {
+                !terminal.screen().contains("Permission request") && terminal.screen().contains("NATIVE_PERMISSION_FINAL") && terminal.screen().contains("enter send")
+            })?;
+            terminal.frame_text(&["NATIVE_PERMISSION_FINAL", "enter send"], READY)?;
+            ensure!(marker.exists() == granted, "unexpected native permission effect");
+            if granted { ensure!(std::fs::read(&marker)? == b"approved"); }
+            terminal.send(b"/permissions\r")?;
+            if remembered {
+                terminal.frame_text(&["Selected exact scope", "literal[1].txt"], READY)?;
+                terminal.send(b"\x1b[3~")?;
+            }
+            terminal.frame_text(&["No session or always grants"], READY)?;
+            terminal.send(b"\x1b")?;
+            terminal.wait("native permission inspector closed", READY, |terminal| !terminal.screen().contains("Permissions · ↑↓ select"))?;
+            terminal.frame_text(&["enter send"], READY)?;
+            if granted { std::fs::remove_file(&marker)?; }
+            terminal.send(b"Verify revoked native authority")?;
+            terminal.composer("Verify revoked native authority")?;
+            terminal.send(b"\r")?;
+            terminal.frame_text(&["Permission request", "literal[1].txt"], READY)?;
+            ensure!(!marker.exists(), "revoked native grant still authorized the write");
+            terminal.send(b"4")?;
+            terminal.wait("native repeat denied and settled", READY, |terminal| {
+                !terminal.screen().contains("Permission request") && terminal.screen().contains("enter send")
+            })?;
+            terminal.frame_text(&["enter send"], READY)?;
+            ensure!(!marker.exists());
+            terminal.send(b"/quit\r")?;
+            ensure!(terminal.finish(EXIT)?["status"] == 0);
+            Ok(())
+        }.await;
+        sandbox.release(outcome)?;
+    }
     Ok(())
 }

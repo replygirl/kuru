@@ -816,6 +816,139 @@ async fn normal_headless_dolt_close_reaps_the_supervisor_and_reopens_accepted_sq
 }
 
 #[tokio::test]
+async fn normal_observer_eof_before_configuration_reaps_without_database_or_lease() -> Result<()> {
+    let mut owner = Fixture::new()?;
+    fixture(
+        &mut owner,
+        Path::new(env!("CARGO_BIN_EXE_kuru-memory-parent-fixture")),
+        Lifetime::TrustedSupervisor,
+        "unconfigured",
+    )
+    .await?;
+    let mut output = owner
+        .child
+        .as_mut()
+        .unwrap()
+        .take_stdout()
+        .context("unconfigured creator output missing")?;
+    owner
+        .channel
+        .as_mut()
+        .unwrap()
+        .close(Duration::from_secs(3))
+        .await?;
+    // The creator awaits finish_owner. Its unconfigured supervisor reports
+    // UnexpectedEof, so the creator deliberately exits unsuccessfully too.
+    let status = owner
+        .child
+        .as_mut()
+        .unwrap()
+        .wait(test_budgets::close_budget())
+        .await?;
+    let mut completion = Vec::new();
+    tokio::time::timeout(
+        test_budgets::close_budget(),
+        (&mut output).take(1024).read_to_end(&mut completion),
+    )
+    .await??;
+    output.close(Duration::from_secs(3)).await?;
+    let entries = std::fs::read_dir(owner.path())?.count();
+    // Creator exit and the inherited supervisor-output EOF jointly prove the
+    // two retained processes ended before any assertion releases the root.
+    owner.descendants_stopped = true;
+    assert!(
+        !status.success(),
+        "unconfigured EOF unexpectedly became success: {status}"
+    );
+    assert_eq!(completion, b"SUPERVISOR-EOF\n");
+    assert_eq!(
+        entries, 0,
+        "unconfigured EOF created database or lifecycle state"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn normal_observer_eof_after_partial_readiness_reaps_and_reopens_initialized_sql()
+-> Result<()> {
+    let mut owner = Fixture::new()?;
+    let binary = test_support::warm_runtime_cache().await?;
+    fixture(
+        &mut owner,
+        &binary,
+        Lifetime::TrustedSupervisor,
+        "partial-ready",
+    )
+    .await?;
+    let opts = options(owner.path(), binary);
+    let retained = Directory::open(&opts.directory, Privacy::OwnerOnly, NameRetention::Movable)?;
+    let identity = retained.identity();
+    let mut inspection = opts.clone();
+    inspection.read_only = true;
+    let borrowed = Server::open(inspection).await?;
+    let before = async {
+        let pool = borrowed.pool("main").await?;
+        let result = sqlx::query_scalar::<_, String>("SELECT DOLT_HASHOF('HEAD')")
+            .fetch_one(pool.as_ref())
+            .await;
+        pool.close().await;
+        result.map_err(anyhow::Error::from)
+    }
+    .await;
+    borrowed.close().await?;
+    let before = before?;
+    owner
+        .channel
+        .as_mut()
+        .unwrap()
+        .close(Duration::from_secs(3))
+        .await?;
+    let status = owner
+        .child
+        .as_mut()
+        .unwrap()
+        .wait(test_budgets::close_budget())
+        .await?;
+    let endpoint_retired = !opts.directory.join("endpoint.json").exists();
+    let same_directory =
+        Directory::open(&opts.directory, Privacy::OwnerOnly, NameRetention::Movable)?.identity()
+            == identity;
+    let reopened = Server::open(opts)
+        .await
+        .context("reopen initialized partial-readiness store")?;
+    let read = async {
+        let pool = reopened.pool("main").await?;
+        let result = sqlx::query_scalar::<_, String>("SELECT DOLT_HASHOF('HEAD')")
+            .fetch_one(pool.as_ref())
+            .await;
+        pool.close().await;
+        result.map_err(anyhow::Error::from)
+    }
+    .await;
+    let closed = reopened.close().await;
+    closed.context("reap reopened partial-readiness supervisor")?;
+    owner.descendants_stopped = true;
+    let head = read?;
+    assert!(
+        status.success(),
+        "normal partial-readiness creator EOF failed: {status}"
+    );
+    assert!(
+        endpoint_retired,
+        "partial-readiness supervisor retained its endpoint after reap"
+    );
+    assert!(
+        same_directory,
+        "partial-readiness cleanup replaced its retained database directory"
+    );
+    assert_eq!(
+        head, before,
+        "partial-readiness cleanup or reopen changed the initialized SQL revision"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn actual_engine_adapter_escalates_after_observed_break_and_reaps_locked_descendant()
 -> Result<()> {
     let mut owner = Fixture::new()?;

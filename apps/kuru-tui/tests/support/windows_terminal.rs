@@ -32,8 +32,18 @@ pub fn composer_frame_ready(screen: &vt100::Screen, draft: &str) -> bool {
         .rows(0, screen.size().1)
         .enumerate()
         .any(|(row, line)| {
-            line.find(draft).is_some_and(|byte| {
-                let col: usize = line[..byte + draft.len()]
+            let end = if draft.is_empty() {
+                [
+                    "What shall we explore or build?",
+                    "Keep your next thought here…",
+                ]
+                .into_iter()
+                .find_map(|placeholder| line.find(placeholder))
+            } else {
+                line.find(draft).map(|byte| byte + draft.len())
+            };
+            end.is_some_and(|end| {
+                let col: usize = line[..end]
                     .chars()
                     .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
                     .sum();
@@ -356,6 +366,17 @@ impl Terminal {
         )
     }
 
+    pub fn frame_text(&mut self, values: &[&str], timeout: Duration) -> Result<()> {
+        self.wait(
+            &format!("completed visible frame contains {values:?}"),
+            timeout,
+            |terminal| {
+                composer_frame_ready(terminal.parser.screen(), "")
+                    && values.iter().all(|value| terminal.screen().contains(value))
+            },
+        )
+    }
+
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
         let mut writer = self
             .console
@@ -369,20 +390,97 @@ impl Terminal {
         Ok(())
     }
 
+    // ConPTY hosts receive this documented request before native keyboard
+    // records. Inspect accumulated output so a split read cannot hide it.
+    fn committed_input_ready(&mut self) -> Result<()> {
+        const REQUEST: &[u8] = b"\x1b[?9001h";
+        if !self
+            .output
+            .windows(REQUEST.len())
+            .any(|part| part == REQUEST)
+        {
+            self.wait("ConPTY requests win32-input-mode", READY, |terminal| {
+                terminal
+                    .output
+                    .windows(REQUEST.len())
+                    .any(|part| part == REQUEST)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Fixture-host committed BMP keys, using Microsoft's Win32-input-mode
+    /// protocol. This deliberately leaves raw-text/paste scenarios on send().
+    pub fn committed_text(&mut self, text: &str) -> Result<()> {
+        ensure!(
+            text.chars().all(|ch| ch.len_utf16() == 1),
+            "committed-key fixture supports BMP text only"
+        );
+        self.committed_input_ready()?;
+        let mut bytes = Vec::new();
+        for character in text.encode_utf16() {
+            bytes.extend(Self::committed_record(0, character, 0));
+        }
+        self.send(&bytes)
+    }
+
+    pub fn committed_key(
+        &mut self,
+        key: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Result<()> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Vk/Uc/Cs correspond to KEY_EVENT_RECORD; scan=0, repeat=1. Native
+        // Backspace is VK_BACK/U+0008, not VK_DELETE despite legacy byte 127.
+        let (virtual_key, character, controls) = match (key, modifiers) {
+            (KeyCode::Enter, KeyModifiers::NONE) => (13, 13, 0),
+            (KeyCode::Esc, KeyModifiers::NONE) => (27, 27, 0),
+            (KeyCode::Backspace, KeyModifiers::NONE) => (8, 8, 0),
+            (KeyCode::Up, KeyModifiers::NONE) => (38, 0, 0),
+            (KeyCode::Down, KeyModifiers::NONE) => (40, 0, 0),
+            (KeyCode::Left, KeyModifiers::NONE) => (37, 0, 0),
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => (82, 18, 8),
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => (69, 5, 8),
+            _ => bail!("unsupported committed fixture key {key:?}/{modifiers:?}"),
+        };
+        self.committed_input_ready()?;
+        self.send(&Self::committed_record(virtual_key, character, controls))
+    }
+
+    fn committed_record(virtual_key: u16, character: u16, controls: u32) -> Vec<u8> {
+        // CSI Vk;Sc;Uc;Kd;Cs;Rc_: preserve both down/up records so production
+        // crossterm and Kuru release filtering are exercised unchanged.
+        format!(
+            "\x1b[{virtual_key};0;{character};1;{controls};1_\x1b[{virtual_key};0;{character};0;{controls};1_"
+        ).into_bytes()
+    }
+
     pub fn focus(&mut self, focused: bool) -> Result<()> {
+        let reply = self.control(serde_json::json!({"focus":focused}), READY)?;
+        ensure!(
+            reply["focus"] == focused,
+            "native focus receipt differs: {reply}"
+        );
+        Ok(())
+    }
+
+    fn control(
+        &mut self,
+        command: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
         let path = self
             .directory
             .join(format!("control-{}.json", self.sequence));
         let temporary = path.with_extension("pending");
-        std::fs::write(
-            &temporary,
-            serde_json::to_vec(&serde_json::json!({"focus":focused}))?,
-        )?;
+        std::fs::write(&temporary, serde_json::to_vec(&command)?)?;
         std::fs::rename(temporary, path)?;
         let ack = self.directory.join(format!("ack-{}.json", self.sequence));
-        self.wait("native focus record acknowledged", READY, |_| ack.is_file())?;
+        self.wait("native console control acknowledged", timeout, |_| {
+            ack.is_file()
+        })?;
         self.sequence += 1;
-        Ok(())
+        Ok(serde_json::from_slice(&std::fs::read(ack)?)?)
     }
 
     pub fn composer(&mut self, draft: &str) -> Result<()> {
@@ -398,6 +496,57 @@ impl Terminal {
                 self.parser.screen().hide_cursor()
             )
         })
+    }
+
+    /// Bind the short draft to its actual native console caret. ConPTY's VT
+    /// projection can lose a space/cursor advance after a combining glyph;
+    /// it is not authority for canonical text or native cursor coordinates.
+    pub fn composer_projection(&mut self, canonical: &str, anchor: &str) -> Result<()> {
+        let target = |terminal: &Self| {
+            let screen = terminal.parser.screen();
+            if screen.hide_cursor() {
+                return None;
+            }
+            screen
+                .rows(0, screen.size().1)
+                .enumerate()
+                .find_map(|(row, line)| {
+                    let start = line.find(anchor)?;
+                    if !line[..start].trim_end().ends_with('›') {
+                        return None;
+                    }
+                    let column = unicode_width::UnicodeWidthStr::width(&line[..start])
+                        + unicode_width::UnicodeWidthStr::width(canonical);
+                    Some((column as u16, row as u16))
+                })
+        };
+        let deadline = Instant::now() + READY;
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .context("canonical native composer cursor did not settle within READY")
+        };
+        let mut native = None;
+        let outcome = (|| -> Result<()> {
+            loop {
+                self.wait("visible native composer anchor", remaining()?, |terminal| {
+                    target(terminal).is_some()
+                })?;
+                let reply = self.control(serde_json::json!({"cursor":true}), remaining()?)?;
+                let [column, row]: [u16; 2] = serde_json::from_value(reply["cursor"].clone())
+                    .context("native console cursor receipt absent")?;
+                native = Some((column, row));
+                if native == target(self) {
+                    return Ok(());
+                }
+            }
+        })();
+        outcome.with_context(|| format!(
+            "canonical width={}, target={:?}, native={native:?}, projected cursor={:?}, hidden={}, last 2048 output bytes={:?}",
+            unicode_width::UnicodeWidthStr::width(canonical), target(self),
+            self.parser.screen().cursor_position(), self.parser.screen().hide_cursor(),
+            String::from_utf8_lossy(&self.output[self.output.len().saturating_sub(2048)..])
+        ))
     }
 
     /// Assert the entire observation interval, without first waiting for silence.

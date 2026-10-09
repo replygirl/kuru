@@ -1266,7 +1266,17 @@ mod tests {
         assert!(!selector.contains("http"));
         assert!(checked_run_url("https://github.com/replygirl/kuru/actions/runs/42").is_ok());
         assert!(checked_run_url("https://example.invalid/run").is_err());
-        let receipt = Receipt {
+        let receipt = receipt_fixture();
+        let text = serde_json::to_string(&receipt).unwrap();
+        assert!(text.len() < RECEIPT_LIMIT);
+        validate_receipt(text.as_bytes()).unwrap();
+        for forbidden in ["stdout", "stderr", "token", "oauth", "proxy"] {
+            assert!(!text.contains(forbidden));
+        }
+    }
+
+    fn receipt_fixture() -> Receipt {
+        Receipt {
             schema_version: RECEIPT_SCHEMA,
             runner_os: "windows",
             runner_arch: "x86_64",
@@ -1307,12 +1317,6 @@ mod tests {
                 }],
             },
             cleanup_confirmed: true,
-        };
-        let text = serde_json::to_string(&receipt).unwrap();
-        assert!(text.len() < RECEIPT_LIMIT);
-        validate_receipt(text.as_bytes()).unwrap();
-        for forbidden in ["stdout", "stderr", "token", "oauth", "proxy"] {
-            assert!(!text.contains(forbidden));
         }
     }
 
@@ -1323,6 +1327,57 @@ mod tests {
         image[0x80..0x84].copy_from_slice(b"PE\0\0");
         image[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
         image
+    }
+
+    #[test]
+    fn isolated_verification_settles_only_after_confirmed_cleanup() {
+        for verified in [true, false] {
+            for cleaned in [true, false] {
+                let temporary = tempfile::tempdir().unwrap();
+                let root = temporary.path().to_owned();
+                fs::write(root.join("sentinel"), b"private isolated evidence").unwrap();
+                let mut receipt = receipt_fixture();
+                receipt.cleanup_confirmed = false;
+                let result = finish_isolated_verification(
+                    temporary,
+                    if verified {
+                        Ok(receipt)
+                    } else {
+                        Err(anyhow::anyhow!("verification failed"))
+                    },
+                    if cleaned {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("native cleanup unresolved"))
+                    },
+                );
+                match (verified, cleaned) {
+                    (true, true) => {
+                        assert!(result.unwrap().cleanup_confirmed);
+                        assert!(!root.exists());
+                    }
+                    (false, true) => {
+                        assert_eq!(result.unwrap_err().to_string(), "verification failed");
+                        assert!(!root.exists());
+                    }
+                    (_, false) => {
+                        let error = format!("{:#}", result.unwrap_err());
+                        assert!(error.contains("native cleanup unresolved"), "{error}");
+                        assert!(error.contains("root retained"), "{error}");
+                        if !verified {
+                            assert!(error.contains("verification failed"), "{error}");
+                        }
+                        assert_eq!(
+                            fs::read(root.join("sentinel")).unwrap(),
+                            b"private isolated evidence"
+                        );
+                        // The test has now inspected the intentionally retained
+                        // root; no live process or memory owner was created.
+                        fs::remove_dir_all(root).unwrap();
+                    }
+                }
+            }
+        }
     }
 
     fn receipt_identity(target: &str, machine: &str) -> Vec<u8> {
@@ -1571,25 +1626,51 @@ mod tests {
     #[tokio::test]
     async fn published_command_names_failed_phase_and_refuses_substituted_cleanup_root() {
         let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().to_owned();
         let missing = temporary.path().join("missing-mise.exe");
         let mut install = MiseInstall::new(temporary.path(), &missing).unwrap();
-        let error = install
-            .output("demo-conversation", &[])
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("native mise demo-conversation command did not settle"),
-            "{error}"
-        );
+        let primary = install
+            .kuru(
+                "demo-conversation",
+                &["run".into(), "isolated prompt".into()],
+            )
+            .await;
+        let memory_attempted = install.memory_attempted;
+        let cleanup = install.retire_memory().await;
+        let commands_empty = install.commands.is_empty();
+        let cold = !install.data.exists() && !install.engine_cache.exists();
 
         let foreign = tempfile::tempdir().unwrap();
         let marker = foreign.path().join("untouched");
         fs::write(&marker, b"foreign").unwrap();
-        install.memory_attempted = true;
         install.data = foreign.path().to_owned();
-        let error = install.retire_memory().await.unwrap_err().to_string();
-        assert!(error.contains("changed its isolated project or data root"));
+        let substituted = install.retire_memory().await;
+        drop(install);
+        let verified =
+            primary.and_then(|_| Err(anyhow::anyhow!("missing executable unexpectedly ran")));
+        let result = finish_isolated_verification(temporary, verified, cleanup);
+        let retained = root.is_dir();
+        // No command started or created memory. Retire the retained TempDir
+        // only after the actual cleanup failure has been captured.
+        fs::remove_dir_all(&root).unwrap();
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(memory_attempted && commands_empty && cold);
+        assert!(retained, "failed cleanup must retain its isolated root");
+        assert!(
+            error.contains("native mise demo-conversation command did not settle"),
+            "{error}"
+        );
+        assert!(
+            error.contains("native mise memory-cleanup command did not settle"),
+            "{error}"
+        );
+        assert!(error.contains("root retained"), "{error}");
+        assert!(
+            substituted
+                .unwrap_err()
+                .to_string()
+                .contains("changed its isolated project or data root")
+        );
         assert_eq!(fs::read(marker).unwrap(), b"foreign");
     }
 
@@ -1695,6 +1776,20 @@ mod tests {
                 release.as_os_str().to_owned(),
             ),
         ]);
+        let profile = std::env::var_os("LLVM_PROFILE_FILE");
+        if let Some(value) = &profile {
+            install
+                .environment
+                .push(("LLVM_PROFILE_FILE".into(), value.clone()));
+        }
+        assert_eq!(
+            install
+                .environment
+                .iter()
+                .find_map(|(name, value)| (name == "LLVM_PROFILE_FILE").then_some(value)),
+            profile.as_ref(),
+            "the existing native child must retain the runner's exact profile destination"
+        );
         let output = install
             .output(
                 "independent-service-regression",

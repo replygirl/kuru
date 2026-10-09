@@ -7,7 +7,7 @@
 //! file matches its receipt digest; every runner ledger proves its plan; and
 //! each executable's plans are disjoint and complete against its listed
 //! tests. Only then does an instrumented merge union each instantiation's
-//! covered lines across the partitions' line exports and enforce the OS's 90%
+//! covered lines across the partitions' line exports and enforce the OS's 95%
 //! gate on cargo-llvm-cov's own line metric, reproduced exactly (see
 //! [`lines`]). The union of their LCOV becomes the merged report, and its
 //! unique-line figure is printed for information only. Any failure leaves no
@@ -954,7 +954,7 @@ mod tests {
                 covered: 19
             }
         );
-        assert_eq!(coverage.gate_percent, 90);
+        assert_eq!(coverage.gate_percent, 95);
         assert_eq!(coverage.instantiations, 1);
         assert_eq!(
             coverage.files,
@@ -1249,23 +1249,23 @@ mod tests {
         low.replace_lcov(2, &hits);
         low.merge().unwrap();
         let mut lines = low.lines(1);
-        lines.instantiations[0].covered = LineSet::from_sorted((1..=17).collect());
+        lines.instantiations[0].covered = LineSet::from_sorted((1..=18).collect());
         let low = Downloaded::new(Mode::Instrumented, 2).await;
         low.replace_lines(1, &lines);
         low.replace_lines(2, &lines);
-        low.refuse("line coverage 85.00% (17 of 20 lines by cargo-llvm-cov's metric) is below 90%");
-        // Exactly 90% passes, as cargo-llvm-cov's --fail-under-lines 90 does.
+        low.refuse("line coverage 90.00% (18 of 20 lines by cargo-llvm-cov's metric) is below 95%");
+        // Exactly 95% passes, as cargo-llvm-cov's --fail-under-lines 95 does.
         let exact = Downloaded::new(Mode::Instrumented, 2).await;
-        lines.instantiations[0].covered = LineSet::from_sorted((1..=18).collect());
+        lines.instantiations[0].covered = LineSet::from_sorted((1..=19).collect());
         exact.replace_lines(1, &lines);
-        lines.instantiations[0].covered = LineSet::from_sorted(vec![18]);
+        lines.instantiations[0].covered = LineSet::from_sorted(vec![19]);
         exact.replace_lines(2, &lines);
         let coverage = exact.merge().unwrap().coverage.unwrap();
         assert_eq!(
             coverage.lines,
             Lines {
                 count: 20,
-                covered: 18
+                covered: 19
             }
         );
         // Instantiations must share their mapped lines across partitions.

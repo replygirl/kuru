@@ -155,16 +155,39 @@ fn queue_focus(input: &OwnedHandle, focused: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Called only by the native platform fixture, in its own newly allocated
-/// hidden console. It verifies actual restore/Drop and native record contents
+/// Called only by the native platform fixture, through explicit standard
+/// handles inherited from its isolated hidden-console owner. It verifies
+/// actual restore/Drop and native record contents
 /// without requiring the CI host itself to have terminal standard handles.
 #[cfg(feature = "test-support")]
 pub fn verify_private_console_fixture() -> io::Result<()> {
     use std::fs::OpenOptions;
-    use windows_sys::Win32::System::Console::{
-        ENABLE_INSERT_MODE, ENABLE_WRAP_AT_EOL_OUTPUT, FOCUS_EVENT, FlushConsoleInputBuffer,
-        INPUT_RECORD, PeekConsoleInputW,
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        System::Console::{
+            ENABLE_INSERT_MODE, ENABLE_WRAP_AT_EOL_OUTPUT, FOCUS_EVENT, FlushConsoleInputBuffer,
+            GetStdHandle, INPUT_RECORD, PeekConsoleInputW, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE, SetStdHandle,
+        },
     };
+    // Standard slots are borrowed process-owned handles. Retain a private
+    // duplicate while changing each slot, and restore its exact original value
+    // even if an observation unwinds. Only this isolated fixture mutates them.
+    struct RestoreStandardHandle {
+        channel: u32,
+        original: HANDLE,
+        _retained: OwnedHandle,
+        restore_on_drop: bool,
+    }
+    impl Drop for RestoreStandardHandle {
+        fn drop(&mut self) {
+            if self.restore_on_drop {
+                // SAFETY: the original process-owned handle was never closed;
+                // its private duplicate also retains the same console object.
+                let _ = unsafe { SetStdHandle(self.channel, self.original) };
+            }
+        }
+    }
     let input: OwnedHandle = OpenOptions::new()
         .read(true)
         .write(true)
@@ -175,29 +198,98 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
         .write(true)
         .open("CONOUT$")?
         .into();
-    let mut guard = ConsoleModeGuard::from_handles(input.try_clone()?, output.try_clone()?)?;
+    let baseline = configure_test_baseline()?;
+    let vt_before = [
+        StandardStream::Input,
+        StandardStream::Output,
+        StandardStream::Error,
+    ]
+    .map(virtual_terminal_output_enabled);
+    let mut guard = ConsoleModeGuard::capture()?;
     let before = guard.original();
     guard.enable_virtual_terminal_output()?;
+    let vt_enabled = [
+        StandardStream::Input,
+        StandardStream::Output,
+        StandardStream::Error,
+    ]
+    .map(virtual_terminal_output_enabled);
+    let mut absent_streams = Vec::new();
+    for (index, channel) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .enumerate()
+    {
+        let selected = || match channel {
+            STD_INPUT_HANDLE => StandardStream::Input,
+            STD_OUTPUT_HANDLE => StandardStream::Output,
+            _ => StandardStream::Error,
+        };
+        let retained = stream(selected())?;
+        // SAFETY: the slot belongs to this process and has no concurrent users.
+        let original = unsafe { GetStdHandle(channel) };
+        let mut restoration = RestoreStandardHandle {
+            channel,
+            original,
+            _retained: retained,
+            restore_on_drop: true,
+        };
+        // SAFETY: NULL is a real absent standard stream; it does not close the
+        // original handle or construct an invalid owned handle.
+        if unsafe { SetStdHandle(channel, std::ptr::null_mut()) } == 0 {
+            let error = io::Error::last_os_error();
+            drop(restoration);
+            return Err(error);
+        }
+        // Capture every result without propagating errors, asserting, or
+        // printing while a standard stream is absent.
+        let stdio = inherited_stdio(selected());
+        let console = stream(selected());
+        let capture = ConsoleModeGuard::capture();
+        let vt_absent = virtual_terminal_output_enabled(selected());
+        // SAFETY: the unchanged original handle and its duplicate remain live.
+        let restored_slot = unsafe { SetStdHandle(channel, original) };
+        let restored_slot = if restored_slot == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            restoration.restore_on_drop = false;
+            Ok(())
+        };
+        drop(restoration);
+        restored_slot?;
+        // A missing stderr does not prevent input/output capture. Restore and
+        // drop that successful temporary guard before the original mode guard.
+        let capture = match capture {
+            Ok(mut captured) => captured.restore(),
+            Err(error) => Err(error),
+        };
+        let vt_restored = virtual_terminal_output_enabled(selected());
+        absent_streams.push((
+            index,
+            stdio,
+            console.map(drop),
+            capture,
+            vt_absent,
+            vt_restored,
+        ));
+    }
     set(&input, before.input ^ ENABLE_INSERT_MODE)?;
     set(&output, before.output ^ ENABLE_WRAP_AT_EOL_OUTPUT)?;
-    if guard.current()? == before {
-        return Err(io::Error::other("fixture modes did not change"));
-    }
+    let changed = guard.current()?;
     guard.restore()?;
-    if guard.current()? != before {
-        return Err(io::Error::other("explicit console restore differs"));
-    }
+    let restored = guard.current()?;
     set(&input, before.input ^ ENABLE_INSERT_MODE)?;
+    guard.enable_virtual_terminal_output()?;
     drop(guard);
-    if mode(&input)? != before.input {
-        return Err(io::Error::other("Drop failed to restore console input"));
-    }
+    let after_drop = ConsoleModes {
+        input: mode(&input)?,
+        output: mode(&output)?,
+    };
     // SAFETY: this fixture owns its console input and has no concurrent reader.
     if unsafe { FlushConsoleInputBuffer(input.as_raw_handle()) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    queue_focus(&input, false)?;
-    queue_focus(&input, true)?;
+    inject_focus(false)?;
+    inject_focus(true)?;
     let mut records = [INPUT_RECORD::default(); 2];
     let mut count = 0;
     // SAFETY: two initialized writable records and count are retained; Peek is
@@ -206,19 +298,48 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    if count != 2
-        || records
-            .iter()
-            .any(|record| record.EventType != FOCUS_EVENT as u16)
-    {
-        return Err(io::Error::other("native focus records are missing"));
+    // All observations are asserted after native mode restoration. Keep true
+    // native API failures above; a fixture mismatch is an assertion with its
+    // exact observed values, not a synthetic filesystem-style error.
+    assert_eq!(vt_before, [false; 3], "baseline VT admission");
+    assert_eq!(before, baseline, "captured console modes");
+    assert_eq!(vt_enabled, [false, true, true], "enabled VT admission");
+    for (index, stdio, console, capture, vt_absent, vt_restored) in absent_streams {
+        assert!(matches!(stdio, Ok(Stdio::Null)), "absent stdio {index}");
+        let error = console.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(error.to_string(), "standard console handle is unavailable");
+        if index == 2 {
+            capture.unwrap();
+        } else {
+            let error = capture.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+            assert_eq!(error.to_string(), "standard console handle is unavailable");
+        }
+        assert!(!vt_absent, "absent VT admission {index}");
+        assert_eq!(
+            vt_restored, vt_enabled[index],
+            "restored VT admission {index}"
+        );
     }
-    // SAFETY: the preceding event tags establish both active union variants.
-    if unsafe {
-        records[0].Event.FocusEvent.bSetFocus != 0 || records[1].Event.FocusEvent.bSetFocus != 1
-    } {
-        return Err(io::Error::other("native focus state changed"));
-    }
+    assert_ne!(changed, before, "console modes did not change");
+    assert_eq!(restored, before, "explicit console restoration");
+    assert_eq!(after_drop, before, "Drop console restoration");
+    assert_eq!(count, 2, "native focus record count");
+    assert_eq!(
+        [records[0].EventType, records[1].EventType],
+        [FOCUS_EVENT as u16; 2],
+        "native focus record tags"
+    );
+    // SAFETY: the preceding exact count/tag assertions establish both active
+    // union variants before either FocusEvent is read.
+    let focus = unsafe {
+        [
+            records[0].Event.FocusEvent.bSetFocus,
+            records[1].Event.FocusEvent.bSetFocus,
+        ]
+    };
+    assert_eq!(focus, [0, 1], "native focus states");
     Ok(())
 }
 
@@ -226,19 +347,25 @@ pub fn verify_private_console_fixture() -> io::Result<()> {
 /// distinguish exact restoration from crossterm's hard-coded default bits.
 #[cfg(feature = "test-support")]
 pub fn configure_test_baseline() -> io::Result<ConsoleModes> {
+    configure_baseline(
+        &stream(StandardStream::Input)?,
+        &stream(StandardStream::Output)?,
+    )
+}
+
+#[cfg(feature = "test-support")]
+fn configure_baseline(input: &OwnedHandle, output: &OwnedHandle) -> io::Result<ConsoleModes> {
     use windows_sys::Win32::System::Console::{
         ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_LINE_INPUT,
         ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     };
-    let input = stream(StandardStream::Input)?;
-    let output = stream(StandardStream::Output)?;
     let input_mode =
-        (mode(&input)? | ENABLE_EXTENDED_FLAGS | ENABLE_LINE_INPUT | ENABLE_INSERT_MODE)
+        (mode(input)? | ENABLE_EXTENDED_FLAGS | ENABLE_LINE_INPUT | ENABLE_INSERT_MODE)
             & !(ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE);
     let output_mode =
-        (mode(&output)? | ENABLE_PROCESSED_OUTPUT) & !ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    set(&input, input_mode)?;
-    set(&output, output_mode)?;
+        (mode(output)? | ENABLE_PROCESSED_OUTPUT) & !ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    set(input, input_mode)?;
+    set(output, output_mode)?;
     Ok(ConsoleModes {
         input: input_mode,
         output: output_mode,

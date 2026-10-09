@@ -2841,3 +2841,80 @@ async fn a2a_server_enforces_auth_validates_protocol_and_returns_peer_output() {
     })
     .await
 }
+
+#[tokio::test]
+async fn a2a_parser_refuses_malformed_calls_before_memory_or_provider_effects() {
+    kuru_memory::test_support::closing(async {
+        let provider = Fake::new(|_| answer("must not dispatch"));
+        let (_project, harness) = fixture(Mode::Freudian, provider.clone()).await;
+        let memory = harness.memory.clone();
+        let before = memory.revision().await.unwrap();
+        let shared = Arc::new(tokio::sync::Mutex::new(harness));
+        let app = crate::server::router(shared.clone(), "http://localhost/", "test-token-123456").unwrap();
+        let valid = json!({"jsonrpc":"2.0","id":"request","method":"SendMessage","params":{"message":{"messageId":"parser-only","role":"ROLE_USER","parts":[{"text":"hello"}]}}});
+        for (pointer, replacement, code) in [
+            ("/jsonrpc", json!("1.0"), -32600),
+            ("/id", json!(null), -32600),
+            ("/id", json!({}), -32600),
+            ("/id", json!(false), -32600),
+            ("/params/message/role", json!("ROLE_SYSTEM"), -32602),
+            ("/params/message/messageId", json!(""), -32602),
+            ("/params/message/parts", json!([]), -32602),
+            ("/params/message/parts", json!([{"data":{"text":"hidden"}}]), -32602),
+            ("/params/message/parts", json!([{"text":"valid"},{"text":42}]), -32602),
+            ("/params/message/parts", json!([{"text":" \n\t"}]), -32602),
+        ] {
+            let mut malformed = valid.clone();
+            *malformed.pointer_mut(pointer).unwrap() = replacement;
+            let (status, reply) = rpc(app.clone(), malformed, "Bearer test-token-123456", "1.0").await;
+            assert_eq!(status, 200);
+            assert_eq!(reply["error"]["code"], code, "{pointer}: {reply}");
+        }
+        for (field, value, code) in [("taskId", json!("unsupported-task"), -32001), ("contextId", json!("x".repeat(257)), -32602)] {
+            let mut malformed = valid.clone();
+            malformed["params"]["message"][field] = value;
+            assert_eq!(rpc(app.clone(), malformed, "Bearer test-token-123456", "1.0").await.1["error"]["code"], code);
+        }
+        let mut push = valid.clone();
+        push["params"]["configuration"] = json!({"pushNotificationConfig":{}});
+        assert_eq!(rpc(app, push, "Bearer test-token-123456", "1.0").await.1["error"]["code"], -32003);
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert_eq!(memory.revision().await.unwrap(), before);
+        let mut harness = shared.lock().await;
+        assert!(harness.history().await.unwrap().is_empty());
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }).await
+}
+
+#[tokio::test]
+async fn a2a_peer_routes_publish_exact_card_and_address_selected_peer() {
+    kuru_memory::test_support::closing(async {
+        let provider = Fake::new(|_| answer("targeted peer answer"));
+        let (_project, harness) = fixture(Mode::Freudian, provider.clone()).await;
+        let target = harness.topology.parts[1].id.clone();
+        let target_namespace = harness.namespace(&target);
+        let memory = harness.memory.clone();
+        let shared = Arc::new(tokio::sync::Mutex::new(harness));
+        let app = crate::server::router(shared.clone(), "http://localhost/", "test-token-123456").unwrap();
+        let card = app.clone().oneshot(Request::builder().uri(format!("/agents/{target}/.well-known/agent-card.json")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(card.status(), 200);
+        let card: Value = serde_json::from_slice(&to_bytes(card.into_body(), 10000).await.unwrap()).unwrap();
+        assert_eq!(card["name"], target);
+        assert_eq!(card["supportedInterfaces"][0]["url"], format!("http://localhost/agents/{target}"));
+        let missing = app.clone().oneshot(Request::builder().uri("/agents/missing-peer/.well-known/agent-card.json").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(missing.status(), 404);
+        let message = json!({"jsonrpc":"2.0","id":2,"method":"SendMessage","params":{"message":{"messageId":"targeted-message","role":"ROLE_AGENT","parts":[{"text":"first part"},{"text":"second part"}]}}});
+        let reply = app.oneshot(Request::builder().method("POST").uri(format!("/agents/{target}")).header("content-type","application/json").header("authorization","Bearer test-token-123456").body(Body::from(message.to_string())).unwrap()).await.unwrap();
+        assert_eq!(reply.status(), 200);
+        let reply: Value = serde_json::from_slice(&to_bytes(reply.into_body(), 10000).await.unwrap()).unwrap();
+        assert_eq!(reply["result"]["message"]["metadata"]["speaker"], target);
+        assert_eq!(reply["result"]["message"]["parts"][0]["text"], "targeted peer answer");
+        assert!(uuid::Uuid::parse_str(reply["result"]["message"]["contextId"].as_str().unwrap()).is_ok());
+        assert!(provider.requests.lock().unwrap().iter().any(|request| request.actor == target_namespace && request.instructions.contains("Phase: speak")));
+        let mut harness = shared.lock().await;
+        assert!(harness.history().await.unwrap().iter().any(|message| message.plain_text() == Some("first part\nsecond part")));
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }).await
+}

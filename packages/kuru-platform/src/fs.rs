@@ -1044,6 +1044,12 @@ mod tests {
             .unwrap();
         assert!(verify_file_access(&source, &token).is_err());
         assert_eq!(
+            verify_retained_file_access(&source, &token)
+                .unwrap_err()
+                .to_string(),
+            "file access policy changed during publication"
+        );
+        assert_eq!(
             std::fs::metadata(stage.path())
                 .unwrap()
                 .permissions()
@@ -1494,5 +1500,441 @@ mod tests {
         );
         assert!(error.to_string().contains("controlled completion failure"));
         assert!(std::error::Error::source(&error).is_some());
+    }
+}
+
+#[cfg(test)]
+mod refusal_contracts {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn retained_access_checks_reject_another_identity_and_new_aliases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut source = directory.create_new(OsStr::new("source")).unwrap();
+        source.write_all(b"policy source").unwrap();
+        let stage = directory.create_new(OsStr::new("stage")).unwrap();
+        let other = directory.create_new(OsStr::new("other")).unwrap();
+        let token = copy_file_access(&source, &stage).unwrap();
+        let error = verify_retained_file_access(&other, &token).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("source identity changed"));
+        std::fs::hard_link(
+            directory.path().join("source"),
+            directory.path().join("alias"),
+        )
+        .unwrap();
+        let error = verify_retained_file_access(&source, &token).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("another hardlink"));
+        assert_eq!(
+            std::fs::read(directory.path().join("alias")).unwrap(),
+            b"policy source"
+        );
+        assert_eq!(checked_file(&stage).unwrap().links, 1);
+        assert_eq!(
+            retained_file_info(&directory.anchor().file)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn access_finalization_keeps_the_exact_published_file_and_source_policy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut source = directory.create_new(OsStr::new("source")).unwrap();
+        source.write_all(b"source remains").unwrap();
+        let mut staged = directory.create_new(OsStr::new("stage")).unwrap();
+        staged.write_all(b"published bytes").unwrap();
+        let access = copy_file_access(&source, &staged).unwrap();
+        let identity = checked_file(&staged).unwrap().identity;
+        directory
+            .publish_file_with_access(
+                &directory,
+                OsStr::new("stage"),
+                &staged,
+                &access,
+                OsStr::new("published"),
+                Publication::New,
+            )
+            .unwrap();
+        finalize_file_access(&source, &staged).unwrap();
+        verify_retained_file_access(&source, &access).unwrap();
+        assert_eq!(
+            checked_file(&directory.read(OsStr::new("published")).unwrap())
+                .unwrap()
+                .identity,
+            identity
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("source")).unwrap(),
+            b"source remains"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("published")).unwrap(),
+            b"published bytes"
+        );
+    }
+
+    #[test]
+    fn removal_completion_refuses_a_directory_occupant_without_deleting_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let name = OsStr::new("retired");
+        let file = directory.create_new(name).unwrap();
+        let error = directory
+            .remove_file_then(name, file, || {
+                let occupant = directory.create_private_directory(name)?;
+                occupant
+                    .create_new(OsStr::new("sentinel"))?
+                    .write_all(b"new occupant")
+            })
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!is_name_replaced(&error.error));
+        assert_eq!(
+            std::fs::read(directory.path().join("retired/sentinel")).unwrap(),
+            b"new occupant"
+        );
+    }
+
+    #[test]
+    fn removal_completion_refuses_a_substituted_retained_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let original = directory.path().to_path_buf();
+        let moved = original.with_file_name("moved-private");
+        let file = directory.create_new(OsStr::new("retired")).unwrap();
+        let error = directory
+            .remove_file_then(OsStr::new("retired"), file, || {
+                std::fs::rename(&original, &moved)?;
+                let replacement = Directory::ensure_private(&original)?;
+                replacement
+                    .create_new(OsStr::new("retired"))?
+                    .write_all(b"replacement sentinel")
+            })
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!moved.join("retired").exists());
+        assert_eq!(
+            std::fs::read(original.join("retired")).unwrap(),
+            b"replacement sentinel"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_inventory_and_replacement_authority_refuse_unknown_or_rebound_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        directory.require_known_entries(&[]).unwrap();
+        let mut file = directory.create_new(OsStr::new("record")).unwrap();
+        file.write_all(b"exact retained inventory").unwrap();
+        directory
+            .require_known_entries(&[OsStr::new("record")])
+            .unwrap();
+        directory
+            .require_owned_replacement(OsStr::new("record"), &file)
+            .unwrap();
+        directory.sync().unwrap();
+        let error = directory.require_known_entries(&[]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "unknown retained directory evidence");
+        let displaced = directory.path().with_file_name("displaced");
+        std::fs::rename(directory.path(), &displaced).unwrap();
+        let replacement = Directory::ensure_private(directory.path()).unwrap();
+        replacement
+            .create_new(OsStr::new("record"))
+            .unwrap()
+            .write_all(b"replacement")
+            .unwrap();
+        for error in [
+            directory
+                .require_known_entries(&[OsStr::new("record")])
+                .unwrap_err(),
+            directory
+                .require_owned_replacement(OsStr::new("record"), &file)
+                .unwrap_err(),
+            directory.sync().unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        assert_eq!(
+            std::fs::read(displaced.join("record")).unwrap(),
+            b"exact retained inventory"
+        );
+        assert_eq!(
+            std::fs::read(replacement.path().join("record")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_removal_reconciles_a_changed_ancestor_without_selecting_the_new_tree() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("parent")).unwrap();
+        let original = parent.path().to_path_buf();
+        let moved = original.with_file_name("moved-parent");
+        let root = parent.create_private_directory(OsStr::new("root")).unwrap();
+        root.create_new(OsStr::new("record"))
+            .unwrap()
+            .write_all(b"owned removable")
+            .unwrap();
+        drop(parent);
+        let displaced = moved.clone();
+        let replaced = original.clone();
+        let mut first = true;
+        let _seam = enumeration_seam::install(move || {
+            if first {
+                first = false;
+                std::fs::rename(&replaced, &displaced).unwrap();
+                let replacement = Directory::ensure_private(&replaced).unwrap();
+                let root = replacement
+                    .create_private_directory(OsStr::new("root"))
+                    .unwrap();
+                root.create_new(OsStr::new("sentinel"))
+                    .unwrap()
+                    .write_all(b"unrelated new tree")
+                    .unwrap();
+            }
+        });
+        let error = root.remove_tree().unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert_eq!(error.descendant, None);
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!moved.join("root").exists());
+        assert_eq!(
+            std::fs::read(original.join("root/sentinel")).unwrap(),
+            b"unrelated new tree"
+        );
+    }
+}
+
+#[cfg(test)]
+mod publication_failure_contracts {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn completed_move_with_a_new_occupant_retains_uncertain_identity_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut candidate = directory.create_new(OsStr::new("candidate")).unwrap();
+        candidate.write_all(b"owned candidate").unwrap();
+        let identity = checked_file(&candidate).unwrap().identity;
+        let error = directory
+            .transfer_file_then(
+                (&directory, OsStr::new("candidate"), &candidate),
+                OsStr::new("published"),
+                Publication::New,
+                true,
+                None,
+                || {
+                    std::fs::rename(
+                        directory.path().join("published"),
+                        directory.path().join("retained-original"),
+                    )?;
+                    directory
+                        .create_new(OsStr::new("published"))?
+                        .write_all(b"replacement occupant")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert_eq!(error.operation, "identity-verification");
+        assert_eq!(error.source_identity, Some(identity));
+        assert!(is_name_replaced(error.error()));
+        assert_eq!(
+            checked_file(&directory.read(OsStr::new("retained-original")).unwrap())
+                .unwrap()
+                .identity,
+            identity
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("retained-original")).unwrap(),
+            b"owned candidate"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("published")).unwrap(),
+            b"replacement occupant"
+        );
+        assert!(!directory.path().join("candidate").exists());
+    }
+
+    #[test]
+    fn moving_a_directory_never_converts_its_privacy_contract() {
+        for source_private in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+            source
+                .create_new(OsStr::new("sentinel"))
+                .unwrap()
+                .write_all(b"source privacy")
+                .unwrap();
+            let destination =
+                Directory::ensure_private(&temporary.path().join("destination")).unwrap();
+            let source = Directory::open(
+                source.path(),
+                if source_private {
+                    Privacy::OwnerOnly
+                } else {
+                    Privacy::Inherited
+                },
+                NameRetention::Movable,
+            )
+            .unwrap();
+            let destination = Directory::open(
+                destination.path(),
+                if source_private {
+                    Privacy::Inherited
+                } else {
+                    Privacy::OwnerOnly
+                },
+                NameRetention::Movable,
+            )
+            .unwrap();
+            let error = destination
+                .move_new_directory(&source, OsStr::new("moved"))
+                .unwrap_err();
+            assert_eq!(error.phase, PublicationPhase::Rejected);
+            assert_eq!(error.operation, "preflight");
+            assert_eq!(error.error().kind(), io::ErrorKind::InvalidInput);
+            assert!(!destination.path().join("moved").exists());
+            source.revalidate().unwrap();
+            assert_eq!(
+                std::fs::read(source.path().join("sentinel")).unwrap(),
+                b"source privacy"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod volume_failure_contracts {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn cross_volume_publication_refuses_before_any_source_or_destination_effect() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+        let mut payload = source.create_new(OsStr::new("payload")).unwrap();
+        payload.write_all(b"retained cross-volume source").unwrap();
+        let identity = checked_file(&payload).unwrap().identity;
+        // /dev is inspected read-only. Establish the distinct volume before
+        // invoking publication so neither operation can reach a native move.
+        let destination =
+            Directory::open(Path::new("/dev"), Privacy::Inherited, NameRetention::Pinned).unwrap();
+        assert_ne!(source.identity().volume, destination.identity().volume);
+        let name = format!(
+            "kuru-{}-cross-volume",
+            temporary.path().file_name().unwrap().to_str().unwrap(),
+        );
+        let target = destination.path().join(&name);
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let error = destination
+            .publish_file(
+                &source,
+                OsStr::new("payload"),
+                &payload,
+                OsStr::new(&name),
+                Publication::New,
+            )
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(error.operation, "preflight");
+        assert_eq!(error.error().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.error().to_string(),
+            "publication must stay on the same volume"
+        );
+        assert_eq!(error.source_identity, Some(identity));
+        let movable =
+            Directory::open(source.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        let error = destination
+            .move_new_directory(&movable, OsStr::new(&name))
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(error.operation, "preflight");
+        assert_eq!(error.error().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.error().to_string(),
+            "directory publication must stay on the same volume"
+        );
+        assert_eq!(error.source_identity, Some(movable.identity()));
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        destination.revalidate().unwrap();
+        source.revalidate().unwrap();
+        assert_eq!(
+            checked_file(&source.read(OsStr::new("payload")).unwrap())
+                .unwrap()
+                .identity,
+            identity
+        );
+        assert_eq!(
+            std::fs::read(source.path().join("payload")).unwrap(),
+            b"retained cross-volume source"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_removal_authority_contracts {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn consuming_removal_rejects_a_substituted_private_root_without_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("private");
+        let original = Directory::ensure_private(&path).unwrap();
+        original
+            .create_new(OsStr::new("sentinel"))
+            .unwrap()
+            .write_all(b"original evidence")
+            .unwrap();
+        let identity = original.identity();
+        let retired = temporary.path().join("retired");
+        std::fs::rename(&path, &retired).unwrap();
+        let replacement = Directory::ensure_private(&path).unwrap();
+        replacement
+            .create_new(OsStr::new("sentinel"))
+            .unwrap()
+            .write_all(b"replacement evidence")
+            .unwrap();
+        let replacement_identity = replacement.identity();
+        let result = original.remove_tree();
+        let original_bytes = std::fs::read(retired.join("sentinel")).unwrap();
+        let replacement_bytes = std::fs::read(path.join("sentinel")).unwrap();
+        replacement.revalidate().unwrap();
+        let current_identity = replacement.identity();
+        replacement.remove_tree().unwrap();
+        Directory::open(&retired, Privacy::OwnerOnly, NameRetention::Movable)
+            .unwrap()
+            .remove_tree()
+            .unwrap();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(error.identity, Some(identity));
+        assert_eq!(error.path, path);
+        assert_eq!(error.descendant, None);
+        assert_eq!(error.error.kind(), io::ErrorKind::PermissionDenied);
+        assert_ne!(replacement_identity, identity);
+        assert_eq!(current_identity, replacement_identity);
+        assert_eq!(original_bytes, b"original evidence");
+        assert_eq!(replacement_bytes, b"replacement evidence");
     }
 }

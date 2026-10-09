@@ -11,18 +11,26 @@ Provide documented source installation and verified, atomic release updates.
 
 The repository SHALL use apps/ and packages/, pinned Rust/mise tooling, hk hooks,
 cospec change gates, Cargo.lock, and CI checks for format, lint, tests and at
-least 90% workspace line coverage from meaningful behavioral tests. Native
+least 95% workspace line coverage from meaningful behavioral tests. Native
 Windows x64/MSVC verification SHALL be required by the aggregate CI gate.
 Windows-only behavior MUST be executed and measured on Windows, not inferred
 from Unix checks or compiled-out tests.
+The existing standalone archive and native platform coverage checks SHALL
+also enforce at least 95% by their cargo-llvm-cov line metric. Test additions
+SHALL exercise observable contracts and failure modes; application exclusions,
+metric substitutions and threshold reductions MUST NOT satisfy the minimum.
 
 #### Scenario: Coverage regression
-- **WHEN** measured workspace line coverage is below 90 percent
+- **WHEN** measured workspace line coverage is below 95 percent
 - **THEN** the coverage check fails rather than silently reducing the threshold or excluding application code.
 
 #### Scenario: Native Windows gate fails
 - **WHEN** the Windows job has a failing required test or coverage check
 - **THEN** the aggregate gate fails regardless of successful macOS and Linux jobs.
+
+#### Scenario: Package coverage is below the minimum
+- **WHEN** a standalone archive or native platform coverage check measures less than 95 percent
+- **THEN** that package check fails while its complete application source inventory and existing line metric remain included.
 
 ### Requirement: Source and mise installation
 
@@ -287,9 +295,9 @@ llvm-cov derives line statistics. Before its receipt is written, that export MUS
 cargo-llvm-cov `--summary-only` line figures exactly, per file and in total, and the receipt MUST carry the export's
 digest. For an instrumented OS, the merge MUST refuse a receipt without that digest or an export that differs from
 it. It MUST require identical source files, instantiations, group locations and mapped lines in every partition,
-union each instantiation's covered lines, and enforce at least 90% by cargo-llvm-cov's line metric: per file, the
+union each instantiation's covered lines, and enforce at least 95% by cargo-llvm-cov's line metric: per file, the
 sum over instantiation groups of the most mapped and the most covered lines of any instantiation. This is the
-metric `mise run coverage` holds to `--fail-under-lines 90`. The merge MUST also require identical source-file and
+metric `mise run coverage` holds to `--fail-under-lines 95`. The merge MUST also require identical source-file and
 line sets in every partition's normalized LCOV, union their hit counts and write that OS's merged LCOV, whose
 unique-line figure is informational. No partition percentage may be averaged.
 
@@ -302,7 +310,7 @@ unique-line figure is informational. No partition percentage may be averaged.
 - **THEN** the merge fails without merging any coverage.
 
 #### Scenario: Merged coverage is below the gate
-- **WHEN** the union of an instrumented OS's partitions covers less than 90 percent of its lines by cargo-llvm-cov's line metric
+- **WHEN** the union of an instrumented OS's partitions covers less than 95 percent of its lines by cargo-llvm-cov's line metric
 - **THEN** that OS's merge fails, and no other OS's result can satisfy it.
 
 #### Scenario: A partition's line export does not reproduce its own summary

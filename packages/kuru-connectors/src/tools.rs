@@ -2542,7 +2542,6 @@ mod tests {
     use super::*;
     use crate::shell_diagnostic::{ShellCapture, ShellFailureCategory, failure as shell_failure};
     use crate::test_support::{HttpFixture, Reply, drain_bounded};
-    #[cfg(unix)]
     use crate::test_support::{StdioFixture, Step};
     use kuru_core::{McpConfig, PermissionAction, PermissionRule};
 
@@ -2614,6 +2613,17 @@ mod tests {
 
     struct RecordInstructionDirectories(std::sync::Mutex<Vec<Vec<String>>>);
 
+    impl RecordInstructionDirectories {
+        fn record(&self, targets: &[ProjectRelativeTarget]) {
+            self.0.lock().unwrap().push(
+                targets
+                    .iter()
+                    .map(|target| target.as_str().to_owned())
+                    .collect(),
+            );
+        }
+    }
+
     #[async_trait::async_trait]
     impl InstructionGate for RecordInstructionDirectories {
         async fn review(
@@ -2621,12 +2631,7 @@ mod tests {
             targets: &[ProjectRelativeTarget],
             _approval: Option<&InstructionReviewSender>,
         ) -> Result<InstructionGateOutcome> {
-            self.0.lock().unwrap().push(
-                targets
-                    .iter()
-                    .map(|target| target.as_str().to_owned())
-                    .collect(),
-            );
+            self.record(targets);
             Ok(InstructionGateOutcome::Required(
                 "review before search exposure".into(),
             ))
@@ -3249,6 +3254,39 @@ mod tests {
 
     #[tokio::test]
     async fn actor_search_reviews_only_allowed_candidate_directories_before_exposure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SearchActivation(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl crate::instruction_review::InstructionActivation for SearchActivation {
+            async fn publish(self: Box<Self>) -> Result<String> {
+                assert_eq!(self.0.fetch_add(1, Ordering::SeqCst), 0);
+                Ok("reviewed src instructions".into())
+            }
+        }
+
+        struct SearchReview {
+            directories: RecordInstructionDirectories,
+            outcome: std::sync::Mutex<Option<InstructionGateOutcome>>,
+            link: Option<(PathBuf, PathBuf)>,
+        }
+
+        #[async_trait::async_trait]
+        impl InstructionGate for SearchReview {
+            async fn review(
+                &self,
+                targets: &[ProjectRelativeTarget],
+                _approval: Option<&InstructionReviewSender>,
+            ) -> Result<InstructionGateOutcome> {
+                self.directories.record(targets);
+                if let Some((original, alias)) = &self.link {
+                    std::fs::hard_link(original, alias)?;
+                }
+                Ok(self.outcome.lock().unwrap().take().unwrap())
+            }
+        }
+
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("src")).unwrap();
         std::fs::create_dir(root.path().join("sibling")).unwrap();
@@ -3257,22 +3295,20 @@ mod tests {
         let gate = Arc::new(RecordInstructionDirectories(std::sync::Mutex::new(
             Vec::new(),
         )));
-        let host = ToolHost::new(
-            root.path(),
-            &Config {
-                permissions: [NativeTool::Glob, NativeTool::Grep]
-                    .into_iter()
-                    .map(|tool| PermissionRule {
-                        action: PermissionAction::Deny,
-                        selector: PermissionSelector::native(tool),
-                        path: Some("sibling/denied.txt".into()),
-                    })
-                    .collect(),
-                ..Default::default()
-            },
-        )
-        .unwrap()
-        .with_instruction_gate(gate.clone());
+        let config = Config {
+            permissions: [NativeTool::Glob, NativeTool::Grep]
+                .into_iter()
+                .map(|tool| PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::native(tool),
+                    path: Some("sibling/denied.txt".into()),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let host = ToolHost::new(root.path(), &config)
+            .unwrap()
+            .with_instruction_gate(gate.clone());
         for (name, args) in [
             ("glob", json!({"pattern":"**/*.txt"})),
             ("grep", json!({"pattern":"needle"})),
@@ -3291,6 +3327,121 @@ mod tests {
             *gate.0.lock().unwrap(),
             vec![vec!["src".to_owned()], vec!["src".to_owned()]]
         );
+        host.shutdown().await.unwrap();
+
+        for (review, accepted, denied) in [
+            ("accepted", true, false),
+            ("unchanged", false, false),
+            ("denied", false, true),
+        ] {
+            for (name, args, expected) in [
+                (
+                    "glob",
+                    json!({"pattern":"**/*.txt"}),
+                    json!(["src/allowed.txt"]),
+                ),
+                (
+                    "grep",
+                    json!({"pattern":"needle"}),
+                    json!([{"path":"src/allowed.txt","line":1,"text":"needle"}]),
+                ),
+            ] {
+                let publications = Arc::new(AtomicUsize::new(0));
+                let outcome = if accepted {
+                    InstructionGateOutcome::Proposed(Box::new(SearchActivation(
+                        publications.clone(),
+                    )))
+                } else if denied {
+                    InstructionGateOutcome::Denied
+                } else {
+                    InstructionGateOutcome::Unchanged
+                };
+                let gate = Arc::new(SearchReview {
+                    directories: RecordInstructionDirectories(std::sync::Mutex::new(Vec::new())),
+                    outcome: std::sync::Mutex::new(Some(outcome)),
+                    link: None,
+                });
+                let host = ToolHost::new(root.path(), &config)
+                    .unwrap()
+                    .with_instruction_gate(gate.clone());
+                let result = host.execute_for_actor(name, args, None, None).await;
+                assert!(!result.replan_required);
+                if denied {
+                    let error = result.result.unwrap_err();
+                    assert!(crate::is_permission_denied(&error));
+                    assert_eq!(
+                        error.to_string(),
+                        "tool permission denied: nested instruction authority was denied"
+                    );
+                } else {
+                    let output: Value = serde_json::from_str(&result.result.unwrap()).unwrap();
+                    assert_eq!(output["matches"], expected, "{review} {name}");
+                    assert_eq!(output["omitted"]["denied"], 1);
+                }
+                assert_eq!(
+                    result.instructions.as_deref(),
+                    accepted.then_some("reviewed src instructions")
+                );
+                assert_eq!(publications.load(Ordering::SeqCst), usize::from(accepted));
+                assert_eq!(
+                    *gate.directories.0.lock().unwrap(),
+                    vec![vec!["src".to_owned()]]
+                );
+                host.shutdown().await.unwrap();
+            }
+        }
+
+        #[cfg(windows)]
+        for (name, args) in [
+            ("glob", json!({"pattern":"**/*.txt"})),
+            ("grep", json!({"pattern":"needle"})),
+        ] {
+            let original = root.path().join("src/allowed.txt");
+            let alias = root.path().join("sibling/linked.bin");
+            let before = regular_file_info(&std::fs::File::open(&original).unwrap()).unwrap();
+            assert_eq!(before.links, 1);
+            let publications = Arc::new(AtomicUsize::new(0));
+            let gate = Arc::new(SearchReview {
+                directories: RecordInstructionDirectories(std::sync::Mutex::new(Vec::new())),
+                outcome: std::sync::Mutex::new(Some(InstructionGateOutcome::Proposed(Box::new(
+                    SearchActivation(publications.clone()),
+                )))),
+                // Admission sees the original single-link candidate. Review
+                // creates its real alias before returning proposed authority.
+                link: Some((original.clone(), alias.clone())),
+            });
+            let host = ToolHost::new(root.path(), &config)
+                .unwrap()
+                .with_instruction_gate(gate.clone());
+            let result = host.execute_for_actor(name, args, None, None).await;
+            let error = result.result.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "tool execution failed: regular file must have exactly one hardlink"
+            );
+            assert!(result.instructions.is_none());
+            assert!(!result.replan_required);
+            assert_eq!(publications.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                *gate.directories.0.lock().unwrap(),
+                vec![vec!["src".to_owned()]]
+            );
+            let after = regular_file_info(&std::fs::File::open(&original).unwrap()).unwrap();
+            let linked = regular_file_info(&std::fs::File::open(&alias).unwrap()).unwrap();
+            assert_eq!(after.identity, before.identity);
+            assert_eq!(linked.identity, before.identity);
+            assert_eq!(after.links, 2);
+            assert_eq!(linked.links, 2);
+            assert_eq!(std::fs::read(&original).unwrap(), b"needle\n");
+            assert_eq!(std::fs::read(&alias).unwrap(), b"needle\n");
+            assert_eq!(
+                std::fs::read(root.path().join("sibling/denied.txt")).unwrap(),
+                b"needle\n"
+            );
+            host.shutdown().await.unwrap();
+            drop(host);
+            std::fs::remove_file(alias).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -4291,7 +4442,6 @@ mod tests {
         assert_eq!(error.chain().count(), 1);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn toolhost_stdio_mcp_projects_application_success_and_protocol_results() {
         const SECRET: &str = "sk-abcdefghijklmnop";
@@ -4390,7 +4540,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn central_permission_gate_denies_stdio_mcp_before_tools_call() {
         let peer = StdioFixture::new([
@@ -4456,7 +4605,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn foreground_once_approval_dispatches_stdio_mcp_tool_call() {
         let peer = StdioFixture::new([

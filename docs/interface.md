@@ -50,6 +50,10 @@ status and composition. The editor expands for wrapped or multiline drafts, then
 scrolls while preserving the caret. Model, effort and framework controls wrap into
 two or three rows as needed. Very small terminals retain the editable draft.
 
+On Windows, the terminal backend does not deliver atomic paste events. Pasted
+or Alt-code combining text may lose accents; native committed-key acceptance
+is separate from paste acceptance.
+
 Pickers filter by typing or paste, mark the current value and scroll the selection
 into view. The framework picker previews geometry before committing a change;
 previews of other modes show their built-in members and are labeled as previews.

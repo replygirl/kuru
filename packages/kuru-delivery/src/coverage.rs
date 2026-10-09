@@ -5124,3 +5124,263 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod coverage_failure_contracts {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn metadata_fixture(root: &Path) -> PathBuf {
+        let package = root.join("fixture");
+        fs::create_dir(&package).unwrap();
+        fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        let path = root.join("metadata.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "packages": [{
+                    "id": "fixture-id", "name": "fixture",
+                    "manifest_path": package.join("Cargo.toml"),
+                    "targets": [{"kind": ["lib"], "name": "fixture", "test": true}]
+                }],
+                "workspace_members": ["fixture-id"],
+                "workspace_root": root
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn unsupported_manifest_execution_cannot_publish_an_inventory() {
+        for section in ["lib", "bin", "test", "example", "bench"] {
+            for invalid_type in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let root = temp.path();
+                let metadata_path = metadata_fixture(root);
+                let manifest = root.join("fixture/Cargo.toml");
+                let text = if invalid_type {
+                    format!(
+                        "{section} = \"unsupported\"\n[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n"
+                    )
+                } else {
+                    let header = if section == "lib" {
+                        "[lib]".to_owned()
+                    } else {
+                        format!("[[{section}]]")
+                    };
+                    format!(
+                        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n{header}\nname = \"fixture\"\nharness = false\n"
+                    )
+                };
+                fs::write(&manifest, &text).unwrap();
+                let messages = root.join("cargo.jsonl");
+                fs::write(&messages, b"").unwrap();
+                let target = root.join("target");
+                fs::create_dir(&target).unwrap();
+                let adjacent = root.join("adjacent-state");
+                fs::write(&adjacent, b"preserve adjacent state").unwrap();
+                let inventory = root.join("inventory.json");
+                let error = write_inventory(
+                    &metadata_path,
+                    &messages,
+                    &target,
+                    &["fixture".to_owned()],
+                    &inventory,
+                )
+                .unwrap_err();
+                let expected = if invalid_type {
+                    format!("invalid [{section}] section")
+                } else {
+                    "unsupported harness=false".to_owned()
+                };
+                assert!(error.to_string().contains(&expected), "{error:#}");
+                assert!(
+                    !inventory.exists(),
+                    "refusal must not publish partial evidence"
+                );
+                assert_eq!(fs::read_to_string(&manifest).unwrap(), text);
+                assert_eq!(fs::read(&adjacent).unwrap(), b"preserve adjacent state");
+
+                // Explicit ordinary libtest harnesses remain admissible in all
+                // target tables. Only the unsupported execution is refused.
+                let admitted = text.replace("false", "true");
+                if !invalid_type {
+                    fs::write(&manifest, admitted).unwrap();
+                    assert_eq!(metadata(&metadata_path).unwrap().packages.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_cargo_artifacts_cannot_publish_partial_evidence() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let metadata_path = metadata_fixture(root);
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        let executable = target.join("fixture");
+        fs::write(&executable, b"read-only fixture artifact").unwrap();
+        let valid = serde_json::json!({
+            "reason": "compiler-artifact", "package_id": "fixture-id",
+            "target": {
+                "kind": ["lib"], "crate_types": ["lib"], "name": "fixture",
+                "src_path": root.join("fixture/src/lib.rs"), "edition": "2024",
+                "doc": true, "doctest": true, "test": true
+            },
+            "profile": {
+                "opt_level": "0", "debuginfo": 2, "debug_assertions": true,
+                "overflow_checks": true, "test": true
+            },
+            "filenames": [executable], "executable": executable
+        });
+        for (field, expected) in [
+            ("package_id", "omits package identity"),
+            ("target", "omits target"),
+            ("profile", "omits profile"),
+            ("filenames", "has no filenames"),
+        ] {
+            let mut incomplete = valid.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            let messages = root.join("cargo.jsonl");
+            fs::write(
+                &messages,
+                format!("\n{}\n", serde_json::to_string(&incomplete).unwrap()),
+            )
+            .unwrap();
+            let inventory = root.join("inventory.json");
+            let error = write_inventory(
+                &metadata_path,
+                &messages,
+                &target,
+                &["fixture".to_owned()],
+                &inventory,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{field}: {error:#}");
+            assert!(!inventory.exists());
+            assert_eq!(
+                fs::read(&executable).unwrap(),
+                b"read-only fixture artifact"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_ledger_refusal_preserves_state_without_launching_a_selection() {
+        for directory in [false, true] {
+            let workspace = fixture::Workspace::new(Mode::Uninstrumented);
+            let root = workspace.temp.path();
+            let ledger = root.join("runner-ledger.jsonl");
+            let marker = b"existing evidence must survive refusal";
+            let original_digest = if directory {
+                fs::create_dir(&ledger).unwrap();
+                fs::write(ledger.join("owned-state"), marker).unwrap();
+                None
+            } else {
+                let mut file = File::create(&ledger).unwrap();
+                file.write_all(marker).unwrap();
+                file.set_len(RUNNER_LEDGER_LIMIT).unwrap();
+                file.sync_all().unwrap();
+                Some(archive::digest(&fs::read(&ledger).unwrap()))
+            };
+            let diagnostics = root.join("diagnostics");
+            fs::create_dir(&diagnostics).unwrap();
+            fs::write(diagnostics.join("adjacent-state"), marker).unwrap();
+            let mut launcher = workspace.launcher();
+            launcher.list_error = true;
+            let error = workspace
+                .dispatch_all(
+                    &mut launcher,
+                    &PartitionScheme::new(1, 1).unwrap(),
+                    &ledger,
+                    &diagnostics,
+                    &[],
+                )
+                .await
+                .unwrap_err();
+            let expected = if directory {
+                "ledger is not a regular file"
+            } else {
+                "ledger is too large"
+            };
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(launcher.list_bounds.len(), 1);
+            assert!(
+                launcher.runs.is_empty(),
+                "listing failure must not launch tests"
+            );
+            assert_eq!(
+                fs::read(diagnostics.join("adjacent-state")).unwrap(),
+                marker
+            );
+            assert_eq!(fs::read_dir(&diagnostics).unwrap().count(), 1);
+            if let Some(original_digest) = original_digest {
+                assert_eq!(fs::metadata(&ledger).unwrap().len(), RUNNER_LEDGER_LIMIT);
+                assert_eq!(
+                    archive::digest(&fs::read(&ledger).unwrap()),
+                    original_digest
+                );
+            } else {
+                assert_eq!(fs::read(ledger.join("owned-state")).unwrap(), marker);
+                assert_eq!(fs::read_dir(&ledger).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_log_keeps_draining_and_observes_completion_after_its_limit() {
+        use std::io::{Seek, SeekFrom};
+        use tokio::io::AsyncWriteExt;
+
+        let temp = TempDir::new().unwrap();
+        let log = temp.path().join("bounded.stdout.log");
+        let adjacent = temp.path().join("adjacent-state");
+        fs::write(&adjacent, b"unchanged").unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let mut progress = LibtestProgress::default();
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                relay_output(reader, tokio::io::sink(), &log, &mut progress),
+                async {
+                    let mut block = vec![b'x'; 16 * 1024];
+                    *block.last_mut().unwrap() = b'\n';
+                    for _ in 0..TEST_LOG_LIMIT / block.len() as u64 {
+                        writer.write_all(&block).await.unwrap();
+                    }
+                    writer
+                        .write_all(b"running 1 test\ntest after_limit ... ok\n")
+                        .await
+                        .unwrap();
+                    // More output beyond the limit must not add another marker.
+                    writer.write_all(&block).await.unwrap();
+                    drop(writer);
+                }
+            )
+        })
+        .await
+        .expect("bounded relay stopped draining after its log filled");
+        assert_eq!(outcome, "complete");
+        assert_eq!(progress.announced, Some(1));
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.recent, ["test after_limit ... ok"]);
+        assert!(progress.unfinished().is_empty());
+        let marker = b"\n[coverage runner: log truncated at its byte limit]\n";
+        assert_eq!(
+            fs::metadata(&log).unwrap().len(),
+            TEST_LOG_LIMIT + marker.len() as u64
+        );
+        let mut file = File::open(&log).unwrap();
+        file.seek(SeekFrom::Start(TEST_LOG_LIMIT)).unwrap();
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, marker);
+        assert_eq!(fs::read(adjacent).unwrap(), b"unchanged");
+    }
+}

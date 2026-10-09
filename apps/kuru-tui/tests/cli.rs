@@ -346,7 +346,6 @@ fn canary_requires_an_explicit_model_without_opening_workspace_authority_or_memo
     assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() -> anyhow::Result<()>
 {
@@ -358,10 +357,47 @@ async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() 
         let marker = env.project.join("post-turn-hook-ran");
         let config_path = env.root.path().join("config/kuru/config.toml");
         let mut config = std::fs::read_to_string(&config_path)?;
-        config.push_str(&format!(
-            "\n[[hooks.post_turn]]\ncommand = '/bin/sh'\nargs = ['-c', 'cat >/dev/null; printf x > \"$1\"; printf RAW_HOOK_SECRET >&2; printf \"{{\"', 'hook', {}]\n",
-            toml::Value::String(marker.to_string_lossy().into_owned())
-        ));
+        #[cfg(unix)]
+        let hook = kuru_core::HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "cat >/dev/null; printf x > \"$1\"; printf RAW_HOOK_SECRET >&2; printf \"{\"".into(),
+                "hook".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            ..kuru_core::HookCommand::default()
+        };
+        #[cfg(windows)]
+        let hook = {
+            kuru_connectors::shell_warmup::warm_up_stock_powershell_hook_launch().await?;
+            kuru_core::HookCommand {
+                command: kuru_platform::windows::process::system_directory()?
+                    .join("WindowsPowerShell/v1.0/powershell.exe")
+                    .to_string_lossy()
+                    .into_owned(),
+                args: vec![
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    format!(
+                        "$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllBytes('{}', [byte[]](120)); [Console]::Error.Write('RAW_HOOK_SECRET'); [Console]::Out.Write('{{')",
+                        marker.to_string_lossy().replace('\'', "''")
+                    ),
+                ],
+                ..kuru_core::HookCommand::default()
+            }
+        };
+        let mut hook_config = toml::Table::new();
+        hook_config.insert(
+            "hooks".into(),
+            toml::Value::try_from(kuru_core::LifecycleHooks {
+                post_turn: vec![hook],
+                ..kuru_core::LifecycleHooks::default()
+            })?,
+        );
+        config.push_str(&toml::to_string(&hook_config)?);
         std::fs::write(config_path, config)?;
 
         // Retain a checked managed attachment across the CLI process boundary so
@@ -376,15 +412,25 @@ async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() 
         );
         let memory = opening.await?;
 
-        let output = tokio::task::block_in_place(|| {
-            env.run(&["run", "a completed answer survives its post hook", "--json"])
-        });
+        let observed = async {
+            let output = tokio::task::block_in_place(|| {
+                env.run(&["run", "a completed answer survives its post hook", "--json"])
+            });
+            let answer: Value = serde_json::from_slice(&output.stdout)?;
+            let session = answer["session"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("completed answer did not identify its session"))?;
+            let page = memory.public_transcript_page(session, None, 8).await?;
+            Ok::<_, anyhow::Error>((output, answer, page))
+        }
+        .await;
+        memory.close().await?;
+        let (output, answer, page) = observed?;
         assert!(
             output.status.success(),
             "settled answer failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let answer: Value = serde_json::from_slice(&output.stdout)?;
         assert!(answer["text"].as_str().is_some_and(|text| !text.is_empty()));
         let session = answer["session"].as_str().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -392,13 +438,11 @@ async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() 
         assert!(!stderr.contains("RAW_HOOK_SECRET"), "{stderr}");
         assert_eq!(std::fs::read(marker)?, b"x");
 
-        let page = memory.public_transcript_page(session, None, 8).await?;
         assert!(page.records.iter().any(|entry| {
             matches!(entry, PublicTranscriptEntry::Turn { record }
                 if record.origin_session_id == session
                     && record.settlement == PublicTurnSettlement::Completed)
         }));
-        memory.close().await?;
         Ok(())
     })
     .await
@@ -4698,6 +4742,107 @@ fn headless_json_remains_machine_readable_when_old_context_is_omitted() {
         String::from_utf8_lossy(&export.stderr)
     );
     assert!(String::from_utf8_lossy(&export.stdout).contains(sentinel));
+}
+
+// The Unix PTY acceptance also covers piped input and signals. Exercise the
+// same public-stream privacy, denied-effect and durable retry contracts using
+// owned native Windows child processes, whose transport has no Unix PTY path.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_windows_headless_stream_preserves_denial_privacy_and_durable_retry() {
+    kuru_memory::test_support::closing(async {
+        use axum::{
+            Json, Router,
+            response::IntoResponse,
+            routing::{get, post},
+        };
+        use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+        struct Server(tokio::task::JoinHandle<()>);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let mode = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let app = Router::new()
+            .route("/v1/models", get(|| async { Json(serde_json::json!({"data":[{"id":"fixture"}]})) }))
+            .route("/v1/responses", post({
+                let mode = mode.clone();
+                let requests = requests.clone();
+                move |Json(request): Json<Value>| {
+                    let mode = mode.clone();
+                    let requests = requests.clone();
+                    async move {
+                        requests.lock().unwrap().push(request.clone());
+                        let speaking = request["instructions"].as_str().is_some_and(|text| text.contains("Phase: speak and act"));
+                        let followup = request["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "function_call_output"));
+                        if speaking && followup && mode.load(Ordering::SeqCst) == 2 {
+                            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "PRIVATE_NATIVE_PROVIDER").into_response();
+                        }
+                        let output = if speaking && !followup {
+                            serde_json::json!([{"type":"function_call","call_id":"native-effect","name":"file_write","arguments":serde_json::json!({"path":"effect.txt","content":"PRIVATE_NATIVE_TOOL"}).to_string()}])
+                        } else if speaking {
+                            serde_json::json!([
+                                {"id":"reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"PRIVATE_NATIVE_REASONING"}],"encrypted_content":"PRIVATE_NATIVE_COGNITIVE"},
+                                {"id":"message","type":"message","content":[{"type":"output_text","text":"PUBLIC_NATIVE_ANSWER"}]}
+                            ])
+                        } else {
+                            serde_json::json!([{"type":"message","content":[{"type":"output_text","text":"PRIVATE_NATIVE_COGNITIVE"}]}])
+                        };
+                        let event = serde_json::json!({"type":"response.completed","response":{"id":"native-headless","status":"completed","output":output,"usage":{"input_tokens":8,"output_tokens":8}}});
+                        ([("content-type", "text/event-stream")], format!("data: {event}\n\n")).into_response()
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = Server(tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); }));
+        for case in 0..3 {
+            mode.store(case, Ordering::SeqCst);
+            let env = Sandbox::warmed().await;
+            let config = env.root.path().join("headless-native.toml");
+            std::fs::write(&config, format!("api_base='http://{address}/v1'\napi_key_env='KURU_NATIVE_STREAM_KEY'\nmax_rounds=1\n")).unwrap();
+            let mut command = env.command_for("responses");
+            command.args(["--model", "fixture", "--config"]).arg(&config).env("KURU_NATIVE_STREAM_KEY", "fixture");
+            if case != 1 { command.arg("--allow-write"); }
+            command.args(["run", "NATIVE_ARGV_PROMPT", "--turn-id", "native-stream", "--output-format", "stream-json"]);
+            let output = tokio::task::spawn_blocking(move || command.output()).await.unwrap().unwrap();
+            assert_eq!(output.status.code(), Some(if case == 2 { 1 } else { 0 }), "case {case}: {}", String::from_utf8_lossy(&output.stderr));
+            for bytes in [&output.stdout, &output.stderr] {
+                let text = String::from_utf8_lossy(bytes);
+                for secret in ["PRIVATE_NATIVE_TOOL", "PRIVATE_NATIVE_COGNITIVE", "PRIVATE_NATIVE_REASONING", "PRIVATE_NATIVE_PROVIDER"] {
+                    assert!(!text.contains(secret), "public native output disclosed {secret}: {text}");
+                }
+            }
+            let records: Vec<Value> = std::str::from_utf8(&output.stdout).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert!(records.iter().all(|record| record["version"] == 1 && ["started", "status", "snapshot", "gap", "terminal"].contains(&record["kind"].as_str().unwrap_or(""))));
+            assert!(records.windows(2).all(|pair| pair[0]["seq"].as_u64() < pair[1]["seq"].as_u64()));
+            assert_eq!(records.iter().filter(|record| record["kind"] == "terminal").count(), 1);
+            let terminal = records.last().unwrap();
+            assert_eq!(terminal["detail"]["status"], if case == 2 { "failed" } else { "completed" });
+            if case != 2 { assert_eq!(terminal["detail"]["answer"], "PUBLIC_NATIVE_ANSWER"); }
+            if case == 1 {
+                assert!(!env.project.join("effect.txt").exists(), "denied native write took effect");
+                assert!(requests.lock().unwrap().iter().any(|request| request["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "function_call_output" && item["output"].as_str().is_some_and(|text| text.contains("tool permission"))))), "denial was not returned to the provider");
+            } else {
+                assert_eq!(std::fs::read(env.project.join("effect.txt")).unwrap(), b"PRIVATE_NATIVE_TOOL");
+            }
+            if case == 0 {
+                let before = requests.lock().unwrap().len();
+                let mut retry = env.command_for("responses");
+                retry.args(["--model", "fixture", "--config"]).arg(&config).env("KURU_NATIVE_STREAM_KEY", "fixture")
+                    .args(["--allow-write", "--resume", terminal["detail"]["session"].as_str().unwrap(), "run", "NATIVE_ARGV_PROMPT", "--turn-id", "native-stream", "--json"]);
+                let output = tokio::task::spawn_blocking(move || retry.output()).await.unwrap().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let replay: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(replay["text"], "PUBLIC_NATIVE_ANSWER");
+                assert!(replay.get("version").is_none());
+                assert_eq!(requests.lock().unwrap().len(), before, "completed retry contacted the provider");
+                assert_eq!(std::fs::read(env.project.join("effect.txt")).unwrap(), b"PRIVATE_NATIVE_TOOL");
+            }
+        }
+    }).await;
 }
 
 #[tokio::test]
