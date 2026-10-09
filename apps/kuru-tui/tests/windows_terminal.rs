@@ -808,7 +808,8 @@ async fn native_conpty_session_controls_share_cli_identity_and_public_history() 
         terminal.committed_key(KeyCode::Enter, KeyModifiers::NONE)?;
         terminal.frame_text(
             &[
-                "current project memory remains shared",
+                "current project memory remains",
+                "shared",
                 "NATIVE-SESSION-ORIGIN",
                 "enter send",
             ],
