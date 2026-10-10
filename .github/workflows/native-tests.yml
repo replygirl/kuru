@@ -660,6 +660,17 @@ jobs:
           KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: mise run //packages/kuru-delivery:test:previous-release-update
+      - name: Set up native Homebrew acceptance
+        if: runner.os != 'Windows'
+        uses: Homebrew/actions/setup-homebrew@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        with:
+          stable: true
+      - name: Accept source-installed executable through native Homebrew
+        if: runner.os != 'Windows'
+        env:
+          KURU_HOMEBREW_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-bin/kuru
+          GITHUB_TOKEN: ${{ github.token }}
+        run: mise run //packages/kuru-delivery:test:homebrew
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
 

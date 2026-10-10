@@ -269,6 +269,15 @@ jobs:
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru
         run: mise run //apps/kuru-tui:test:embedded-runtime
+      - name: Set up native Homebrew acceptance
+        uses: Homebrew/actions/setup-homebrew@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        with:
+          stable: true
+      - name: Accept native ARM executable through Homebrew
+        env:
+          KURU_HOMEBREW_CANDIDATE_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru
+          GITHUB_TOKEN: ${{ github.token }}
+        run: mise run //packages/kuru-delivery:test:homebrew
 
   native-memory:
     # The arm64 host runs the complete real-memory suite through the same

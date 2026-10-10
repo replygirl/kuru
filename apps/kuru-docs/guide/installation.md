@@ -23,6 +23,29 @@ Before publication, each release's exact Windows package is tested through nativ
 
 Ordinary Kuru commands start or attach to a private per-project memory service from the installed executable. It is not registered as an operating-system service, requires no separately installed database daemon, and exits once clients and accepted work have drained.
 
+## Install with Homebrew
+
+On Apple Silicon macOS or Linux ARM64/x86-64:
+
+```sh
+brew install replygirl/kuru/kuru
+kuru --version
+```
+
+The [dedicated Kuru tap](https://github.com/replygirl/homebrew-kuru) installs the
+native release executable, bundled Dolt, licenses, four shell completions and
+manual page. It requires no Rust compiler or separate database. Linux needs a
+glibc compatible with Ubuntu 24.04; Intel macOS is unsupported.
+
+Use Homebrew for upgrades:
+
+```sh
+brew update
+brew upgrade kuru
+```
+
+`kuru update` refuses Homebrew-owned installations before download or staging.
+
 ## Install with the shell bootstrap
 
 On macOS or Linux:

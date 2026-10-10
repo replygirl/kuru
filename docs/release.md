@@ -7,6 +7,9 @@ assembles the complete candidate, accepts it on Linux, macOS and Windows, deploy
 documentation from that exact commit, and publishes the release only after those
 gates succeed. A separate
 post-publication Windows job then verifies the immutable public download.
+The same workflow signs macOS and Windows executables before final packaging,
+accepts Homebrew installation on its supported native targets, and updates the
+dedicated tap after public promotion.
 Pushes and tags do not start release publication or deploy documentation.
 
 ## One-time setup
@@ -45,6 +48,107 @@ Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
 7.0.0 and Communiqué 1.5.0 pins. Native archive build jobs use only the Rust
 packaging task and do not need the notes toolchain. Full maintainer tests and notes generation run on
 Linux, Apple Silicon macOS or Windows x86_64. App installation does not require these tools.
+
+## Native signing setup
+
+Configure these Actions secrets and variables on `replygirl/kuru` before the next
+release dispatch. Preflight rejects missing signing or tap settings before a
+version commit is created. There is no unsigned-release fallback.
+
+For macOS, maintain an active Apple Developer Program membership and export a
+**Developer ID Application** certificate with its private key as a
+password-protected PKCS#12 file. Developer ID Installer is unnecessary for the
+current standalone CLI archives. Prepare an App Store Connect **Team API key**
+for notarization; Apple's Individual API keys cannot authenticate `notarytool`.
+The Team key type is separate from individual Developer Program enrollment.
+See [Developer ID certificates](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/)
+and [Apple API keys](https://developer.apple.com/documentation/AppStoreConnectAPI/creating-api-keys-for-app-store-connect-api).
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `MACOS_SIGNING_P12_BASE64` | Secret | Base64 encoding of exported certificate and private key |
+| `MACOS_SIGNING_P12_PASSWORD` | Secret | PKCS#12 export password |
+| `MACOS_SIGNING_IDENTITY` | Variable | Exact Developer ID Application identity |
+| `APPLE_TEAM_ID` | Variable | Ten-character publisher Team ID |
+| `APPLE_NOTARY_KEY_P8` | Secret | Team API key's P8 private key |
+| `APPLE_NOTARY_KEY_ID` | Variable | Notarization Key ID |
+| `APPLE_NOTARY_ISSUER_ID` | Variable | Notarization Issuer ID |
+
+The macOS job imports an ephemeral keychain, signs a checked private executable
+copy with hardened runtime and a secure timestamp, requires the configured
+Developer ID team, submits a temporary ZIP, and requires Apple's `Accepted`
+response. Temporary certificates, keys and the keychain are removed on exit.
+Standalone CLI executables cannot have notarization tickets stapled; the archive
+does not promise offline Gatekeeper acceptance. Offline bundled-memory acceptance
+is tested independently.
+
+For Windows, create an Azure subscription/Entra tenant and an **Artifact Signing
+Public Trust** account/profile. US individuals are eligible after identity
+validation; their Azure billing account must be Individual and match government
+identification. Azure identity validation is independent of Apple enrollment.
+Register `Microsoft.CodeSigning`, finish portal identity validation, and create
+the certificate profile. See the [official quickstart](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart).
+
+Create an Entra app/service principal with GitHub OIDC federation and grant
+**Artifact Signing Certificate Profile Signer** at the selected profile. Configure
+federation against the actual repository's GitHub OIDC subject, with audience
+`api://AzureADTokenExchange`; do not assume an old subject format for a renamed
+or newly created repository. No Azure client secret or Windows private-key export
+is needed. See [Azure signing OIDC](https://github.com/Azure/artifact-signing-action/blob/main/docs/OIDC.md).
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `AZURE_CLIENT_ID` | Variable | Federated app/service principal |
+| `AZURE_TENANT_ID` | Variable | Entra tenant |
+| `AZURE_SUBSCRIPTION_ID` | Variable | Signing subscription |
+| `AZURE_SIGNING_ENDPOINT` | Variable | Selected region's signing endpoint |
+| `AZURE_SIGNING_ACCOUNT` | Variable | Artifact Signing account name |
+| `AZURE_SIGNING_PROFILE` | Variable | Public Trust certificate profile |
+| `WINDOWS_SIGNING_SUBJECT` | Variable | Exact expected Authenticode certificate Subject |
+
+The official Azure action requires a Windows x64 runner. Both natively built PE
+architectures are signed there, with SHA-256 and RFC3161 timestamping; ARM64 then
+executes the exact signed package on its native runner. Authenticode verification
+requires `Valid`, the exact configured Subject and a timestamp certificate with
+time-stamping usage. Signing establishes publisher integrity, but does not
+guarantee immediate SmartScreen reputation. Linux tarballs need no mandatory OS
+signing account and retain complete verified SHA-256 manifests.
+
+Live Apple notarization and Azure Public Trust acceptance require a configured
+release run. Local ad hoc signatures, fake signers and HTTP fixtures establish
+implementation contracts; they do not establish live signing-service success.
+
+## Homebrew tap setup and recovery
+
+Initialize `replygirl/homebrew-kuru` with a `main` branch and the source-owned
+README in `packages/kuru-delivery/support/homebrew`. Copy its `ci.yml` to the
+tap's `.github/workflows/ci.yml` so formula PRs and main updates install and test
+the selected public release on native Linux and macOS. Create a separate GitHub App
+with Contents read/write and Metadata read, installed only on this tap, with
+webhooks disabled and no organization/account permissions. Set
+`HOMEBREW_APP_ID` (variable) and `HOMEBREW_APP_PRIVATE_KEY` (secret) on the source
+repository. Keep the existing release app scoped only to `replygirl/kuru`.
+
+Native staged legs generate the formula from the verified complete candidate,
+install/test it with Homebrew, compare installed bytes after linkage fixups,
+exercise offline persistent use and cleanup, and upgrade a genuine previous
+published release when one exists. The formula pairs core and shell-support
+resources; it has no source build, bottle or external engine dependency.
+
+After release promotion, `publish-homebrew` reads the actual public tag, source
+marker and complete immutable asset manifest. It uses the tap app to update
+`Formula/kuru.rb` with the inspected blob SHA. Identical content performs no
+write; rollback and different content at the same version fail. A conflicting
+concurrent update fails rather than overwriting it. A tap failure leaves the
+public release intact: rerun failed jobs on the original release run to repair
+the tap, including after a response is lost.
+
+Final native packages use immutable same-run artifact names containing the
+selected version, commit and target. A retry validates and restores those bytes
+instead of obtaining another signature timestamp. Expired artifacts, or deleted
+artifacts whose successful upload is recorded in run history, fail with an
+explicit recovery diagnosis. Retain/recover the original accepted packages;
+never replace an immutable public asset with a newly signed rebuild.
 
 ## Choose and release a version
 
@@ -113,6 +217,10 @@ runtime is involved.
    commit, which restores a pin-verified cached archive or builds it once on
    `ubuntu-latest` and fails unless it matches the committed pin, and the leg
    imports that artifact with `bundle:prepare --archive ... --offline`.
+   macOS signs and notarizes a separate private copy; both Windows builds export
+   private signing inputs to `sign-windows`, whose x64 runner signs and verifies
+   both architectures before creating their final archives. Restored immutable
+   native packages are revalidated and accepted without obtaining new timestamps.
 4. Generate notes in a separate job with a read-only GitHub token, alongside final
    validation of the selected version commit. No release writes are available to
    that job. Its output is an artifact for publication, which still waits for
@@ -143,6 +251,9 @@ runtime is involved.
    platforms. The loopback mise fixture and the local release base given to the
    previous updater are not public downloads of the new release. A failure on
    any platform or in either path blocks `publish`.
+   Signed targets also verify the exact staged publisher signature before runtime
+   execution. The three Unix legs accept Homebrew install/test, payload equality,
+   offline persistent use and a genuine previous-release Homebrew upgrade.
 7. Run `deploy-docs` only after staged acceptance on every platform and
    `build-docs` succeed. Pages deployment and GitHub release promotion are separate service
    operations; this ordering does not claim they update atomically.

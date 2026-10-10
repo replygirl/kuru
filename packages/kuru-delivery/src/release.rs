@@ -712,13 +712,18 @@ fn assembled_assets(
     selected: Version,
     notes: &Path,
 ) -> Result<BTreeMap<String, String>> {
+    checked_notes(notes)?;
+    verified_assets(directory, selected)
+}
+
+/// Check an assembled manifest without changing its bytes.
+pub fn verified_assets(directory: &Path, selected: Version) -> Result<BTreeMap<String, String>> {
     let mut checksums = archive_assets(directory, selected)?;
     let manifest = checksum_manifest(&checksums);
     ensure!(
         fs::read_to_string(directory.join("SHA256SUMS"))? == manifest,
         "candidate checksum manifest differs from its archives"
     );
-    checked_notes(notes)?;
     checksums.insert("SHA256SUMS".into(), digest(manifest.as_bytes()));
     Ok(checksums)
 }
@@ -781,7 +786,11 @@ fn remote_assets(
     }
     Ok(seen)
 }
-async fn published_url(api: &GitHub, release: &Value, selected: Version) -> Result<String> {
+async fn published_checksums(
+    api: &GitHub,
+    release: &Value,
+    selected: Version,
+) -> Result<BTreeMap<String, String>> {
     let listed = release["assets"]
         .as_array()
         .context("missing release assets")?;
@@ -815,10 +824,183 @@ async fn published_url(api: &GitHub, release: &Value, selected: Version) -> Resu
         remote_assets(release, &checksums)? == checksums.keys().cloned().collect(),
         "published release is incomplete"
     );
+    Ok(checksums)
+}
+
+async fn published_url(api: &GitHub, release: &Value, selected: Version) -> Result<String> {
+    published_checksums(api, release, selected).await?;
     Ok(release["html_url"]
         .as_str()
         .context("missing release URL")?
         .to_owned())
+}
+
+/// Read only the actual immutable public release, including recovery after promotion.
+pub async fn published_assets(
+    api: &GitHub,
+    selected: Version,
+    commit: &str,
+) -> Result<BTreeMap<String, String>> {
+    checked_sha(commit)?;
+    ensure!(
+        tag_commit(api, selected).await?.as_deref() == Some(commit),
+        "public release tag does not match the selected commit"
+    );
+    let release = find_release(api, selected)
+        .await?
+        .context("release is not public")?;
+    let marker = format!("<!-- kuru-release-sha: {commit} -->");
+    ensure!(
+        release["draft"].as_bool() == Some(false)
+            && release["prerelease"].as_bool() == Some(false)
+            && release["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(&marker)),
+        "release is not the selected stable public release"
+    );
+    published_checksums(api, &release, selected).await
+}
+
+/// Stable names bind immutable packages to this selected source and native target.
+pub fn package_artifact_name(selected: Version, commit: &str, target: &str) -> Result<String> {
+    checked_sha(commit)?;
+    crate::targets::find(target)?;
+    Ok(format!("release-package-{selected}-{commit}-{target}"))
+}
+
+/// Find a same-run package, rejecting expired or lost previously retained bytes.
+pub async fn retained_package(
+    api: &GitHub,
+    run_id: u64,
+    selected: Version,
+    commit: &str,
+    target: &str,
+) -> Result<bool> {
+    ensure!(run_id > 0, "workflow run ID must be positive");
+    let name = package_artifact_name(selected, commit, target)?;
+    let mut found = None;
+    for page in 1..=100 {
+        let data = api
+            .required(
+                Method::GET,
+                &api.path(&format!(
+                    "actions/runs/{run_id}/artifacts?per_page=100&page={page}"
+                )),
+                None,
+            )
+            .await?;
+        let rows = data["artifacts"]
+            .as_array()
+            .context("missing workflow artifacts")?;
+        for row in rows
+            .iter()
+            .filter(|row| row["name"].as_str() == Some(&name))
+        {
+            ensure!(found.is_none(), "duplicate retained release package");
+            ensure!(
+                row["expired"].as_bool() == Some(false),
+                "retained signed package expired; recover its original bytes before retrying"
+            );
+            found = Some(row["id"].as_u64().context("missing artifact ID")?);
+        }
+        if rows.len() < 100 {
+            break;
+        }
+        ensure!(page < 100, "workflow artifact listing exceeded limit");
+    }
+    if found.is_some() {
+        return Ok(true);
+    }
+    // A deleted artifact is no longer listed. Completed upload steps prove that
+    // absence is lost state, rather than permission to sign a new timestamp.
+    let job_name = if target.contains("windows") {
+        format!("Sign Windows package ({target})")
+    } else {
+        format!("Build native package ({target})")
+    };
+    for page in 1..=100 {
+        let data = api
+            .required(
+                Method::GET,
+                &api.path(&format!(
+                    "actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}"
+                )),
+                None,
+            )
+            .await?;
+        let rows = data["jobs"].as_array().context("missing workflow jobs")?;
+        for job in rows
+            .iter()
+            .filter(|job| job["name"].as_str() == Some(&job_name))
+        {
+            ensure!(
+                !job["steps"]
+                    .as_array()
+                    .context("missing workflow job steps")?
+                    .iter()
+                    .any(|step| step["name"] == "Retain signed native package"
+                        && step["conclusion"] == "success"),
+                "retained signed package was deleted; recover its original bytes before retrying"
+            );
+        }
+        if rows.len() < 100 {
+            return Ok(false);
+        }
+    }
+    bail!("workflow job listing exceeded limit")
+}
+
+/// Verify the closed inventory of one restored native package before reuse.
+pub fn verify_package(directory: &Path, selected: Version, target: &str) -> Result<()> {
+    let target = crate::targets::find(target)?;
+    let core = crate::archive::archive_name(&selected.to_string(), target.triple)?;
+    let support = crate::shell_support::archive_name(&selected.to_string(), target.triple)?;
+    let expected: BTreeSet<_> = [
+        core.clone(),
+        format!("{core}.sha256"),
+        support.clone(),
+        format!("{support}.sha256"),
+    ]
+    .into_iter()
+    .collect();
+    let mut actual = BTreeSet::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        ensure!(
+            entry.file_type()?.is_file(),
+            "retained package entry is not regular"
+        );
+        actual.insert(
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("invalid package filename"))?,
+        );
+    }
+    ensure!(
+        actual == expected,
+        "retained native package inventory differs"
+    );
+    let mut payloads = Vec::new();
+    for name in [&core, &support] {
+        let path = directory.join(name);
+        ensure!(
+            fs::metadata(&path)?.len() <= MAX_ARCHIVE,
+            "retained package exceeds bound"
+        );
+        let bytes = fs::read(path)?;
+        ensure!(
+            fs::read_to_string(directory.join(format!("{name}.sha256")))?
+                == format!("{}  {name}\n", digest(&bytes)),
+            "retained package checksum differs"
+        );
+        payloads.push(bytes);
+    }
+    let (_, marked) =
+        crate::archive::extract_core(&payloads[0], target, crate::archive::MAX_ARCHIVE_BYTES)?;
+    ensure!(marked, "retained package lacks shell support marker");
+    crate::shell_support::decode(&payloads[1], target)?;
+    Ok(())
 }
 pub async fn publish(
     api: &GitHub,
