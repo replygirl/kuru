@@ -55,7 +55,7 @@ jobs:
         shell: bash
         # Leave the leaf absent so the preparer creates this runner's private ACLs.
         run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           experimental: true
           version: 2026.9.18
@@ -118,7 +118,7 @@ jobs:
         shell: bash
         # Leave the leaf absent so the preparer creates this runner's private ACLs.
         run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           experimental: true
           version: 2026.9.18
@@ -240,7 +240,7 @@ jobs:
         # Leave the leaf absent so the preparer creates this runner's private ACLs.
         # Cargo's restored target/ cache must not supply these directory grants.
         run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           experimental: true
           version: 2026.9.18
@@ -313,7 +313,7 @@ jobs:
         # Leave the leaf absent so the preparer creates this runner's private ACLs.
         # Cargo's restored target/ cache must not supply these directory grants.
         run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles-partition-${{ matrix.partition }}-${{ github.run_attempt }}\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           experimental: true
           version: 2026.9.18
@@ -444,7 +444,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           experimental: true
           version: 2026.9.18
@@ -515,7 +515,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           experimental: true
           version: 2026.9.18
@@ -607,7 +607,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           experimental: true
           version: 2026.9.18
@@ -706,7 +706,7 @@ jobs:
             fi
           done
           df -h /
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           experimental: true
           version: 2026.9.18
