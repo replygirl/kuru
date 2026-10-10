@@ -528,7 +528,10 @@ async fn release_cli_signing_copies_preserve_hardlinked_inputs_and_verify_privat
         .arg(&output);
     let prepared = success(&run_release(prepare).await);
     let copy = output.join("kuru");
-    assert_eq!(Path::new(prepared.trim()), fs::canonicalize(&copy).unwrap());
+    assert_eq!(
+        fs::canonicalize(Path::new(prepared.trim())).unwrap(),
+        fs::canonicalize(&copy).unwrap()
+    );
     assert_eq!(fs::read(&copy).unwrap(), original);
     assert_ne!(files::identity(&copy), identity);
     let directory = kuru_platform::fs::Directory::open(
