@@ -64,7 +64,7 @@ usage-lib = { version = "=6.12.0", features = ["clap"] }
 # audit above `native_completion_answer_output` in apps/kuru-tui/src/cli.rs for
 # which of its process-spawning code paths are actually reachable from that call.
 usage-cli = "=6.12.0"
-usage-argv = { version = "=6.12.0", features = ["complete"] }
+usage-argv = { version = "=7.0.0", features = ["complete"] }
 tempfile = "=3.27.0"
 url = "=2.5.8"
 unicode-width = "=0.2.2"
