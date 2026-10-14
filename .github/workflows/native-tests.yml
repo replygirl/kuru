@@ -220,7 +220,7 @@ jobs:
       # directory are verified cache hits against the same committed pin.
       # The caller fetched and verified these archives once for the whole run.
       - name: Download the run's verified bundle inputs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.bundle-inputs }}-${{ inputs.os }}
           path: ${{ runner.temp }}/bundle-inputs
@@ -241,7 +241,7 @@ jobs:
           done
       - name: Download the Windows arm64 engine input
         if: runner.os == 'Windows' && runner.arch == 'ARM64'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ needs.dolt-windows-arm64.outputs.artifact }}
           path: ${{ runner.temp }}/bundle-input
@@ -495,7 +495,7 @@ jobs:
       # several into one directory per artifact name; the merge accepts both
       # layouts and validates each partition's latest uploaded attempt.
       - name: Download every partition's evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-*
           merge-multiple: false
@@ -575,7 +575,7 @@ jobs:
       # a verified cache hit against the same committed pin.
       - name: Download the Windows arm64 engine input
         if: runner.os == 'Windows' && runner.arch == 'ARM64'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ needs.dolt-windows-arm64.outputs.artifact }}
           path: ${{ runner.temp }}/bundle-input
