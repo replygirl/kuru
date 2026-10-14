@@ -505,7 +505,7 @@ jobs:
         run: mise run //apps/kuru-tui:verify:windows-imports
       - name: Retain unsigned Windows signing inputs
         if: runner.os == 'Windows' && steps.retained.outputs.found != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signing-input-${{ needs.plan.outputs.version }}-${{ needs.bump.outputs.sha }}-${{ matrix.target }}
           path: ${{ runner.temp }}/kuru-signing-input/*
@@ -513,7 +513,7 @@ jobs:
           overwrite: true
       - name: Retain signed native package
         if: runner.os != 'Windows' && steps.retained.outputs.found != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.retained.outputs.name }}
           path: dist/*
@@ -631,7 +631,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Signed package validation failed' }
       - name: Retain signed native package
         if: steps.retained.outputs.found != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.retained.outputs.name }}
           path: dist/*
@@ -667,7 +667,7 @@ jobs:
           RELEASE_SHA: ${{ needs.bump.outputs.sha }}
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: mise run release:tool -- notes --sha "$RELEASE_SHA" --version "$RELEASE_VERSION" --output RELEASE_NOTES.md
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-notes
           path: RELEASE_NOTES.md
@@ -708,7 +708,7 @@ jobs:
         env:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: printf 'name=release-candidate-%s\n' "$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: |
@@ -1014,7 +1014,7 @@ jobs:
           KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ runner.temp }}/published-windows-${{ matrix.target }}-receipt.json
         run: mise run //packages/kuru-delivery:verify:published-windows
       - name: Retain public-download verification evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: published-windows-${{ matrix.target }}-${{ needs.plan.outputs.version }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/published-windows-${{ matrix.target }}-receipt.json

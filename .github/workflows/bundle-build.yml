@@ -141,7 +141,7 @@ jobs:
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock packages/kuru-memory/mise.lock Cargo.lock
       - name: Upload the built archive and its pins
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bundle-build-aarch64-pc-windows-msvc
           path: ${{ runner.temp }}/bundle-artifact
@@ -149,7 +149,7 @@ jobs:
           retention-days: 30
       - name: Upload both builds for diagnosis
         if: failure() || cancelled()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bundle-build-diagnostics
           path: |
@@ -314,7 +314,7 @@ jobs:
         id: input
         run: printf 'artifact=bundle-input-%s\n' "$BUILT_TARGET" >> "$GITHUB_OUTPUT"
       - name: Upload the pin-verified archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.input.outputs.artifact }}
           path: ${{ runner.temp }}/bundle-input/${{ env.BUILT_ARCHIVE }}

@@ -159,7 +159,7 @@ jobs:
       # One artifact per label, named without the attempt so that rerun
       # partitions import the set this run already verified.
       - name: Publish the ubuntu-latest bundle inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-bundle-inputs-ubuntu-latest
           path: ${{ runner.temp }}/kuru-bundle-inputs/ubuntu-latest
@@ -167,7 +167,7 @@ jobs:
           compression-level: 0
           overwrite: true
       - name: Publish the ubuntu-24.04-arm bundle inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-bundle-inputs-ubuntu-24.04-arm
           path: ${{ runner.temp }}/kuru-bundle-inputs/ubuntu-24.04-arm
@@ -175,7 +175,7 @@ jobs:
           compression-level: 0
           overwrite: true
       - name: Publish the macos-latest bundle inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-bundle-inputs-macos-latest
           path: ${{ runner.temp }}/kuru-bundle-inputs/macos-latest
@@ -183,7 +183,7 @@ jobs:
           compression-level: 0
           overwrite: true
       - name: Publish the windows-latest bundle inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-bundle-inputs-windows-latest
           path: ${{ runner.temp }}/kuru-bundle-inputs/windows-latest
@@ -191,7 +191,7 @@ jobs:
           compression-level: 0
           overwrite: true
       - name: Publish the windows-11-arm bundle inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-bundle-inputs-windows-11-arm
           path: ${{ runner.temp }}/kuru-bundle-inputs/windows-11-arm
@@ -387,14 +387,14 @@ jobs:
         run: mise run //packages/kuru-delivery:test:partition
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock Cargo.lock
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-coverage-ubuntu-24.04-arm-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.partition }}-${{ github.run_attempt }}
           if-no-files-found: error
       - name: Upload failed partition diagnostics
         if: ${{ failure() || cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-coverage-diagnostics-ubuntu-24.04-arm-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.partition }}-${{ github.run_attempt }}
@@ -479,7 +479,7 @@ jobs:
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock Cargo.lock
       # merge-summary.json only: an uninstrumented merge writes no LCOV.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: ci-coverage-ubuntu-24.04-arm-attempt-${{ github.run_attempt }}
@@ -542,7 +542,7 @@ jobs:
         run: git diff --exit-code -- mise.lock Cargo.lock
       - name: Upload native platform coverage
         if: ${{ matrix.mode == 'coverage' && !cancelled() && (success() || hashFiles('target/kuru-platform-coverage.lcov') != '') }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-native-platform-${{ matrix.target }}
           path: target/kuru-platform-coverage.lcov
@@ -652,7 +652,7 @@ jobs:
       # Uploaded after a failed gate as well, for diagnosis.
       - name: Upload the open-time records
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-open-time-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-open-time
@@ -798,7 +798,7 @@ jobs:
         run: git diff --exit-code -- mise.lock Cargo.lock
       - name: Upload the usage scan records and timelines
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-usage-scan-attempt-${{ github.run_attempt }}
           path: |

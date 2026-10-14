@@ -407,14 +407,14 @@ jobs:
       # Only a successful partition publishes receipt evidence under the name
       # the merge downloads; a failed partition publishes its diagnostics under
       # a name that the merge's pattern cannot match.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.partition }}-${{ github.run_attempt }}
           if-no-files-found: error
       - name: Upload failed partition diagnostics
         if: ${{ failure() || cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ inputs.artifact-prefix }}-coverage-diagnostics-${{ inputs.os }}-partition-${{ matrix.partition }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.partition }}-${{ github.run_attempt }}
@@ -519,7 +519,7 @@ jobs:
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
       # The merged LCOV and merge-summary.json, whose per-partition table
       # records cache hits, phase times and profile counts.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-attempt-${{ github.run_attempt }}
@@ -626,7 +626,7 @@ jobs:
       # caller's label.
       - name: Publish the installed release binary for the open-time gate
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ inputs.artifact-prefix }}-release-binary-${{ inputs.os }}
           path: ${{ runner.temp }}/kuru-bin/kuru
