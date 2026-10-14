@@ -2403,9 +2403,9 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width",
- "usage-argv",
+ "usage-argv 6.12.0",
  "usage-cli",
- "usage-lib",
+ "usage-lib 6.12.0",
  "uuid",
  "vt100",
 ]
@@ -4944,10 +4944,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d81d0292a01b769c28c094fc9da0596f49a4c78a6da88ffda53de9eafefc5b20"
 
 [[package]]
-name = "usage-cli"
-version = "6.12.0"
+name = "usage-argv"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35e3113a42d8ac2e396ef0729cd6281963f9d6865eb828a796e2a7ed09b70e9e"
+checksum = "3f31e087c07f22ebec8bdfacc0882da2acc40f4cebe7f7076c063989f3ed8591"
+
+[[package]]
+name = "usage-cli"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "884fa9af78961ecb142d4bf35c1a0c8fe7c9497d25b5c58388a983a415c7bf31"
 dependencies = [
  "env_logger",
  "exec",
@@ -4965,20 +4971,19 @@ dependencies = [
  "tera",
  "thiserror 2.0.21",
  "tokio",
- "usage-lib",
+ "usage-lib 7.0.0",
  "usage-rs",
 ]
 
 [[package]]
 name = "usage-derive"
-version = "6.12.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6731f7bc17e630509b9c254ac13049dfc02451011d9dc9eb52865157304c03dc"
+checksum = "342a9df274d3e00d174204e0f9a6f7708dea1b23ee5004db07cbc881e4e57cab"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
- "toml",
 ]
 
 [[package]]
@@ -5000,36 +5005,58 @@ dependencies = [
  "tera",
  "thiserror 2.0.21",
  "unicode-width",
- "usage-argv",
+ "usage-argv 6.12.0",
+ "winnow",
+]
+
+[[package]]
+name = "usage-lib"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cdf41d75ec80333e3fef9dd05593cf7c180975a122bc0ee52a08869f78afaee"
+dependencies = [
+ "indexmap 2.14.2",
+ "itertools 0.15.0",
+ "log",
+ "num-traits",
+ "pulldown-cmark",
+ "regex",
+ "roff",
+ "semver",
+ "serde",
+ "tera",
+ "thiserror 2.0.21",
+ "unicode-width",
+ "usage-argv 7.0.0",
  "usage-validation",
  "winnow",
 ]
 
 [[package]]
 name = "usage-rs"
-version = "6.12.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b770a1ed5bf2c95707490f612e0c5597d7c664c6e37b60772ead3a8359526115"
+checksum = "6f78bceaa649166d281dc30c457b11e82509b757b710c20def341a02088688ff"
 dependencies = [
- "usage-argv",
+ "usage-argv 7.0.0",
  "usage-derive",
  "usage-test",
 ]
 
 [[package]]
 name = "usage-test"
-version = "6.12.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1011b07f3e21381eaaada43daeb5dce92469bc25c87921e6c957b2c3ba5ae716"
+checksum = "c03023025a29589b93406b11055b5740f74884b766a71de062134413f150a779"
 dependencies = [
- "usage-argv",
+ "usage-argv 7.0.0",
 ]
 
 [[package]]
 name = "usage-validation"
-version = "6.12.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45d62e7271a029ae2087e1e00a79fbe57dffa3ff8bd9b00f78a34be9013bf76d"
+checksum = "08e63f4dce1e5f4553821c1dfd3cc80f816ba60b29c5718d37e1d4047b0a2d6e"
 dependencies = [
  "expr-lang",
 ]
