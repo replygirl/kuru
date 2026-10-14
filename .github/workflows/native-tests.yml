@@ -662,7 +662,7 @@ jobs:
         run: mise run //packages/kuru-delivery:test:previous-release-update
       - name: Set up native Homebrew acceptance
         if: runner.os != 'Windows'
-        uses: Homebrew/actions/setup-homebrew@e99025eb970cfa124b8284a35463d87426917478 # 2026.09.28.1
+        uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
         with:
           stable: true
       - name: Accept source-installed executable through native Homebrew
