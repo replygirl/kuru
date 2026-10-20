@@ -1,6 +1,9 @@
 //! Owned public display identities and bounded retained transcript pages.
 
-use std::{collections::VecDeque, ops::Deref};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    ops::Deref,
+};
 
 use kuru_memory::{PublicTranscriptCursor, PublicTranscriptEntry, PublicTranscriptPage};
 use sha2::{Digest, Sha256};
@@ -86,6 +89,17 @@ pub(super) struct Item {
     pub(super) projection: uuid::Uuid,
     pub(super) turn_key: Option<String>,
     local: bool,
+    /// For a local item: the last persisted-identity item displayed before it
+    /// (`None` when it preceded every record). Page installs re-place the item
+    /// after this anchor instead of moving it to the tail.
+    anchor: Option<ItemId>,
+}
+
+/// Locals removed before public-page arithmetic, with the previous order of
+/// every item so a local whose anchor left the window keeps its relative place.
+struct Detached {
+    order: Vec<ItemId>,
+    locals: Vec<((String, String), Item)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +171,7 @@ pub(super) fn turn_key(session: &str, turn: &str, view: &str) -> String {
 
 impl Transcript {
     pub fn push(&mut self, text: (String, String)) {
+        let anchor = self.persisted_tail();
         self.append(
             text,
             Item {
@@ -164,9 +179,20 @@ impl Transcript {
                 id: ItemId::Local(uuid::Uuid::new_v4()),
                 turn_key: None,
                 local: true,
+                anchor,
             },
         );
         self.bound_locals();
+    }
+
+    /// The last item with a persisted identity, including in-flight user and
+    /// answer items already bound to their turn.
+    fn persisted_tail(&self) -> Option<ItemId> {
+        self.items
+            .iter()
+            .rev()
+            .find(|item| !matches!(item.id, ItemId::Local(_)))
+            .map(|item| item.id.clone())
     }
 
     pub fn clear(&mut self) {
@@ -234,7 +260,12 @@ impl Transcript {
     }
 
     pub(super) fn cursor_for(&self, id: &ItemId) -> Option<Option<PublicTranscriptCursor>> {
-        let index = self.items.iter().position(|item| &item.id == id)?;
+        // Pages count public items only; locals have no page cursor.
+        let index = self
+            .items
+            .iter()
+            .filter(|item| !item.local)
+            .position(|item| &item.id == id)?;
         let mut start = 0;
         for page in &self.pages {
             if index < start + page.items {
@@ -259,19 +290,10 @@ impl Transcript {
         page.pending = None;
         let mut incoming = Self::from_page(page);
         incoming.pages[0].entry = old.next.clone();
-        // A persisted page may now contain a formerly local completed turn.
-        // Keep the canonical identity once, without counting this as omission.
-        for index in (0..self.items.len()).rev() {
-            if self.items[index].local
-                && incoming
-                    .items
-                    .iter()
-                    .any(|item| item.id == self.items[index].id)
-            {
-                self.items.remove(index);
-                self.text.remove(index);
-            }
-        }
+        // Public-page arithmetic below sees only public items; a persisted page
+        // may also now contain a formerly local completed turn, which
+        // `attach` keeps once, without counting it as omission.
+        let detached = self.detach();
         incoming.text.append(&mut self.text);
         incoming.items.append(&mut self.items);
         self.text = incoming.text;
@@ -284,6 +306,7 @@ impl Transcript {
             self.text.drain(start..start + removed.items);
             self.items.drain(start..start + removed.items);
         }
+        self.attach(detached);
         self.epoch = self.epoch.wrapping_add(1);
         true
     }
@@ -296,10 +319,12 @@ impl Transcript {
         if query.is_empty() {
             return None;
         }
-        let public_items = self.pages.iter().map(|page| page.items).sum::<usize>();
         let mut reached = after.is_none();
-        for index in (0..public_items.min(self.len())).rev() {
+        for index in (0..self.len()).rev() {
             let item = &self.items[index];
+            if item.local {
+                continue;
+            }
             let start = if let Some((id, byte)) = after.filter(|(id, _)| *id == item.id) {
                 let _ = id;
                 reached = true;
@@ -344,17 +369,7 @@ impl Transcript {
         }
         let mut incoming = Self::from_page(page);
         incoming.pages[0].entry = entry;
-        for index in (0..self.items.len()).rev() {
-            if self.items[index].local
-                && incoming
-                    .items
-                    .iter()
-                    .any(|item| item.id == self.items[index].id)
-            {
-                self.items.remove(index);
-                self.text.remove(index);
-            }
-        }
+        let detached = self.detach();
         let insert = self.pages.iter().map(|page| page.items).sum::<usize>();
         self.text.splice(insert..insert, incoming.text);
         self.items.splice(insert..insert, incoming.items);
@@ -365,6 +380,7 @@ impl Transcript {
             self.text.drain(..removed.items);
             self.items.drain(..removed.items);
         }
+        self.attach(detached);
         self.epoch = self.epoch.wrapping_add(1);
         true
     }
@@ -377,22 +393,76 @@ impl Transcript {
         let epoch = self.epoch;
         let omitted = self.local_omitted;
         let protected = self.protected.clone();
-        let mut locals = self
-            .text
-            .drain(..)
-            .zip(self.items.drain(..))
-            .filter(|(_, item)| item.local)
-            .collect::<Vec<_>>();
+        let detached = self.detach();
         *self = incoming;
-        for (text, item) in locals.drain(..) {
-            if !self.items.iter().any(|retained| retained.id == item.id) {
-                self.append(text, item);
-            }
-        }
+        self.attach(detached);
         self.protected = protected.filter(|id| self.items.iter().any(|item| &item.id == id));
         self.bound_locals();
         self.epoch = epoch.wrapping_add(1);
         self.local_omitted = self.local_omitted.saturating_add(omitted);
+    }
+
+    /// Remove every local item, leaving public items contiguous by page.
+    fn detach(&mut self) -> Detached {
+        let order = self.items.iter().map(|item| item.id.clone()).collect();
+        let mut locals = Vec::new();
+        let mut index = 0;
+        while index < self.items.len() {
+            if self.items[index].local {
+                locals.push((self.text.remove(index), self.items.remove(index)));
+            } else {
+                index += 1;
+            }
+        }
+        Detached { order, locals }
+    }
+
+    /// Re-place detached locals in their previous order: after their anchor
+    /// (and after locals already placed there), before every public record
+    /// when they preceded all of them, before the next surviving later item
+    /// when the anchor left this window, and otherwise at the end. A local
+    /// whose identity the incoming items already hold (a bound turn now
+    /// persisted) is replaced by that record.
+    fn attach(&mut self, detached: Detached) {
+        let Detached { order, locals } = detached;
+        let mut placed = BTreeSet::new();
+        let mut front = 0usize;
+        for (text, item) in locals {
+            if self.items.iter().any(|retained| retained.id == item.id) {
+                continue;
+            }
+            let position = |id: &ItemId| self.items.iter().position(|retained| &retained.id == id);
+            let index = match &item.anchor {
+                None => front,
+                Some(anchor) => {
+                    if let Some(at) = position(anchor) {
+                        let mut index = at + 1;
+                        while self
+                            .items
+                            .get(index)
+                            .is_some_and(|next| placed.contains(&next.id))
+                        {
+                            index += 1;
+                        }
+                        index
+                    } else {
+                        order
+                            .iter()
+                            .skip_while(|id| **id != item.id)
+                            .skip(1)
+                            .find_map(position)
+                            .unwrap_or(self.items.len())
+                    }
+                }
+            };
+            if index <= front {
+                front += 1;
+            }
+            placed.insert(item.id.clone());
+            self.text.insert(index, text);
+            self.items.insert(index, item);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     fn append(&mut self, text: (String, String), item: Item) {
@@ -442,6 +512,7 @@ impl Transcript {
                             id: ItemId::Legacy(sequence),
                             turn_key: None,
                             local: false,
+                            anchor: None,
                         },
                     );
                 }
@@ -464,9 +535,11 @@ impl Transcript {
         });
         if let Some(record) = page.pending {
             let first = transcript.len();
+            let anchor = transcript.persisted_tail();
             transcript.append_turn(record, &page.view);
             for item in &mut transcript.items[first..] {
                 item.local = true;
+                item.anchor = anchor.clone();
             }
         }
         transcript
@@ -485,6 +558,7 @@ impl Transcript {
                     },
                     turn_key: Some(key.clone()),
                     local: false,
+                    anchor: None,
                 },
             );
         }
@@ -504,6 +578,7 @@ impl Transcript {
                     },
                     turn_key: Some(key.clone()),
                     local: false,
+                    anchor: None,
                 },
             );
         }
@@ -593,6 +668,247 @@ mod tests {
         }
     }
 
+    /// A newest page holding `turns` (oldest first), as the reader returns it.
+    fn newest(turns: &[usize]) -> PublicTranscriptPage {
+        let mut records = turns
+            .iter()
+            .flat_map(|turn| page(*turn, None, true).records)
+            .collect::<Vec<_>>();
+        records.reverse();
+        PublicTranscriptPage {
+            total_rows: records.len() as u64,
+            records,
+            ..page(0, None, true)
+        }
+    }
+
+    fn texts(transcript: &Transcript) -> Vec<&str> {
+        transcript.iter().map(|(_, text)| text.as_str()).collect()
+    }
+
+    #[test]
+    fn help_output_keeps_its_place_when_the_next_turn_is_persisted() {
+        let mut transcript = Transcript::from_page(newest(&[1]));
+        transcript.push(("help".into(), "help output".into()));
+        transcript.push(("user".into(), "question-2".into()));
+        transcript.bind_user("session", "2", "main");
+        transcript.push(("speaker".into(), "answer-2".into()));
+        transcript.bind_answer("session", "2", "main");
+        transcript.install_newest(newest(&[1, 2]));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-1",
+                "answer-1",
+                "help output",
+                "question-2",
+                "answer-2"
+            ]
+        );
+        transcript.install_newest(newest(&[1, 2, 3]));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-1",
+                "answer-1",
+                "help output",
+                "question-2",
+                "answer-2",
+                "question-3",
+                "answer-3"
+            ]
+        );
+    }
+
+    #[test]
+    fn error_lines_and_notices_after_an_answer_stay_after_that_answer() {
+        let mut transcript = Transcript::from_page(newest(&[1]));
+        transcript.push(("user".into(), "question-2".into()));
+        transcript.bind_user("session", "2", "main");
+        transcript.push(("speaker".into(), "answer-2".into()));
+        transcript.bind_answer("session", "2", "main");
+        transcript.push(("kuru".into(), "omission notice".into()));
+        transcript.push(("user".into(), "question-3".into()));
+        transcript.bind_user("session", "3", "main");
+        transcript.push(("error".into(), "turn failed".into()));
+        // Turn 3 failed before persistence: its local user item and error stay.
+        transcript.install_newest(newest(&[1, 2]));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-1",
+                "answer-1",
+                "question-2",
+                "answer-2",
+                "omission notice",
+                "question-3",
+                "turn failed"
+            ]
+        );
+        assert_eq!(transcript.local_omitted, 0);
+    }
+
+    #[test]
+    fn locals_without_records_before_them_stay_first_and_vanished_anchors_keep_relative_place() {
+        let mut transcript = Transcript::default();
+        transcript.push(("help".into(), "first help".into()));
+        transcript.push(("status".into(), "first status".into()));
+        transcript.install_newest(newest(&[1, 2]));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "first help",
+                "first status",
+                "question-1",
+                "answer-1",
+                "question-2",
+                "answer-2"
+            ]
+        );
+
+        let mut transcript = Transcript::from_page(newest(&[1]));
+        transcript.push(("help".into(), "old help".into()));
+        transcript.install_newest(newest(&[1, 2, 3]));
+        // The anchor scrolls out of the newest window: the help output stays
+        // above the later surviving records instead of rejoining the tail.
+        transcript.install_newest(newest(&[2, 3, 4]));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "old help",
+                "question-2",
+                "answer-2",
+                "question-3",
+                "answer-3",
+                "question-4",
+                "answer-4"
+            ]
+        );
+        // The retained anchor restores the exact place when it returns.
+        transcript.install_newest(newest(&[1, 2]));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-1",
+                "answer-1",
+                "old help",
+                "question-2",
+                "answer-2"
+            ]
+        );
+    }
+
+    #[test]
+    fn interleaved_locals_do_not_change_public_page_eviction_cursors_or_search() {
+        let mut transcript = Transcript::from_page(page(2, Some(cursor(1)), true));
+        let newest_answer = transcript.item_id(1).unwrap().clone();
+        transcript.push(("help".into(), "needle in help".into()));
+        let help = transcript.item_id(2).unwrap().clone();
+        assert!(transcript.install_older(page(1, Some(cursor(0)), true)));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-1",
+                "answer-1",
+                "question-2",
+                "answer-2",
+                "needle in help"
+            ]
+        );
+        assert_eq!(transcript.cursor_for(&help), None);
+        let older_question = transcript.item_id(0).unwrap().clone();
+        assert_eq!(
+            transcript.cursor_for(&older_question),
+            Some(Some(cursor(1)))
+        );
+        assert_eq!(transcript.cursor_for(&newest_answer), Some(None));
+        assert!(transcript.next_match("needle", None).is_none());
+        assert_eq!(
+            transcript.next_match("answer-2", None).map(|found| found.0),
+            Some(newest_answer.clone())
+        );
+        // Evicting the newest page keeps the local; its anchor left the
+        // window and nothing later survives, so it waits at the end.
+        assert!(transcript.install_older(page(0, None, true)));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-0",
+                "answer-0",
+                "question-1",
+                "answer-1",
+                "needle in help"
+            ]
+        );
+        assert_eq!(transcript.pages.len(), 2);
+        assert_eq!(transcript.omitted_records(), 1);
+        // The newer page returns after its anchor, and the oldest page leaves.
+        assert!(transcript.install_newer(page(2, Some(cursor(1)), true), None));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-1",
+                "answer-1",
+                "question-2",
+                "answer-2",
+                "needle in help"
+            ]
+        );
+        assert_eq!(transcript.cursor_for(&newest_answer), Some(None));
+    }
+
+    #[test]
+    fn local_bounds_and_omission_counts_survive_reanchoring() {
+        let mut transcript = Transcript::from_page(newest(&[1]));
+        for index in 0..LOCAL_ITEMS + 2 {
+            transcript.push(("kuru".into(), format!("local-{index}")));
+        }
+        assert_eq!(transcript.local_omitted, 2);
+        assert_eq!(transcript.len(), 2 + LOCAL_ITEMS);
+        transcript.install_newest(newest(&[1, 2]));
+        assert_eq!(transcript.local_omitted, 2);
+        assert_eq!(transcript.len(), 4 + LOCAL_ITEMS);
+        assert_eq!(transcript[2].1, "local-2");
+        assert_eq!(
+            transcript[2 + LOCAL_ITEMS - 1].1,
+            format!("local-{}", LOCAL_ITEMS + 1)
+        );
+        assert_eq!(transcript[2 + LOCAL_ITEMS].1, "question-2");
+    }
+
+    #[test]
+    fn pending_turn_items_follow_the_last_record_and_yield_to_the_persisted_turn() {
+        let mut pending = newest(&[1]);
+        pending.pending = page(2, None, true).records.pop().map(|entry| match entry {
+            PublicTranscriptEntry::Turn { record } => record,
+            PublicTranscriptEntry::Legacy { .. } => unreachable!("turn fixture"),
+        });
+        let mut transcript = Transcript::from_page(pending);
+        transcript.push(("help".into(), "help output".into()));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-1",
+                "answer-1",
+                "question-2",
+                "answer-2",
+                "help output"
+            ]
+        );
+        transcript.install_newest(newest(&[1, 2]));
+        assert_eq!(
+            texts(&transcript),
+            [
+                "question-1",
+                "answer-1",
+                "question-2",
+                "answer-2",
+                "help output"
+            ]
+        );
+        assert!(transcript.items.iter().filter(|item| item.local).count() == 1);
+    }
+
     #[test]
     fn page_eviction_keeps_canonical_ids_anchors_and_exact_record_counts() {
         let mut transcript = Transcript::from_page(page(2, Some(cursor(1)), true));
@@ -630,6 +946,8 @@ mod tests {
         );
         assert!(projected.next_match("Needle", None).is_none());
         let mut current = Transcript::from_page(page(1, None, true));
+        // Anchored to turn 1, which the projected search page does not hold,
+        // and nothing later survives: the notice keeps the tail.
         current.push(("kuru".into(), "current-operation notice".into()));
         let notice = current.item_id(2).unwrap().clone();
         current.install_projection(projected);

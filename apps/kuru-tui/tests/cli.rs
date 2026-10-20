@@ -1909,6 +1909,21 @@ fn oversized_instruction_is_reported_before_usable_project_dispatch() {
 }
 
 #[test]
+fn memory_long_help_lists_the_retention_controls() {
+    let env = Sandbox::new();
+    let help = env.success(&["memory", "--help"]);
+    for control in [
+        "Memory and chat do not expire automatically.",
+        "kuru memory notes ID",
+        "kuru memory export --format json --output PATH",
+        "kuru memory forget ID --note SEQUENCE",
+        "kuru memory purge --help",
+    ] {
+        assert!(help.contains(control), "{control}: {help}");
+    }
+}
+
+#[test]
 fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     let env = Sandbox::new();
     assert!(env.success(&["--help"]).contains("peer"));
@@ -4459,7 +4474,7 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     assert_memory_progress(&cold_stderr);
     assert!(cold_stderr.contains("Memory is ready at"), "{cold_stderr}");
     assert!(
-        cold_stderr.contains("kuru memory notes ID"),
+        cold_stderr.contains("`kuru memory --help`"),
         "{cold_stderr}"
     );
 

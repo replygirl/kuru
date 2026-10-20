@@ -4335,7 +4335,7 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         assert_creating_kept(&terminal.output)?;
     }
     let expected = if expect_notice {
-        vec!["KURU", "enter send", "Memory is ready at"]
+        vec!["KURU", "enter send", "Memory ready ·"]
     } else {
         vec!["KURU", "enter send"]
     };
@@ -4344,7 +4344,7 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         if expect_notice {
             &[]
         } else {
-            &["Memory is ready at"]
+            &["Memory ready ·"]
         },
         sandbox.startup_timeout,
     )?;

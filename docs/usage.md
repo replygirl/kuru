@@ -29,7 +29,7 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | `/sessions` | Open the session picker; Enter resumes, Delete removes, Ctrl+R restores, Ctrl+L renames, and Ctrl+F opens settled fork boundaries |
 | `/resume SESSION_ID` | Resume one exact active session |
 | `/export [PATH]` | Export the current public session as Markdown |
-| `/status` | Show local session, project, selections, turns, and known usage without a provider call |
+| `/status` | Show local session, project, memory directory, selections, turns, and known usage without a provider call |
 | `/tools` | Inspect filtered tools and disabled/live/stale/degraded MCP aliases without a provider call |
 | `/mcp login [--device\|--no-browser] ALIAS` | Sign in to one OAuth-enabled MCP alias |
 | `/mcp status ALIAS` | Inspect redacted local MCP authorization and availability state |
@@ -77,8 +77,15 @@ browser.
 Tab completion changes only the command name before the first argument; editing
 the draft starts a new completion cycle. `/clear` drops rendered conversation rows
 from this terminal, not durable turns, usage, or the current session. A resumed
-session still has its stored history. `/status` reports the current local view;
-it does not ask the provider for an update.
+session still has its stored history. `/status` reports the current local view,
+including a `Memory:` line with the project's escaped memory directory; it does
+not ask the provider for an update.
+
+The first time Kuru opens a project's memory, the status line above the composer
+shows `Memory ready · kept until removed · /status · "DIRECTORY"`. It stays until
+your first key or paste, is not part of the conversation, and is shown once per
+project. Command output and notices such as `/help` stay where they appeared in
+the conversation as later turns complete.
 
 You can add a terminal prompt command as `.kuru/commands/NAME.md` in the project
 or `commands/NAME.md` under Kuru's user configuration directory. The Markdown

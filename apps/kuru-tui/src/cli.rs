@@ -172,6 +172,7 @@ pub enum Command {
         command: Option<SessionCommand>,
     },
     /// Inspect this project's memory store and revision history.
+    #[command(after_long_help = MEMORY_CONTROLS)]
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
@@ -530,6 +531,15 @@ pub fn doctor_exit_code(error: &anyhow::Error) -> Option<i32> {
         .downcast_ref::<crate::doctor::DoctorExit>()
         .map(|exit| exit.0)
 }
+
+/// Retention controls referenced by the first-run memory disclosure.
+const MEMORY_CONTROLS: &str = "\
+Memory and chat do not expire automatically.
+
+  kuru memory notes ID                             Read one peer or relationship's notes
+  kuru memory export --format json --output PATH   Export every record from one snapshot
+  kuru memory forget ID --note SEQUENCE            Change one active note; prior revisions remain
+  kuru memory purge --help                         Review whole-project removal";
 
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
