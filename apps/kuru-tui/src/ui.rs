@@ -1842,6 +1842,12 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
     })
 }
 
+fn memory_directory(status: Result<kuru_memory::MemoryStatus>) -> Option<String> {
+    status
+        .ok()
+        .map(|status| crate::memory_notice::display_directory(&status.directory))
+}
+
 fn transcript_from_public_page(page: PublicTranscriptPage) -> Transcript {
     Transcript::from_page(page)
 }
@@ -2934,9 +2940,8 @@ where
     view.theme = Theme::new(&harness.config.ui, terminal_signals.color_depth);
     let permission_service = harness.permission_service();
     refresh_permission_state(&permission_service, &mut view)?;
-    view.memory_directory = Some(crate::memory_notice::display_directory(
-        &harness.memory().status().await?.directory,
-    ));
+    // Only `/status` reads this; a failed status read must not stop the chat.
+    view.memory_directory = memory_directory(harness.memory().status().await);
     view.memory_notice = notice.as_ref().map(MemoryNotice::indicator);
     let mut events = harness.subscribe();
     let mut progress = harness.subscribe_progress();
@@ -5149,6 +5154,7 @@ mod tests {
         view.terminal_event(TerminalEvent::Paste("x".into()));
         assert!(view.memory_notice.is_none());
 
+        view.memory_directory = memory_directory(Err(anyhow::anyhow!("injected status failure")));
         assert!(
             view.current_session_status()
                 .contains("\nMemory: unavailable\n")

@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     ops::Deref,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use kuru_memory::{PublicTranscriptCursor, PublicTranscriptEntry, PublicTranscriptPage};
@@ -13,6 +14,14 @@ use super::project_transcript_message;
 pub(super) const PAGE_RECORDS: usize = 32;
 const LOCAL_ITEMS: usize = 128;
 const LOCAL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Creation order of local items across every projection; positions no
+/// longer imply age once locals are re-placed by anchor.
+static LOCAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_local_sequence() -> u64 {
+    LOCAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum ItemId {
@@ -93,6 +102,8 @@ pub(super) struct Item {
     /// (`None` when it preceded every record). Page installs re-place the item
     /// after this anchor instead of moving it to the tail.
     anchor: Option<ItemId>,
+    /// Local creation order (0 for public items); the bound evicts by age.
+    sequence: u64,
 }
 
 /// Locals removed before public-page arithmetic, with the previous order of
@@ -180,6 +191,7 @@ impl Transcript {
                 turn_key: None,
                 local: true,
                 anchor,
+                sequence: next_local_sequence(),
             },
         );
         self.bound_locals();
@@ -446,6 +458,8 @@ impl Transcript {
                         }
                         index
                     } else {
+                        // Linear in the saved order per orphaned local; both
+                        // are bounded by LOCAL_ITEMS plus two public pages.
                         order
                             .iter()
                             .skip_while(|id| **id != item.id)
@@ -462,7 +476,6 @@ impl Transcript {
             self.text.insert(index, text);
             self.items.insert(index, item);
         }
-        self.epoch = self.epoch.wrapping_add(1);
     }
 
     fn append(&mut self, text: (String, String), item: Item) {
@@ -483,10 +496,14 @@ impl Transcript {
             }
         }
         while count > LOCAL_ITEMS || bytes > LOCAL_BYTES {
+            // Evict the oldest local by creation order, not by position.
             let Some(index) = self
                 .items
                 .iter()
-                .position(|item| item.local && Some(&item.id) != self.protected.as_ref())
+                .enumerate()
+                .filter(|(_, item)| item.local && Some(&item.id) != self.protected.as_ref())
+                .min_by_key(|(_, item)| item.sequence)
+                .map(|(index, _)| index)
             else {
                 break;
             };
@@ -513,6 +530,7 @@ impl Transcript {
                             turn_key: None,
                             local: false,
                             anchor: None,
+                            sequence: 0,
                         },
                     );
                 }
@@ -540,6 +558,7 @@ impl Transcript {
             for item in &mut transcript.items[first..] {
                 item.local = true;
                 item.anchor = anchor.clone();
+                item.sequence = next_local_sequence();
             }
         }
         transcript
@@ -559,6 +578,7 @@ impl Transcript {
                     turn_key: Some(key.clone()),
                     local: false,
                     anchor: None,
+                    sequence: 0,
                 },
             );
         }
@@ -579,6 +599,7 @@ impl Transcript {
                     turn_key: Some(key.clone()),
                     local: false,
                     anchor: None,
+                    sequence: 0,
                 },
             );
         }
@@ -874,6 +895,36 @@ mod tests {
             format!("local-{}", LOCAL_ITEMS + 1)
         );
         assert_eq!(transcript[2 + LOCAL_ITEMS].1, "question-2");
+    }
+
+    #[test]
+    fn local_bound_evicts_the_oldest_local_not_the_first_positioned() {
+        let mut unanchored = Transcript::default();
+        unanchored.push(("help".into(), "unanchored".into()));
+        unanchored.install_newest(newest(&[1]));
+        for index in 0..LOCAL_ITEMS {
+            unanchored.push(("kuru".into(), format!("later-{index}")));
+        }
+        // The unanchored local is first by position and also oldest.
+        assert_eq!(unanchored.local_omitted, 1);
+        assert!(!unanchored.iter().any(|(_, text)| text == "unanchored"));
+
+        // A newer local re-placed in front of an older one, as an unanchored
+        // or orphaned local can be: the bound evicts the older, not the first.
+        let mut mixed = Transcript::from_page(newest(&[1]));
+        mixed.push(("kuru".into(), "older tail".into()));
+        let older = mixed.item_id(2).unwrap().clone();
+        let mut front = Transcript::default();
+        front.push(("help".into(), "newer front".into()));
+        let (text, item) = (front.text.remove(0), front.items.remove(0));
+        mixed.text.insert(0, text);
+        mixed.items.insert(0, item);
+        for index in 0..LOCAL_ITEMS - 1 {
+            mixed.push(("kuru".into(), format!("fill-{index}")));
+        }
+        assert_eq!(mixed.local_omitted, 1);
+        assert_eq!(mixed[0].1, "newer front");
+        assert!(!mixed.items.iter().any(|item| item.id == older));
     }
 
     #[test]
