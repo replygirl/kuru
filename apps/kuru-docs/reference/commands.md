@@ -70,7 +70,7 @@ stack and displays a sanitized session suffix. Other terminals keep their title.
 | `/sessions`                                  | Open the session picker for resume, rename, remove, restore and fork                     |
 | `/resume SESSION_ID`                         | Resume one exact active session                                                          |
 | `/export [PATH]`                             | Export this public session as Markdown                                                   |
-| `/status`                                    | Show the current session, project, selections, turns, and known usage locally            |
+| `/status`                                    | Show the session, project, memory directory, selections, turns, and known usage locally  |
 | `/config`                                    | Inspect the captured effective configuration, source layers, and leaf provenance locally |
 | `/compact [ID]`                              | Compact retained context for one or all active identities                                |
 | `/parts`                                     | Inspect active parts and relationships                                                   |
@@ -103,7 +103,7 @@ Model, effort, and framework selections made here are [saved for the project](./
 
 Ctrl-C cancels an active headless run and waits for its operation and memory cleanup. Confirmed compaction notices remain on stderr. Plain/final JSON output begins after a completed turn; opt-in stream JSON can already contain public progress. Interrupting output never undoes a completed turn.
 
-Tab completes only the leading command name and leaves its arguments unchanged. `/clear` affects only the current terminal view: stored conversation, usage, and session identity remain available, including after resume. `/status` uses the local session snapshot and makes no provider request.
+Tab completes only the leading command name and leaves its arguments unchanged. `/clear` affects only the current terminal view: stored conversation, usage, and session identity remain available, including after resume. `/status` uses the local session snapshot, includes the escaped memory directory, and makes no provider request. Local output such as `/help` stays where it appeared as later turns complete.
 
 Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/NAME.md` under Kuru's user configuration directory. A file needs YAML `name` and `description` frontmatter followed by a nonempty Markdown prompt. `/NAME` sends the captured prompt as a normal turn; optional arguments are separately labeled literal text. It never runs a shell command. Built-in names win collisions, followed by project and user entries. After workspace trust, `/help` and Tab show only effective commands. Project entries join the complete base authority manifest; see [skills and custom prompts](./configuration#skills-and-custom-prompts).
 

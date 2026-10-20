@@ -13,7 +13,19 @@ const VERSION: u64 = 1;
 pub(crate) struct MemoryNotice {
     store: MemoryStore,
     key: String,
+    directory: String,
     text: String,
+}
+
+/// Bounded escaped representation of the actual selected directory, including
+/// spaces and control characters; shared by every memory disclosure surface.
+pub(crate) fn display_directory(directory: &std::path::Path) -> String {
+    format!("{directory:?}")
+}
+
+/// The persistent `/status` line naming where this project's memory lives.
+pub(crate) fn status_line(directory: &str) -> String {
+    format!("Memory: {directory} · kept until removed · kuru memory --help")
 }
 
 impl MemoryNotice {
@@ -22,7 +34,7 @@ impl MemoryNotice {
         let key = format!("{}{}", status.project, STATE_SUFFIX);
         let value = store.get(&key).await?;
         let Some(value) = value else {
-            return Ok(Some(Self::new(store, key, status.directory)));
+            return Ok(Some(Self::new(store, key, &status.directory)));
         };
         let version = value
             .get("version")
@@ -31,24 +43,28 @@ impl MemoryNotice {
         if version >= VERSION {
             return Ok(None);
         }
-        Ok(Some(Self::new(store, key, status.directory)))
+        Ok(Some(Self::new(store, key, &status.directory)))
     }
 
-    fn new(store: MemoryStore, key: String, directory: std::path::PathBuf) -> Self {
-        // Debug path formatting is a bounded escaped representation of the
-        // actual selected directory, including spaces and control characters.
-        let directory = format!("{directory:?}");
+    fn new(store: MemoryStore, key: String, directory: &std::path::Path) -> Self {
+        let directory = display_directory(directory);
         Self {
             store,
             key,
             text: format!(
-                "Memory is ready at {directory}. Memory and chat do not expire automatically. Read notes with `kuru memory notes ID`; export with `kuru memory export --format json --output PATH`; `kuru memory forget ID --note SEQUENCE` changes one active note while retaining prior revisions; review whole-project removal with `kuru memory purge --help`."
+                "Memory is ready at {directory}. Memory and chat do not expire automatically. See `kuru memory --help` to read, export, forget or purge it."
             ),
+            directory,
         }
     }
 
-    pub(crate) fn text(&self) -> &str {
-        &self.text
+    /// Interactive status-line indicator; the command reference lives in
+    /// `kuru memory --help` rather than in the conversation.
+    pub(crate) fn indicator(&self) -> String {
+        format!(
+            "Memory ready · kept until removed · /status · {}",
+            self.directory
+        )
     }
 
     /// Publish on stderr before committing the visible-version marker. Stdout,
@@ -116,15 +132,22 @@ mod tests {
             let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
             let cleanup_directory = store.status().await.unwrap().directory;
             let directory = format!("{cleanup_directory:?}");
-            assert!(notice.text().contains(&directory));
-            for control in [
-                "kuru memory notes ID",
-                "kuru memory export --format json --output PATH",
-                "kuru memory forget ID --note SEQUENCE",
-                "kuru memory purge --help",
-            ] {
-                assert!(notice.text().contains(control), "{control}");
-            }
+            assert!(notice.text.contains(&directory));
+            assert!(notice.text.starts_with("Memory is ready at "));
+            assert!(
+                notice
+                    .text
+                    .contains("Memory and chat do not expire automatically.")
+            );
+            assert!(notice.text.contains("`kuru memory --help`"));
+            assert_eq!(
+                notice.indicator(),
+                format!("Memory ready · kept until removed · /status · {directory}")
+            );
+            assert_eq!(
+                status_line(&directory),
+                format!("Memory: {directory} · kept until removed · kuru memory --help")
+            );
             notice.record().await.unwrap();
             assert!(
                 MemoryNotice::pending(store.clone())

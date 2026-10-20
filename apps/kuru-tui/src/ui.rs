@@ -311,6 +311,11 @@ pub struct View {
     last_frame_ms: u64,
     operation_start: Option<u64>,
     notice_until: u64,
+    /// First-run memory disclosure: shown in the status line until the first
+    /// key or paste, never on the transient-notice timer or in the transcript.
+    memory_notice: Option<String>,
+    /// Escaped managed memory directory reported by `/status`.
+    memory_directory: Option<String>,
     completion_locked: bool,
     completion_signal_pending: bool,
     transcript_navigation: transcript::Navigation,
@@ -621,6 +626,8 @@ impl View {
             last_frame_ms: 0,
             operation_start: None,
             notice_until: 0,
+            memory_notice: None,
+            memory_directory: None,
             completion_locked: false,
             completion_signal_pending: false,
             transcript_navigation: transcript::Navigation::default(),
@@ -726,9 +733,13 @@ impl View {
             .as_ref()
             .map_or_else(|| "Usage: unavailable".to_owned(), format_session_usage);
         format!(
-            "Session: {}\nProject: {}\nModel: {}\nEffort: {}\nMode: {}\nFocus: {}\nTurns: {}\n{}",
+            "Session: {}\nProject: {}\n{}\nModel: {}\nEffort: {}\nMode: {}\nFocus: {}\nTurns: {}\n{}",
             self.session,
             self.project,
+            self.memory_directory.as_deref().map_or_else(
+                || "Memory: unavailable".to_owned(),
+                crate::memory_notice::status_line
+            ),
             self.model,
             self.effort,
             self.mode,
@@ -1145,8 +1156,12 @@ impl View {
     pub fn terminal_event(&mut self, event: TerminalEvent) -> (bool, Option<String>) {
         let command = match event {
             TerminalEvent::Key(key) if key.kind == KeyEventKind::Release => return (false, None),
-            TerminalEvent::Key(key) => self.key(key),
+            TerminalEvent::Key(key) => {
+                self.memory_notice = None;
+                self.key(key)
+            }
             TerminalEvent::Paste(text) => {
+                self.memory_notice = None;
                 let search_owns_input = self.picker.is_none()
                     && self.permission_prompt.is_none()
                     && self.instruction_prompt.is_none()
@@ -1825,6 +1840,12 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
         runtime: project_runtime_snapshot(harness),
         usage: Some(harness.session_usage().await?),
     })
+}
+
+fn memory_directory(status: Result<kuru_memory::MemoryStatus>) -> Option<String> {
+    status
+        .ok()
+        .map(|status| crate::memory_notice::display_directory(&status.directory))
 }
 
 fn transcript_from_public_page(page: PublicTranscriptPage) -> Transcript {
@@ -2919,11 +2940,9 @@ where
     view.theme = Theme::new(&harness.config.ui, terminal_signals.color_depth);
     let permission_service = harness.permission_service();
     refresh_permission_state(&permission_service, &mut view)?;
-    if let Some(notice) = &notice {
-        view.transcript
-            .push(("system".into(), notice.text().into()));
-        view.show_scene = false;
-    }
+    // Only `/status` reads this; a failed status read must not stop the chat.
+    view.memory_directory = memory_directory(harness.memory().status().await);
+    view.memory_notice = notice.as_ref().map(MemoryNotice::indicator);
     let mut events = harness.subscribe();
     let mut progress = harness.subscribe_progress();
     let mut context = harness.subscribe_context();
@@ -3028,7 +3047,7 @@ where
                     preview_paint.painted(TokioInstant::now());
                 }
                 if let Some(notice) = notice.take() {
-                    // This frame contains the system transcript entry. Persist
+                    // This frame contains the status-line indicator. Persist
                     // only after it completed and before input is admitted.
                     notice.record().await?;
                 }
@@ -5109,6 +5128,41 @@ mod tests {
         assert_eq!(full.cursor, 3);
         assert_eq!(full.paste_chips.get_at(&full.input, 4), chip.as_ref());
         assert!(full.notice.as_deref().unwrap().contains("128 KiB"));
+    }
+
+    #[test]
+    fn memory_indicator_outlasts_transient_notices_and_clears_on_input() {
+        let mut view = fixture();
+        assert!(!rendered(&view).contains("Memory ready"));
+        view.memory_notice = Some("Memory ready · kept until removed · /status · \"/m\"".into());
+        assert!(view.transcript.is_empty() && view.show_scene);
+        assert!(rendered(&view).contains("i Memory ready · kept until removed · /status"));
+        view.notify("transient");
+        let frame = rendered(&view);
+        assert!(frame.contains("Memory ready ·") && !frame.contains("transient"));
+        assert!(view.advance_animation(Duration::from_millis(5_001)));
+        assert!(view.notice.is_none());
+        assert!(rendered(&view).contains("Memory ready ·"));
+        assert!(view.transcript.is_empty());
+        view.terminal_event(TerminalEvent::FocusLost);
+        view.terminal_event(TerminalEvent::Resize(120, 35));
+        assert!(view.memory_notice.is_some());
+        view.terminal_event(TerminalEvent::Key(key(KeyCode::Esc)));
+        assert!(view.memory_notice.is_none());
+        assert!(!rendered(&view).contains("Memory ready"));
+        view.memory_notice = Some("Memory ready".into());
+        view.terminal_event(TerminalEvent::Paste("x".into()));
+        assert!(view.memory_notice.is_none());
+
+        view.memory_directory = memory_directory(Err(anyhow::anyhow!("injected status failure")));
+        assert!(
+            view.current_session_status()
+                .contains("\nMemory: unavailable\n")
+        );
+        view.memory_directory = Some("\"/data/memory/abc\"".into());
+        assert!(view.current_session_status().contains(
+            "\nMemory: \"/data/memory/abc\" · kept until removed · kuru memory --help\n"
+        ));
     }
 
     #[test]

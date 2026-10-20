@@ -445,10 +445,7 @@ fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
     ensure!(
         notice.starts_with("Memory is ready at ")
             && notice.contains("Memory and chat do not expire automatically.")
-            && notice.contains("`kuru memory notes ID`")
-            && notice.contains("`kuru memory export --format json --output PATH`")
-            && notice.contains("`kuru memory forget ID --note SEQUENCE`")
-            && notice.contains("`kuru memory purge --help`"),
+            && notice.contains("`kuru memory --help`"),
         "normal kuru run changed first-run notice: {notice:?}"
     );
     ensure!(

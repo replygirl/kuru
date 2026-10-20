@@ -292,12 +292,18 @@ until the cancelled request finishes; running it again succeeds.
 
 After the first conversation/runtime command (`kuru run`, `kuru dream`,
 `kuru undo-dream`, the TUI, or `kuru serve`) opens a writable project store, the
-application shows one informational local notice. It names the escaped managed directory and points to
-`kuru memory notes ID`, `kuru memory export --format json --output PATH`,
+application shows one informational local notice per project. Headless commands
+write one stderr line before their work: it starts `Memory is ready at
+"DIRECTORY".`, states that memory and chat do not expire automatically, and
+points to `kuru memory --help`. The TUI instead shows the status-line indicator
+`Memory ready · kept until removed · /status · "DIRECTORY"` until the first key
+or paste; it is never a conversation entry, and `/status` always repeats the
+directory. `kuru memory --help` lists `kuru memory notes ID`,
+`kuru memory export --format json --output PATH`,
 `kuru memory forget ID --note SEQUENCE`, and `kuru memory purge --help`. The
 notice records only that this project/version was displayed, after stderr is
-flushed or the TUI frame is complete. It is not sent to a provider or added to a
-peer conversation. Memory and chat do not expire automatically; forgetting a
+flushed or the TUI frame containing the indicator is complete. It is not sent to
+a provider or added to a peer conversation. Memory and chat do not expire automatically; forgetting a
 selected active note retains prior Dolt revisions.
 
 `memory.offline` remains accepted for configuration compatibility; bundled engine

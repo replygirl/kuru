@@ -78,11 +78,15 @@ output and never receives the sentence.
 
 The first conversation/runtime command (`kuru run`, `kuru dream`, `kuru
 undo-dream`, the TUI, or `kuru serve`) that opens a writable project store also
-shows one short local storage notice after the store is actually ready. It names the escaped managed directory and
-links the available controls: `kuru memory notes ID`, `kuru memory export
+shows one short local storage notice per project after the store is actually
+ready. It names the escaped managed directory and points to `kuru memory --help`,
+which lists the controls: `kuru memory notes ID`, `kuru memory export
 --format json --output PATH`, `kuru memory forget ID --note SEQUENCE`, and
-`kuru memory purge --help`. Kuru records that the notice was shown only after
-stderr or the first TUI frame completes. It is not provider input or peer chat.
+`kuru memory purge --help`. Headless commands write it to stderr; the terminal
+interface shows it in the status line until your first key or paste, never as a
+conversation entry, and `/status` always shows the directory. Kuru records that
+the notice was shown only after stderr or the first TUI frame completes. It is
+not provider input or peer chat.
 Memory and chat do not expire automatically; selected-note forgetting changes
 current memory while retaining earlier Dolt revisions.
 

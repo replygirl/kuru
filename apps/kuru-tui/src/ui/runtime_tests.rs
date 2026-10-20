@@ -20,7 +20,7 @@ use ratatui::{
     Terminal,
     backend::{Backend, ClearType, TestBackend, WindowSize},
     buffer::Cell,
-    layout::{Constraint, Layout, Position, Size},
+    layout::{Position, Size},
 };
 use tokio::{
     sync::{Notify, broadcast, mpsc},
@@ -849,22 +849,114 @@ async fn reopen_store(options: kuru_memory::OpenOptions) -> MemoryStore {
     MemoryStore::open(options).await.unwrap()
 }
 
+/// Records each completed frame: ratatui flushes only after a draw finished.
+struct RecordingBackend {
+    inner: TestBackend,
+    frames: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl Backend for RecordingBackend {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        backend_result(self.inner.draw(content))
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        backend_result(self.inner.hide_cursor())
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        backend_result(self.inner.show_cursor())
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        backend_result(self.inner.get_cursor_position())
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        backend_result(self.inner.set_cursor_position(position))
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        backend_result(self.inner.clear())
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        backend_result(self.inner.clear_region(clear_type))
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        backend_result(self.inner.size())
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        backend_result(self.inner.window_size())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        backend_result(self.inner.flush())?;
+        let buffer = self.inner.buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        self.frames.lock().unwrap().push(rows);
+        Ok(())
+    }
+}
+
+/// The newest completed frame matching `ready`, within a bounded wait.
+async fn completed_frame(
+    frames: &Arc<Mutex<Vec<Vec<String>>>>,
+    what: &str,
+    ready: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(frame) = frames.lock().unwrap().last().filter(|frame| ready(frame)) {
+                return frame.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "no completed frame showed {what}: {:?}",
+            frames.lock().unwrap().last()
+        )
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_history() {
+async fn first_run_indicator_is_drawn_before_input_then_recorded_outside_the_transcript() {
     kuru_memory::test_support::closing(async {
         let (data_root, project, options, store) = persistent_store().await;
         let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
+        let directory = format!("{:?}", store.status().await.unwrap().directory);
         let (project, harness, models) =
             harness_with_provider_in(project, store.clone(), Arc::new(DemoProvider)).await;
         assert!(harness.history().await.unwrap().is_empty());
 
-        let (input_tx, input_rx) = mpsc::channel(1);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let (input_tx, input_rx) = mpsc::channel(16);
         let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
             input_rx.recv().await.map(|event| (Ok(event), input_rx))
         }));
+        let backend = RecordingBackend {
+            inner: TestBackend::new(120, 45),
+            frames: frames.clone(),
+        };
         let loop_task = tokio::spawn(async move {
-            let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
-            let result = run_loop_with_stream_and_notice(
+            let mut terminal = Terminal::new(backend).unwrap();
+            run_loop_with_stream_and_notice(
                 &mut terminal,
                 harness,
                 models,
@@ -874,32 +966,7 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
                 None,
                 Default::default(),
             )
-            .await;
-            let buffer = terminal.backend().buffer();
-            let screen = buffer
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            let rows = Layout::vertical([
-                Constraint::Length(if buffer.area.height >= 16 { 2 } else { 1 }),
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(5), // Empty editor: two input rows, one control row, and borders.
-                Constraint::Length(1),
-            ])
-            .split(buffer.area);
-            let transcript =
-                Layout::horizontal([Constraint::Min(0), Constraint::Length(34)]).split(rows[1])[0];
-            let transcript_text = (transcript.y..transcript.bottom())
-                .map(|y| {
-                    (transcript.x..transcript.right())
-                        .map(|x| buffer[(x, y)].symbol())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            (result, screen, transcript_text)
+            .await
         });
 
         // The loop records the notice during its own startup, which has no
@@ -918,6 +985,63 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
         })
         .await
         .expect("notice was not recorded after a completed initial frame");
+        // Recording follows a completed frame, which carried the indicator on
+        // the status line and nowhere else.
+        let first = frames
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("a completed frame");
+        let indicator = format!("Memory ready · kept until removed · /status · {directory}");
+        let status_rows = first
+            .iter()
+            .filter(|row| row.contains("Memory ready ·"))
+            .collect::<Vec<_>>();
+        assert_eq!(status_rows.len(), 1, "{first:#?}");
+        let shown = status_rows[0].trim();
+        assert!(shown.starts_with("i Memory ready ·"), "{shown}");
+        assert!(
+            indicator.starts_with(shown.trim_start_matches("i ").trim_end_matches('…')),
+            "{shown}"
+        );
+
+        for character in "/status".chars() {
+            input_tx
+                .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(character),
+                    crossterm::event::KeyModifiers::NONE,
+                )))
+                .await
+                .unwrap();
+        }
+        input_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+        let status = completed_frame(&frames, "the /status memory line", |frame| {
+            frame.iter().any(|row| row.contains("Memory: "))
+        })
+        .await;
+        assert!(
+            status.iter().all(|row| !row.contains("Memory ready ·")),
+            "{status:#?}"
+        );
+        // The transcript column, unwrapped: rows end at the side panel border.
+        let compact = status
+            .iter()
+            .flat_map(|row| row.split('│').next().unwrap_or_default().chars())
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let expected = crate::memory_notice::status_line(&directory)
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(compact.contains(&expected), "{status:#?}");
+
         input_tx
             .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char('c'),
@@ -925,20 +1049,20 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
             )))
             .await
             .unwrap();
-        let (result, screen, transcript_text) =
-            tokio::time::timeout(Duration::from_secs(10), loop_task)
-                .await
-                .expect("notice loop did not exit")
-                .expect("notice loop task panicked");
-        result.unwrap();
-        assert!(screen.contains("Memory is ready at"), "{screen}");
-        let transcript_text = transcript_text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        tokio::time::timeout(Duration::from_secs(10), loop_task)
+            .await
+            .expect("notice loop did not exit")
+            .expect("notice loop task panicked")
+            .unwrap();
         assert!(
-            transcript_text.contains("Read notes with kuru memory notes ID;"),
-            "{transcript_text}"
+            frames
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .all(|row| !row.contains("kept until removed · /status")
+                    || row.trim().starts_with("i Memory ready ·")),
+            "the indicator appeared outside the status line"
         );
 
         // Close before reopening: a dropped store would leave its live Dolt to a
@@ -954,7 +1078,8 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
         let snapshot = reopened.begin_active_export().await.unwrap();
         let page = snapshot.page(None).await.unwrap();
         assert!(page.records.iter().all(|record| match record {
-            StorageRecord::Message { content, .. } => !content.contains("Memory is ready at"),
+            StorageRecord::Message { content, .. } =>
+                !content.contains("Memory ready") && !content.contains("Memory is ready at"),
             StorageRecord::State { .. }
             | StorageRecord::ContextSummary { .. }
             | StorageRecord::ContextCursor { .. }
@@ -1060,10 +1185,10 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
                 .any(|message| message.plain_text() == Some("turn reaches provider"))
         }));
         assert!(requests.iter().all(|request| {
-            request
-                .messages
-                .iter()
-                .all(|message| !message.text_projection().contains("Memory is ready at"))
+            request.messages.iter().all(|message| {
+                let text = message.text_projection();
+                !text.contains("Memory ready") && !text.contains("Memory is ready at")
+            })
         }));
 
         drop(input_tx);

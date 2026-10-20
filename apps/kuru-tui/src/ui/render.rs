@@ -1896,6 +1896,7 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let error = view.status.starts_with("Failed") || view.status.starts_with("error");
     let cancelled = view.status.starts_with("Cancelled");
     if view.notice.is_none()
+        && view.memory_notice.is_none()
         && !view.busy
         && view.show_scene
         && view.transcript.is_empty()
@@ -1928,7 +1929,11 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
             )
         }
     });
-    let (glyph, label, color) = if let Some(notice) = &view.notice {
+    // The first-run memory indicator outranks transient notices so the frame
+    // that precedes its recording always shows it.
+    let (glyph, label, color) = if let Some(notice) = &view.memory_notice {
+        ("i", notice.clone(), identity.accent)
+    } else if let Some(notice) = &view.notice {
         (
             if view.busy { "i" } else { "✓" },
             notice.clone(),
