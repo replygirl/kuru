@@ -13,7 +13,7 @@
 
 ## 3. Preservation
 
-- [ ] 3.1 @integration (agent) existing trust, preferences, doctor and CLI suites plus host/Windows lint, typecheck, docs and cospec checks -> pass; CI coverage gate holds at 95%. Observed locally: app suite 447/0, all static checks exit 0. CI run 39446598749 on 86ce5873: 60 checks pass; coverage macOS 95.23%, Ubuntu 95.22%, Windows 95.01% (gate 95%). Open: `quality / RustSec advisories` fails on externally published rustls (RUSTSEC-2026-0346..0349) and zip (RUSTSEC-2026-0367..0369) advisories unrelated to this change, so the required green run is not yet observed.
+- [ ] 3.1 @integration (agent) existing trust, preferences, doctor and CLI suites plus host/Windows lint, typecheck, docs and cospec checks -> pass; CI coverage gate holds at 95%. Observed locally: app suite 447/0, all static checks exit 0. CI run 39446598749 on 86ce5873: 60 checks pass; coverage macOS 95.23%, Ubuntu 95.22%, Windows 95.01% (gate 95%). Open: `quality / RustSec advisories` fails on externally published rustls (RUSTSEC-2026-0346..0349) and zip (RUSTSEC-2026-0367..0369) advisories unrelated to this change, so the required green run is not yet observed. After the review round, run 39460105794 on f415231d: 60 pass; coverage macOS 95.23%, Ubuntu 95.24%, Windows 95.00%; the same RustSec job alone fails.
 
 ## 4. Fail-closed memory opens (review round) [critical]
 
