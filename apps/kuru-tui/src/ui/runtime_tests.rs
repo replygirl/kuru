@@ -28,10 +28,10 @@ use tokio::{
 };
 
 use super::{
-    ACTIVITY_DRAIN_CAP, CompletionState, DispatchOutcome, Scheduler, TerminalEvent, View, Wake,
-    WakeAvailability, apply_completion, cancel_operation, dispatch, next_wake,
-    project_initial_view, project_runtime_snapshot, run_loop_with_stream,
-    run_loop_with_stream_and_notice,
+    ACTIVITY_DRAIN_CAP, CompletionState, DispatchOutcome, PublicRead, PublicReadKind, Scheduler,
+    TerminalEvent, View, Wake, WakeAvailability, apply_completion, apply_public_read,
+    cancel_operation, dispatch, next_wake, project_initial_view, project_runtime_snapshot,
+    run_loop_with_stream, run_loop_with_stream_and_notice,
 };
 use crate::memory_notice::MemoryNotice;
 
@@ -1391,6 +1391,94 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         job.take().unwrap().abort();
     })
     .await
+}
+
+#[tokio::test]
+async fn persisted_replies_show_the_part_name_not_its_uuid() {
+    kuru_memory::test_support::closing(async {
+        let (_directory, mut harness, models) = fixture().await;
+        let initial = project_initial_view(&harness).await.unwrap();
+        let mut view = View::from_initial(initial, vec![]);
+        let mut outputs = Vec::new();
+        for prompt in ["first prompt", "second prompt"] {
+            let DispatchOutcome::Turn(result) =
+                dispatch(&mut harness, &models, prompt).await.unwrap()
+            else {
+                panic!("ordinary input did not run a turn")
+            };
+            outputs.push(result.output);
+        }
+        let page = harness
+            .memory()
+            .public_transcript_page(&view.session, None, super::transcript::PAGE_RECORDS)
+            .await
+            .unwrap();
+        let turns = page
+            .records
+            .iter()
+            .rev()
+            .map(|entry| match entry {
+                kuru_memory::PublicTranscriptEntry::Turn { record } => record.turn_id.clone(),
+                kuru_memory::PublicTranscriptEntry::Legacy { .. } => panic!("legacy record"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(turns.len(), 2);
+        view.apply_runtime(project_runtime_snapshot(&harness));
+        let speakers = outputs
+            .iter()
+            .map(|output| output.speaker.clone())
+            .collect::<Vec<_>>();
+        for (output, turn) in outputs.into_iter().zip(&turns) {
+            view.complete_turn(output);
+            view.transcript.bind_answer(&view.session, turn, "main");
+        }
+        let replies = |view: &View| {
+            view.transcript
+                .iter()
+                .filter(|(label, _)| label != "user")
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>()
+        };
+        let live = replies(&view);
+        assert_eq!(live.len(), 2);
+        for (label, speaker) in live.iter().zip(&speakers) {
+            let name = view
+                .parts
+                .iter()
+                .find(|(id, _)| id == speaker)
+                .map(|(_, name)| name.split(" · ").next().unwrap().to_owned())
+                .expect("speaker is in the roster");
+            assert_eq!(*label, name);
+            assert_ne!(label, speaker);
+        }
+
+        // The persisted page replaces the live items; every reply keeps its name.
+        let read = PublicRead {
+            session: view.session.clone(),
+            view: "main".into(),
+            epoch: view.transcript_navigation.epoch,
+            kind: PublicReadKind::Newest,
+            page: Ok(page),
+        };
+        apply_public_read(&mut view, "main", read);
+        assert_eq!(replies(&view), live);
+        assert!(view.transcript.items.iter().all(|item| {
+            item.speaker
+                .as_ref()
+                .is_none_or(|speaker| speakers.contains(speaker))
+        }));
+
+        // A restored session projects through the same roster.
+        let restored = project_initial_view(&harness).await.unwrap();
+        let restored = restored
+            .transcript
+            .iter()
+            .filter(|(label, _)| label != "user")
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(restored, live);
+    })
+    .await;
 }
 
 #[tokio::test]

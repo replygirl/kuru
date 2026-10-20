@@ -5,7 +5,10 @@ use std::{collections::VecDeque, ops::Deref};
 use kuru_memory::{PublicTranscriptCursor, PublicTranscriptEntry, PublicTranscriptPage};
 use sha2::{Digest, Sha256};
 
-use super::project_transcript_message;
+use super::{INTERRUPTION_ROLE, project_transcript_message};
+
+/// Resolves a raw speaker id to the label the live transcript shows for it.
+pub(super) type Label<'a> = &'a dyn Fn(&str) -> String;
 
 pub(super) const PAGE_RECORDS: usize = 32;
 const LOCAL_ITEMS: usize = 128;
@@ -85,6 +88,9 @@ pub(super) struct Item {
     /// when the durable message ID stays the same (for example a hook rewrite).
     pub(super) projection: uuid::Uuid,
     pub(super) turn_key: Option<String>,
+    /// Raw speaker id of an assistant reply, kept so its display label can be
+    /// derived again whenever the roster or relationships change.
+    pub(super) speaker: Option<String>,
     local: bool,
 }
 
@@ -157,12 +163,23 @@ pub(super) fn turn_key(session: &str, turn: &str, view: &str) -> String {
 
 impl Transcript {
     pub fn push(&mut self, text: (String, String)) {
+        self.push_item(text, None);
+    }
+
+    /// Push a reply that keeps its raw speaker id, so a later roster change can
+    /// name it again.
+    pub(super) fn push_speaker(&mut self, text: (String, String), speaker: &str) {
+        self.push_item(text, Some(speaker.to_owned()));
+    }
+
+    fn push_item(&mut self, text: (String, String), speaker: Option<String>) {
         self.append(
             text,
             Item {
                 projection: uuid::Uuid::new_v4(),
                 id: ItemId::Local(uuid::Uuid::new_v4()),
                 turn_key: None,
+                speaker,
                 local: true,
             },
         );
@@ -245,7 +262,7 @@ impl Transcript {
         None
     }
 
-    pub(super) fn install_older(&mut self, mut page: PublicTranscriptPage) -> bool {
+    pub(super) fn install_older(&mut self, mut page: PublicTranscriptPage, label: Label) -> bool {
         let Some(old) = self.pages.front() else {
             return false;
         };
@@ -257,7 +274,7 @@ impl Transcript {
             return false;
         }
         page.pending = None;
-        let mut incoming = Self::from_page(page);
+        let mut incoming = Self::from_page(page, label);
         incoming.pages[0].entry = old.next.clone();
         // A persisted page may now contain a formerly local completed turn.
         // Keep the canonical identity once, without counting this as omission.
@@ -327,6 +344,7 @@ impl Transcript {
         &mut self,
         mut page: PublicTranscriptPage,
         entry: Option<PublicTranscriptCursor>,
+        label: Label,
     ) -> bool {
         let Some(old) = self.pages.back() else {
             return false;
@@ -342,7 +360,7 @@ impl Transcript {
         if entry.is_some() {
             page.pending = None;
         }
-        let mut incoming = Self::from_page(page);
+        let mut incoming = Self::from_page(page, label);
         incoming.pages[0].entry = entry;
         for index in (0..self.items.len()).rev() {
             if self.items[index].local
@@ -369,8 +387,8 @@ impl Transcript {
         true
     }
 
-    pub(super) fn install_newest(&mut self, page: PublicTranscriptPage) {
-        self.install_projection(Self::from_page(page));
+    pub(super) fn install_newest(&mut self, page: PublicTranscriptPage, label: Label) {
+        self.install_projection(Self::from_page(page, label));
     }
 
     pub(super) fn install_projection(&mut self, incoming: Self) {
@@ -428,7 +446,7 @@ impl Transcript {
         }
     }
 
-    pub(super) fn from_page(mut page: PublicTranscriptPage) -> Self {
+    pub(super) fn from_page(mut page: PublicTranscriptPage, label: Label) -> Self {
         let mut transcript = Self::default();
         let records = page.records.len();
         page.records.reverse();
@@ -441,12 +459,13 @@ impl Transcript {
                             projection: uuid::Uuid::new_v4(),
                             id: ItemId::Legacy(sequence),
                             turn_key: None,
+                            speaker: None,
                             local: false,
                         },
                     );
                 }
                 PublicTranscriptEntry::Turn { record } => {
-                    transcript.append_turn(record, &page.view);
+                    transcript.append_turn(record, &page.view, label);
                 }
             }
         }
@@ -464,7 +483,7 @@ impl Transcript {
         });
         if let Some(record) = page.pending {
             let first = transcript.len();
-            transcript.append_turn(record, &page.view);
+            transcript.append_turn(record, &page.view, label);
             for item in &mut transcript.items[first..] {
                 item.local = true;
             }
@@ -472,7 +491,7 @@ impl Transcript {
         transcript
     }
 
-    fn append_turn(&mut self, record: kuru_memory::PublicTurnRecord, view: &str) {
+    fn append_turn(&mut self, record: kuru_memory::PublicTurnRecord, view: &str, label: Label) {
         let key = turn_key(&record.origin_session_id, &record.turn_id, view);
         if let Some(message) = record.user_entry {
             self.append(
@@ -484,18 +503,25 @@ impl Transcript {
                         slot: MessageSlot::User,
                     },
                     turn_key: Some(key.clone()),
+                    speaker: None,
                     local: false,
                 },
             );
         }
         for (slot, message) in record.terminal_entries.into_iter().enumerate() {
-            let role = if message.role == "assistant" {
-                record.speaker_id.as_deref().unwrap_or("unknown")
-            } else {
-                &message.role
+            // Only a real part or relationship id is a speaker to name. The
+            // interruption marker projects as the kernel's own voice and a
+            // record without a speaker stays `unknown`.
+            let (role, speaker) = match (message.role.as_str(), record.speaker_id.as_deref()) {
+                ("assistant", Some(id)) if id != INTERRUPTION_ROLE => {
+                    (label(id), Some(id.to_owned()))
+                }
+                ("assistant", Some(id)) => (id.to_owned(), None),
+                ("assistant", None) => ("unknown".to_owned(), None),
+                (role, _) => (role.to_owned(), None),
             };
             self.append(
-                project_transcript_message(role, message.text_projection()),
+                project_transcript_message(&role, message.text_projection()),
                 Item {
                     projection: uuid::Uuid::new_v4(),
                     id: ItemId::Turn {
@@ -503,10 +529,31 @@ impl Transcript {
                         slot: MessageSlot::Terminal(slot),
                     },
                     turn_key: Some(key.clone()),
+                    speaker,
                     local: false,
                 },
             );
         }
+    }
+
+    /// Derive the label of every item that carries a speaker id again. A
+    /// changed label gets a new projection identity so cached layouts rebuild.
+    pub(super) fn relabel(&mut self, label: Label) -> bool {
+        let mut changed = false;
+        for (text, item) in self.text.iter_mut().zip(&mut self.items) {
+            if let Some(speaker) = &item.speaker {
+                let name = label(speaker);
+                if text.0 != name {
+                    text.0 = name;
+                    item.projection = uuid::Uuid::new_v4();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        changed
     }
 }
 
@@ -555,6 +602,9 @@ mod tests {
         PublicTranscriptPosition, PublicTurnKind, PublicTurnRecord, PublicTurnSettlement,
     };
 
+    fn same(id: &str) -> String {
+        id.into()
+    }
     fn cursor(turn: usize) -> PublicTranscriptCursor {
         PublicTranscriptCursor {
             session_id: "session".into(),
@@ -595,26 +645,26 @@ mod tests {
 
     #[test]
     fn page_eviction_keeps_canonical_ids_anchors_and_exact_record_counts() {
-        let mut transcript = Transcript::from_page(page(2, Some(cursor(1)), true));
+        let mut transcript = Transcript::from_page(page(2, Some(cursor(1)), true), &same);
         let answer = transcript.item_id(1).unwrap().clone();
-        assert!(transcript.install_older(page(1, Some(cursor(0)), true)));
+        assert!(transcript.install_older(page(1, Some(cursor(0)), true), &same));
         assert_eq!(transcript.pages.len(), 2);
         assert_eq!(transcript.omitted_records(), 1);
         let anchor = transcript.item_id(0).unwrap().clone();
         transcript.protected = Some(anchor.clone());
-        assert!(transcript.install_older(page(0, None, true)));
+        assert!(transcript.install_older(page(0, None, true), &same));
         assert_eq!(transcript.pages.len(), 2);
         assert!(transcript.items.iter().any(|item| item.id == anchor));
         assert!(!transcript.items.iter().any(|item| item.id == answer));
         assert_eq!(transcript.newer_target(), Some(cursor(1)));
-        assert!(transcript.install_newer(page(2, Some(cursor(1)), true), None));
+        assert!(transcript.install_newer(page(2, Some(cursor(1)), true), None, &same));
         assert_eq!(transcript.omitted_records(), 1);
         assert!(transcript.items.iter().any(|item| item.id == answer));
     }
 
     #[test]
     fn literal_next_match_visits_all_offsets_before_older_records_and_preserves_local_tail() {
-        let mut projected = Transcript::from_page(page(2, Some(cursor(1)), true));
+        let mut projected = Transcript::from_page(page(2, Some(cursor(1)), true), &same);
         projected.text[1].1 = "needle 猫 needle".into();
         let first = projected.next_match("needle", None).unwrap();
         let second = projected
@@ -629,7 +679,7 @@ mod tests {
                 .is_none()
         );
         assert!(projected.next_match("Needle", None).is_none());
-        let mut current = Transcript::from_page(page(1, None, true));
+        let mut current = Transcript::from_page(page(1, None, true), &same);
         current.push(("kuru".into(), "current-operation notice".into()));
         let notice = current.item_id(2).unwrap().clone();
         current.install_projection(projected);
@@ -640,12 +690,12 @@ mod tests {
 
     #[test]
     fn live_and_persisted_answer_slots_match_and_local_duplicates_are_removed() {
-        let mut transcript = Transcript::from_page(page(2, Some(cursor(1)), false));
+        let mut transcript = Transcript::from_page(page(2, Some(cursor(1)), false), &same);
         let answer = transcript.item_id(0).unwrap().clone();
         transcript.push(("speaker".into(), "answer-1".into()));
         transcript.bind_answer("session", "1", "main");
         let local = transcript.item_id(1).unwrap().clone();
-        assert!(transcript.install_older(page(1, None, false)));
+        assert!(transcript.install_older(page(1, None, false), &same));
         assert_eq!(
             transcript
                 .items
@@ -665,7 +715,78 @@ mod tests {
         let before = transcript.clone();
         let mut stale = page(0, None, false);
         stale.revision = "changed".into();
-        assert!(!transcript.install_older(stale));
+        assert!(!transcript.install_older(stale, &same));
         assert_eq!(transcript, before);
+    }
+
+    fn named(id: &str) -> String {
+        match id {
+            "speaker" => "Self".into(),
+            other => other.chars().take(16).collect(),
+        }
+    }
+
+    #[test]
+    fn persisted_entries_use_the_resolver_and_keep_raw_speaker_ids() {
+        let transcript = Transcript::from_page(page(1, None, true), &named);
+        assert_eq!(transcript[0], ("user".into(), "question-1".into()));
+        assert_eq!(transcript[1], ("Self".into(), "answer-1".into()));
+        assert_eq!(transcript.items[0].speaker, None);
+        assert_eq!(transcript.items[1].speaker.as_deref(), Some("speaker"));
+        let mut unattributed = page(2, None, false);
+        let PublicTranscriptEntry::Turn { record } = &mut unattributed.records[0] else {
+            unreachable!()
+        };
+        record.speaker_id = None;
+        let transcript = Transcript::from_page(unattributed, &named);
+        assert_eq!(transcript[0].0, "unknown");
+        assert_eq!(transcript.items[0].speaker, None);
+    }
+
+    #[test]
+    fn install_newest_preserves_the_live_label_and_older_pages_use_the_resolver() {
+        let mut transcript = Transcript::from_page(page(2, Some(cursor(1)), false), &named);
+        transcript.push(("Self".into(), "live tail".into()));
+        let before = transcript[0].0.clone();
+        transcript.install_newest(page(2, Some(cursor(1)), false), &named);
+        assert_eq!(transcript[0].0, before);
+        assert_eq!(transcript.last().unwrap().1, "live tail");
+        assert!(transcript.install_older(page(1, None, false), &named));
+        assert_eq!(transcript[0].0, "Self");
+        let mut stranger = page(0, None, false);
+        let PublicTranscriptEntry::Turn { record } = &mut stranger.records[0] else {
+            unreachable!()
+        };
+        record.speaker_id = Some("a-retired-part-with-a-long-identity".into());
+        let mut newer = Transcript::from_page(stranger, &named);
+        assert_eq!(newer[0].0, "a-retired-part-w");
+        assert!(newer.relabel(&|_| "Other".into()));
+        assert_eq!(newer[0].0, "Other");
+    }
+
+    #[test]
+    fn relabel_changes_only_speaker_items_and_reports_no_change_when_stable() {
+        let mut transcript = Transcript::from_page(page(1, None, true), &named);
+        transcript.push(("kuru".into(), "notice".into()));
+        let epoch = transcript.epoch;
+        let projections = transcript
+            .items
+            .iter()
+            .map(|item| item.projection)
+            .collect::<Vec<_>>();
+        assert!(!transcript.relabel(&named));
+        assert_eq!(transcript.epoch, epoch);
+        assert!(transcript.relabel(&|_| "Renamed".into()));
+        assert_eq!(transcript[0].0, "user");
+        assert_eq!(transcript[1].0, "Renamed");
+        assert_eq!(transcript[2].0, "kuru");
+        assert_ne!(transcript.epoch, epoch);
+        assert_eq!(transcript.items[0].projection, projections[0]);
+        assert_ne!(transcript.items[1].projection, projections[1]);
+        assert_eq!(transcript.items[2].projection, projections[2]);
+        transcript.push_speaker(("kuru".into(), "reply".into()), "speaker");
+        assert!(transcript.relabel(&named));
+        assert_eq!(transcript[3].0, "Self");
+        assert_eq!(transcript[2].0, "kuru");
     }
 }

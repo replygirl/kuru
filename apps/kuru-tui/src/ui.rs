@@ -796,6 +796,8 @@ impl View {
         self.mode = runtime.mode;
         self.model = runtime.model;
         self.effort = runtime.effort;
+        let roster_changed =
+            self.parts != runtime.parts || self.relationships != runtime.relationships;
         self.parts = runtime.parts;
         self.relationships = runtime.relationships;
         self.focus = runtime.focus;
@@ -804,20 +806,20 @@ impl View {
         self.routes.retain(|(from, to)| {
             self.parts.iter().any(|(id, _)| id == from) && self.parts.iter().any(|(id, _)| id == to)
         });
+        if roster_changed {
+            self.relabel_transcript();
+        }
     }
 
     fn actor_name(&self, id: &str) -> String {
-        self.parts
-            .iter()
-            .find(|(part, _)| part == id)
-            .map(|(_, name)| name.split(" · ").next().unwrap_or(name).to_owned())
-            .or_else(|| {
-                self.relationships
-                    .iter()
-                    .find(|r| r.id == id)
-                    .map(|r| r.kind.to_string())
-            })
-            .unwrap_or_else(|| id.chars().take(16).collect())
+        speaker_label(&self.parts, &self.relationships, id)
+    }
+
+    /// Name every retained reply again from the current roster.
+    fn relabel_transcript(&mut self) {
+        let (parts, relationships) = (&self.parts, &self.relationships);
+        self.transcript
+            .relabel(&|id| transcript_label(parts, relationships, id));
     }
 
     fn settle(&mut self) {
@@ -1046,6 +1048,7 @@ impl View {
                 self.relationships
                     .retain(|current| current.id != relationship.id);
                 self.relationships.push(relationship);
+                self.relabel_transcript();
                 ("relationship".into(), actor, detail)
             }
             Event::State { actor, report } => (
@@ -1102,16 +1105,13 @@ impl View {
                     .iter()
                     .map(|id| self.actor_name(id))
                     .collect::<Vec<_>>();
-                if members.is_empty() {
-                    relationship.kind.to_string()
-                } else {
-                    format!("{} · {}", relationship.kind, members.join(" + "))
-                }
+                relationship_label(&relationship.kind.to_string(), &members)
             })
             .unwrap_or_else(|| self.actor_name(&output.speaker));
         self.speaker_id = output.speaker;
         self.speaker = speaker.clone();
-        self.transcript.push((speaker, output.text));
+        self.transcript
+            .push_speaker((speaker, output.text), &self.speaker_id);
         if let (Some(turn), Some(source)) = (&self.active_operation_id, &self.active_source_view) {
             self.transcript.bind_answer(&self.session, turn, source);
         }
@@ -1806,11 +1806,13 @@ fn revoke_selected_permission(service: &PermissionService, view: &mut View) -> R
 /// Read the initial TUI presentation from the runtime at the adapter boundary.
 /// `View` itself remains a synchronous owned value.
 pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> {
+    let runtime = project_runtime_snapshot(harness);
     let transcript = transcript_from_public_page(
         harness
             .memory()
             .public_transcript_page(&harness.session.id, None, transcript::PAGE_RECORDS)
             .await?,
+        &runtime,
     );
     Ok(InitialViewData {
         transcript,
@@ -1822,13 +1824,65 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
             .to_string_lossy()
             .into_owned(),
         motion: !reduced_motion(std::env::var("KURU_REDUCED_MOTION").ok().as_deref()),
-        runtime: project_runtime_snapshot(harness),
+        runtime,
         usage: Some(harness.session_usage().await?),
     })
 }
 
-fn transcript_from_public_page(page: PublicTranscriptPage) -> Transcript {
-    Transcript::from_page(page)
+/// Label a part or relationship id for display: the part's name, a
+/// relationship's kind, or the id's first 16 characters.
+fn speaker_label(parts: &[(String, String)], relationships: &[Relationship], id: &str) -> String {
+    parts
+        .iter()
+        .find(|(part, _)| part == id)
+        .map(|(_, name)| name.split(" · ").next().unwrap_or(name).to_owned())
+        .or_else(|| {
+            relationships
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.kind.to_string())
+        })
+        .unwrap_or_else(|| id.chars().take(16).collect())
+}
+
+/// The label of a relationship reply: its kind and member names.
+fn relationship_label(kind: &str, members: &[String]) -> String {
+    if members.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind} · {}", members.join(" + "))
+    }
+}
+
+/// Label a transcript reply's speaker. A part reads as its name and a known
+/// relationship as `kind · members`, exactly as the live reply shows; a
+/// relationship that no longer exists falls back to the id's first 16
+/// characters. The live reply and every page projection share this.
+fn transcript_label(
+    parts: &[(String, String)],
+    relationships: &[Relationship],
+    id: &str,
+) -> String {
+    if !parts.iter().any(|(part, _)| part == id)
+        && let Some(relationship) = relationships.iter().find(|r| r.id == id)
+    {
+        let members = relationship
+            .members
+            .iter()
+            .map(|member| speaker_label(parts, relationships, member))
+            .collect::<Vec<_>>();
+        return relationship_label(&relationship.kind.to_string(), &members);
+    }
+    speaker_label(parts, relationships, id)
+}
+
+fn transcript_from_public_page(
+    page: PublicTranscriptPage,
+    runtime: &RuntimeSnapshot,
+) -> Transcript {
+    Transcript::from_page(page, &|id| {
+        transcript_label(&runtime.parts, &runtime.relationships, id)
+    })
 }
 
 fn project_transcript_message(role: &str, content: String) -> (String, String) {
@@ -2282,20 +2336,22 @@ fn apply_public_read(view: &mut View, source_view: &str, read: PublicRead) {
     {
         return;
     }
+    let (parts, relationships) = (&view.parts, &view.relationships);
+    let label = |id: &str| transcript_label(parts, relationships, id);
     match read.page {
         Ok(page) => match read.kind {
             PublicReadKind::Older => {
-                if view.transcript.install_older(page) {
+                if view.transcript.install_older(page, &label) {
                     view.transcript_navigation.scroll(-10);
                 } else {
                     view.notify("Transcript changed; return to the latest page");
                 }
             }
-            PublicReadKind::Newest => view.transcript.install_newest(page),
-            PublicReadKind::Restore => view.transcript.install_newest(page),
+            PublicReadKind::Newest => view.transcript.install_newest(page, &label),
+            PublicReadKind::Restore => view.transcript.install_newest(page, &label),
             PublicReadKind::Newer { target, entry } => {
                 if page.next.as_ref() == Some(&target) {
-                    if view.transcript.install_newer(page, entry) {
+                    if view.transcript.install_newer(page, entry, &label) {
                         view.transcript_navigation.scroll(10);
                     }
                 } else if let Some(cursor) = page.next {
@@ -2311,7 +2367,7 @@ fn apply_public_read(view: &mut View, source_view: &str, read: PublicRead) {
                 {
                     search.scanned += page.records.len() as u64;
                     search.cursor = page.next.clone();
-                    let projected = Transcript::from_page(page);
+                    let projected = Transcript::from_page(page, &label);
                     let hit = projected.next_match(&query, None);
                     search.finished = search.cursor.is_none();
                     search.status = if hit.is_some() {
@@ -4110,19 +4166,31 @@ mod tests {
             terminal_entries: vec![Message::text("assistant", "answer")],
             record_format: kuru_memory::PUBLIC_TURN_RECORD_FORMAT.into(),
         };
-        let transcript = transcript_from_public_page(PublicTranscriptPage {
-            session_id: "session".into(),
-            view: "main".into(),
-            revision: "0123456789abcdef0123456789abcdef".into(),
-            head_node_id: Some(record.node_id.clone()),
-            pending: None,
-            records: vec![PublicTranscriptEntry::Turn { record }],
-            total_rows: 4,
-            next: None,
-        });
+        let runtime = RuntimeSnapshot {
+            turns: 0,
+            mode: "ifs".into(),
+            model: "model".into(),
+            effort: "default".into(),
+            parts: vec![("stable-speaker".into(), "Stable · role".into())],
+            relationships: vec![],
+            focus: None,
+        };
+        let transcript = transcript_from_public_page(
+            PublicTranscriptPage {
+                session_id: "session".into(),
+                view: "main".into(),
+                revision: "0123456789abcdef0123456789abcdef".into(),
+                head_node_id: Some(record.node_id.clone()),
+                pending: None,
+                records: vec![PublicTranscriptEntry::Turn { record }],
+                total_rows: 4,
+                next: None,
+            },
+            &runtime,
+        );
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0], ("user".into(), "question".into()));
-        assert_eq!(transcript[1], ("stable-speaker".into(), "answer".into()));
+        assert_eq!(transcript[1], ("Stable".into(), "answer".into()));
         assert_eq!(transcript.omitted_records(), 3);
         let mut view = fixture();
         view.transcript = transcript;
@@ -6614,6 +6682,241 @@ mod tests {
             total_rows: 3,
             next,
         }
+    }
+
+    /// A one-turn public page whose settled answer was spoken by `speaker`.
+    fn turn_read_page(
+        turn: usize,
+        speaker: Option<&str>,
+        next: Option<PublicTranscriptCursor>,
+    ) -> PublicTranscriptPage {
+        PublicTranscriptPage {
+            session_id: "plain-session".into(),
+            view: "main".into(),
+            revision: "captured-revision".into(),
+            head_node_id: None,
+            pending: None,
+            records: vec![PublicTranscriptEntry::Turn {
+                record: kuru_memory::PublicTurnRecord {
+                    node_id: kuru_memory::public_turn_node_id("plain-session", &turn.to_string())
+                        .unwrap(),
+                    origin_session_id: "plain-session".into(),
+                    turn_id: turn.to_string(),
+                    kind: kuru_memory::PublicTurnKind::Primary,
+                    continuation_of_node_id: None,
+                    predecessor_node_id: None,
+                    settlement: kuru_memory::PublicTurnSettlement::Completed,
+                    user_entry: None,
+                    speaker_id: speaker.map(Into::into),
+                    terminal_entries: vec![Message::text("assistant", format!("answer-{turn}"))],
+                    record_format: kuru_memory::PUBLIC_TURN_RECORD_FORMAT.into(),
+                },
+            }],
+            total_rows: 3,
+            next,
+        }
+    }
+
+    fn reply_output(view: &View, speaker: &str, text: &str) -> TurnOutput {
+        TurnOutput {
+            session: view.session.clone(),
+            speaker: speaker.into(),
+            text: text.into(),
+            relationship: None,
+            input_tokens: 1,
+            output_tokens: 1,
+            limited: false,
+            limit_reasons: Some(vec![]),
+            response_outcome: Some(kuru_runtime::ResponseOutcome::Text),
+            events: vec![],
+        }
+    }
+
+    fn labels(view: &View) -> Vec<String> {
+        view.transcript
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn persisted_page_keeps_the_label_the_live_reply_showed() {
+        let mut view = fixture();
+        let speaker = view.parts[0].0.clone();
+        assert_eq!(view.parts[0].1.split(" · ").next(), Some("Self"));
+        view.complete_turn(reply_output(&view, &speaker, "answer-1"));
+        view.transcript.bind_answer("plain-session", "1", "main");
+        assert_eq!(labels(&view), ["Self"]);
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(1, Some(&speaker), None)),
+        );
+        assert_eq!(labels(&view), ["Self"]);
+        assert_eq!(
+            view.transcript.items[0].speaker.as_deref(),
+            Some(speaker.as_str())
+        );
+        // Restoring a session installs through the same resolver.
+        view.transcript.clear();
+        install_public_read(
+            &mut view,
+            PublicReadKind::Restore,
+            Ok(turn_read_page(1, Some(&speaker), None)),
+        );
+        assert_eq!(labels(&view), ["Self"]);
+    }
+
+    #[test]
+    fn older_newer_and_search_pages_resolve_part_names() {
+        let mut view = fixture();
+        let speaker = view.parts[1].0.clone();
+        let name = view.parts[1].1.split(" · ").next().unwrap().to_owned();
+        let older = public_read_cursor(1);
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(2, Some(&speaker), Some(older.clone()))),
+        );
+        install_public_read(
+            &mut view,
+            PublicReadKind::Older,
+            Ok(turn_read_page(1, Some(&speaker), None)),
+        );
+        assert_eq!(labels(&view), [name.clone(), name.clone()]);
+        view.transcript_search = Some(transcript::Search::new(
+            transcript::Position::FollowTail,
+            None,
+        ));
+        view.transcript_search.as_mut().unwrap().query = "answer-0".into();
+        install_public_read(
+            &mut view,
+            PublicReadKind::Search("answer-0".into()),
+            Ok(turn_read_page(0, Some(&speaker), None)),
+        );
+        assert_eq!(labels(&view), [name]);
+        assert!(view.transcript_navigation.match_byte.is_some());
+    }
+
+    #[test]
+    fn unknown_speakers_share_one_prefix_fallback_and_system_roles_are_unchanged() {
+        let mut view = fixture();
+        let unknown = "e1567a83-468e-5927-a7f7-dcd081401411-retired";
+        view.complete_turn(reply_output(&view, unknown, "answer-1"));
+        view.transcript.bind_answer("plain-session", "1", "main");
+        let live = labels(&view)[0].clone();
+        assert_eq!(live, unknown.chars().take(16).collect::<String>());
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(1, Some(unknown), None)),
+        );
+        assert_eq!(labels(&view), [live]);
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(2, None, None)),
+        );
+        assert_eq!(labels(&view), ["unknown"]);
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(3, Some(INTERRUPTION_ROLE), None)),
+        );
+        assert_eq!(labels(&view), ["kuru"]);
+        assert!(view.transcript.items[0].speaker.is_none());
+    }
+
+    #[test]
+    fn roster_and_relationship_changes_relabel_earlier_replies() {
+        let mut view = fixture();
+        let speaker = view.parts[0].0.clone();
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(1, Some(&speaker), None)),
+        );
+        view.complete_turn(reply_output(&view, &speaker, "answer-2"));
+        view.transcript.bind_answer("plain-session", "2", "main");
+        assert_eq!(labels(&view), ["Self", "Self"]);
+        let before = view.transcript.items[0].projection;
+        let mut renamed = runtime_snapshot();
+        renamed.parts[0].1 = "Renamed · role".into();
+        view.apply_runtime(renamed);
+        assert_eq!(labels(&view), ["Renamed", "Renamed"]);
+        assert_ne!(view.transcript.items[0].projection, before);
+        // A framework switch that retires the part falls back to its id prefix.
+        let mut switched = runtime_snapshot();
+        switched.parts.retain(|(id, _)| *id != speaker);
+        view.apply_runtime(switched);
+        let prefix: String = speaker.chars().take(16).collect();
+        assert_eq!(labels(&view), [prefix.clone(), prefix]);
+        // A relationship id is named like the live reply once the relationship is known.
+        let members = view.parts[..2].iter().map(|part| part.0.clone()).collect();
+        let relation = Relationship::new(RelationshipKind::Alliance, members).unwrap();
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(2, Some(&relation.id), None)),
+        );
+        assert_eq!(
+            labels(&view),
+            [relation.id.chars().take(16).collect::<String>()]
+        );
+        let composite = format!(
+            "alliance · {}",
+            view.parts[..2]
+                .iter()
+                .map(|part| part.1.split(" · ").next().unwrap())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        );
+        view.event(Event::Relationship {
+            actor: relation.id.clone(),
+            relationship: relation,
+        });
+        assert_eq!(labels(&view), [composite]);
+    }
+
+    #[test]
+    fn relationship_replies_keep_their_composite_label_after_reload() {
+        let mut view = fixture();
+        let members = view.parts[..2]
+            .iter()
+            .map(|part| part.0.clone())
+            .collect::<Vec<_>>();
+        let relation = Relationship::new(RelationshipKind::Alliance, members).unwrap();
+        let names = relation
+            .members
+            .iter()
+            .map(|id| view.actor_name(id))
+            .collect::<Vec<_>>();
+        let composite = format!("alliance · {}", names.join(" + "));
+        let mut runtime = runtime_snapshot();
+        runtime.relationships = vec![relation.clone()];
+        view.apply_runtime(runtime.clone());
+        let mut output = reply_output(&view, &relation.id, "answer-1");
+        output.relationship = Some(relation.clone());
+        view.complete_turn(output);
+        view.transcript.bind_answer("plain-session", "1", "main");
+        assert_eq!(labels(&view), std::slice::from_ref(&composite));
+        // The persisted page names the same relationship the same way.
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(1, Some(&relation.id), None)),
+        );
+        assert_eq!(labels(&view), std::slice::from_ref(&composite));
+        // An unchanged runtime snapshot leaves labels and layout identity alone.
+        let projection = view.transcript.items[0].projection;
+        view.apply_runtime(runtime);
+        assert_eq!(view.transcript.items[0].projection, projection);
+        // Once the relationship is gone the reply falls back to the id prefix.
+        view.apply_runtime(runtime_snapshot());
+        assert_eq!(
+            labels(&view),
+            [relation.id.chars().take(16).collect::<String>()]
+        );
     }
 
     fn public_read_cursor(sequence: i64) -> PublicTranscriptCursor {
