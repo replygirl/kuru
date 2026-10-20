@@ -834,9 +834,17 @@ SHA-256 value derived from the starter token, never the token. Beside the stages
 it carries `progress`, a count that belongs to one open
 (`MemoryStore::open_observed` creates it; the open's `ProgressReporter` and
 `ServerOptions` carry it). The count advances only at a distinct one-shot point or a completed bounded unit of
-work: every stage report, every open-timeline milestone stamped inside the open
-(stamp and advance are paired at the site), every 8 MiB copied by extraction or
-hashed by warm-cache verification, and every completed migration step. A new
+work: every stage report, including those of the creation and stage workers
+(which report through a counting reporter that publishes no stage), every
+open-timeline milestone stamped inside the open (stamp and advance are paired at
+the site), every completed store-template copy, the stage identity write, every
+8 MiB copied by extraction or hashed by warm-cache verification, and every
+completed migration step. Each engine start advances at its spawn call, its
+supervisor spawn, its Windows channel accept, its Ready frame and its probe, so
+a creation from the template keeps advancing from its `OpeningDatabase` report
+to the stage engine's readiness. `create-start`, `extract-*`, `migrate-*` and
+`cold-created` stay bare stamps beside work that already advances. A stamp
+under a test event hold is taken before its own advance. A new
 site follows the same rule: never advance on a timer, inside a sleep, in a
 retry iteration or while waiting for a lock. Immediately before an open that
 has failed closes an engine it started, and only where the open then returns
@@ -1000,17 +1008,18 @@ count, or `null`), `dropped` and `late`; never a path, scope, SQL, identity,
 credential or content. The events, in canonical order, are `owner-main`,
 `owner-lock`, `startup-lock`, `extract-start`, `extract-end`,
 `cache-verify-start`, `cache-verify-end`, `create-start`,
-`supervisor-spawned`, `channel-accepted` (Windows only), `supervisor-ready`,
-`probe-verified`, `template-copied`, `cold-created`, `activated`,
+`legacy-prepared`, `recovery-checked`, `spawn-call`, `supervisor-spawned`,
+`channel-accepted` (Windows only), `supervisor-ready`, `probe-verified`,
+`copy-end`, `template-copied`, `cold-created`, `activated`,
 `main-pool`, `version-read`, `migrate-start`, `migrate-end`,
 `validate-active`, `candidate-recovery`, `usage-pool`, `usage-bound`,
 `usage-scan-1`, `usage-upgrade`, `usage-validate`, `usage-scan-2`,
 `usage-record`, `store-ready`, `listener-bound` and `endpoint-published`. An
 existing-project open on Unix records all of them except extraction, creation,
 activation, migration and `channel-accepted`. Creation, extraction and upgrade
-opens add those, and the per-engine-start events (`supervisor-spawned`,
-`channel-accepted`, `supervisor-ready`, `probe-verified`) repeat once per
-start. `usage-bound` follows the read of the usage head's validation record
+opens add those, and the per-engine-start events (`spawn-call`,
+`supervisor-spawned`, `channel-accepted`, `supervisor-ready`,
+`probe-verified`) repeat once per start. `usage-bound` follows the read of the usage head's validation record
 (see
 [the usage ledger validation record](memory.md#usage-ledger-validation-record)),
 and `usage-scan-1` then closes the owned-row walk, which a recorded reopen
@@ -1051,7 +1060,11 @@ predecessor with the same token, possible only when a test reuses a token) or
 `unreadable`. An ungated starter reads nothing and its error is unchanged.
 Read the phase from `last`: `owner-lock` points at the project startup lock
 wait, `extract-start` at extraction, `cache-verify-start` at runtime
-verification, `create-start` at preparation before the first engine start,
+verification, `create-start` at the legacy import probe, `legacy-prepared`
+at staging recovery, `recovery-checked` at the template's judgement and copy
+(or the cold stage's preparation), `copy-end` at the stage identity write and
+stage preparation, `spawn-call` at the supervisor's process creation itself
+(on Windows after the private listener bind),
 `supervisor-spawned` without `channel-accepted` at supervisor start-up on
 Windows, `channel-accepted` at the engine start inside the supervisor,
 `migrate-start` at the migration, and `template-copied` or `cold-created` at

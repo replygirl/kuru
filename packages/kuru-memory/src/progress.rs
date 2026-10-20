@@ -250,6 +250,17 @@ impl ProgressReporter {
         }
     }
 
+    /// A reporter that publishes no stage but advances `ticks` at every
+    /// report and milestone, for a worker whose stages its opener already
+    /// stands for.
+    pub(crate) fn counting(ticks: Option<OpenTicks>) -> Self {
+        Self {
+            sender: None,
+            sent: 0,
+            ticks,
+        }
+    }
+
     pub(crate) fn observed() -> (MemoryOpenProgress, Self) {
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         (

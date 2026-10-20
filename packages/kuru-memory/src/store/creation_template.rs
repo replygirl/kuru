@@ -1760,11 +1760,13 @@ impl std::error::Error for CreateError {}
 /// lock under a copy in flight. The lock comes back with the outcome; a copy
 /// that panicked returns none, and its lock was released as the copy
 /// unwound. The thread writes through its own handle on `stage`, opened
-/// again and bound to `stage`'s identity.
+/// again and bound to `stage`'s identity. A completed copy is a progress
+/// milestone of the open `ticks` counts.
 async fn copy_blocking(
     judged: Judged,
     stage: &Directory,
     lock: KeyLock,
+    ticks: Option<&crate::progress::OpenTicks>,
 ) -> (Option<KeyLock>, Result<(), CreationFailure>) {
     let destination = match files::directory(stage.path()) {
         Ok(destination) if destination.identity() == stage.identity() => destination,
@@ -1794,7 +1796,12 @@ async fn copy_blocking(
     })
     .await;
     match copied {
-        Ok((lock, outcome)) => (Some(lock), outcome),
+        Ok((lock, outcome)) => {
+            if outcome.is_ok() {
+                crate::progress::milestone(ticks, crate::open_timeline::Event::CopyEnd);
+            }
+            (Some(lock), outcome)
+        }
         Err(error) => (
             None,
             Err(CreationFailure::Io(anyhow!(
@@ -1844,7 +1851,8 @@ pub(crate) async fn create_in(
                 None => drop(shared),
                 Some(Ok(judged)) => {
                     let identity = judged.identity;
-                    let (shared, copied) = copy_blocking(judged, stage, shared).await;
+                    let (shared, copied) =
+                        copy_blocking(judged, stage, shared, engine.ticks.as_ref()).await;
                     drop(shared);
                     return match copied {
                         Ok(()) => Ok(Created::Copied {
@@ -1876,7 +1884,7 @@ pub(crate) async fn create_in(
     match inspect(root, key)? {
         Inspection::Valid(judged) => {
             let identity = judged.identity;
-            let (lock, copied) = copy_blocking(judged, stage, lock).await;
+            let (lock, copied) = copy_blocking(judged, stage, lock, engine.ticks.as_ref()).await;
             if let Err(failure) = &copied
                 && failure.is_verdict()
             {
@@ -1916,7 +1924,8 @@ pub(crate) async fn create_in(
                 // Copied from the published template, or from the verified
                 // stage when publication failed; the chain is paid once.
                 let judged = report.published.then_some(template.identity);
-                let (lock, copied) = copy_blocking(template, stage, lock).await;
+                let (lock, copied) =
+                    copy_blocking(template, stage, lock, engine.ticks.as_ref()).await;
                 match copied {
                     Ok(()) => {
                         drop(lock);

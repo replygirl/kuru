@@ -5599,6 +5599,227 @@ mod tests {
         verdict.and(cleanup)
     }
 
+    /// A gated starter's gated owner creating a new project from the store
+    /// template keeps advancing its progress count after its OpeningDatabase
+    /// report: the count its starter reads while the owner is held at its
+    /// first `supervisor-spawned` (the stage engine's start) is past the
+    /// count that report left. Held there for longer than one window after
+    /// its last advance, the owner is still abandoned as stalled, with the
+    /// held event named as the owner's last.
+    ///
+    /// The baseline comes from the existing `CreatingDatabase` stage hold:
+    /// the owner's open is not polled while it holds, so the record holding
+    /// that stage carries a count no later point has advanced. From that
+    /// stage to the first engine spawn the OpeningDatabase report is the only
+    /// stage report, so a count above `baseline + 1` there is progress from
+    /// the creation span itself. The client clock is paused as in
+    /// `readiness_deadline_names_the_owner_event_it_was_held_at`; every
+    /// real-clock observation runs inside the one blocking waiter, so the
+    /// starter's window cannot run while the owner is still writing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn creation_progress_continues_until_the_held_stage_engine_spawn() -> Result<()> {
+        crate::test_support::warm_runtime_cache().await?;
+        let root = crate::test_support::tempdir()?;
+        let (project, scope, data, mut options) = owner_fixture(root.path())?;
+        let executable = options
+            .supervisor
+            .clone()
+            .context("fixture supervisor absent")?;
+        let token = uuid::Uuid::new_v4();
+        options.starter_token = Some(token);
+        let budget = Duration::from_secs(options.config.startup_timeout_secs);
+        let holds = root.path().join("holds");
+        std::fs::create_dir(&holds)?;
+        // The marker's content is its observation budget: the owner waits
+        // for its removal at most one startup budget.
+        let creating = holds.join("CreatingDatabase.hold");
+        std::fs::write(&creating, budget.as_millis().to_string())?;
+        let held = EventHold::create(&holds, "supervisor-spawned")?;
+        let published = EventHold::create(&holds, "endpoint-published")?;
+        published.release()?;
+        let environment = vec![
+            (OsString::from(open_timeline::ENV), OsString::from("1")),
+            (
+                OsString::from(open_timeline::hold::DIR_ENV),
+                holds.clone().into_os_string(),
+            ),
+            (
+                OsString::from(activity::OPEN_HOLD_DIR_ENV),
+                holds.clone().into_os_string(),
+            ),
+        ];
+        let reached_spawn = held.entered_waiter(budget)?;
+        let observe = {
+            let (data, scope) = (data.clone(), scope.clone());
+            let tag = activity::activity_tag(&token);
+            move || -> Result<(u64, u64)> {
+                let read = || activity::read_activity(&data, &scope, &tag).ok();
+                let until = |what: &str, accept: &dyn Fn(&activity::Activity) -> bool| {
+                    let deadline = std::time::Instant::now() + budget;
+                    let mut last = None;
+                    loop {
+                        if let Some(activity) = read() {
+                            if accept(&activity) {
+                                return Ok(activity);
+                            }
+                            last = Some(activity);
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            bail!(
+                                "{what} within {} s; last record read: {last:?}",
+                                budget.as_secs()
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                };
+                let baseline = until(
+                    "the owner published no record holding CreatingDatabase",
+                    &|activity| activity.stages.contains(&MemoryOpenStage::CreatingDatabase),
+                )?
+                .progress;
+                std::fs::remove_file(&creating)?;
+                reached_spawn()?;
+                let opening = baseline + 1;
+                let observed = until(
+                    &format!(
+                        "the owner held at its first supervisor-spawned advanced no further than \
+                         the OpeningDatabase report's count {opening} (CreatingDatabase at \
+                         {baseline}): the creation span reports no progress"
+                    ),
+                    &|activity| activity.progress > opening,
+                )?
+                .progress;
+                Ok((baseline, observed))
+            }
+        };
+
+        // Held across the owner spawn; see `crate::spawn_gate`.
+        let spawn_gate = crate::spawn_gate::spawning().await;
+        tokio::time::pause();
+        let inhibitor = tokio::task::spawn_blocking(observe);
+        let (outcome, reached) = activity::with_owner_environment(
+            environment,
+            open_timeline::with_gate(true, async {
+                tokio::join!(attach_or_start(&options, &project, &executable), async {
+                    let reached = inhibitor
+                        .await
+                        .context("the hold waiter panicked")
+                        .and_then(|reached| reached);
+                    if reached.is_err() {
+                        tokio::time::resume();
+                    }
+                    reached
+                })
+            }),
+        )
+        .await;
+        if reached.is_ok() {
+            tokio::time::resume();
+        }
+        drop(spawn_gate);
+
+        let verdict = (|| -> Result<()> {
+            let (baseline, observed) = *reached
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            let error = outcome
+                .as_ref()
+                .err()
+                .context("an owner held at supervisor-spawned was reported ready")?;
+            let rendered = format!("{error:#}");
+            let Some(ReadinessFailure::Stalled {
+                last_stage,
+                seen,
+                since,
+                window,
+                owner_timeline,
+                ..
+            }) = error.downcast_ref::<ReadinessFailure>()
+            else {
+                bail!("a held owner was not reported as a stall: {rendered}");
+            };
+            ensure!(
+                rendered.starts_with("memory service readiness deadline exceeded"),
+                "readiness failure lost its leading text: {rendered}"
+            );
+            ensure!(
+                *last_stage == Some(MemoryOpenStage::OpeningDatabase),
+                "the stall names another stage: {rendered}"
+            );
+            ensure!(
+                *seen >= observed && *seen > baseline + 1,
+                "the starter saw {seen} advances, not past the OpeningDatabase report's {} \
+                 (observed {observed} before the window ran): {rendered}",
+                baseline + 1
+            );
+            ensure!(
+                *since >= *window,
+                "the stall came before one window without progress: {rendered}"
+            );
+            let clause = owner_timeline
+                .strip_prefix("owner timeline: ")
+                .with_context(|| format!("the deadline lacks the owner timeline: {rendered}"))?;
+            ensure!(
+                clause
+                    .split("; ")
+                    .any(|field| field.starts_with("last=supervisor-spawned ")),
+                "the owner timeline does not end at supervisor-spawned: {rendered}"
+            );
+            let events: Vec<&str> = clause
+                .split("; ")
+                .find_map(|field| field.strip_suffix(" (ms)"))
+                .with_context(|| format!("the owner timeline lists no events: {rendered}"))?
+                .split(' ')
+                .filter_map(|event| event.split_once('=').map(|(name, _)| name))
+                .collect();
+            let position = |name: &str| events.iter().position(|event| *event == name);
+            let order = [
+                "create-start",
+                "legacy-prepared",
+                "recovery-checked",
+                "copy-end",
+                "spawn-call",
+                "supervisor-spawned",
+            ]
+            .map(position);
+            ensure!(
+                order.iter().all(Option::is_some) && order.is_sorted(),
+                "the owner timeline lacks the creation span's events in order: {rendered}"
+            );
+            ensure!(
+                events
+                    .iter()
+                    .filter(|event| **event == "supervisor-spawned")
+                    .count()
+                    == 1,
+                "the owner was not held at its first engine start: {rendered}"
+            );
+            Ok(())
+        })();
+
+        // Cleanup on every path, on the real clock.
+        let _ = std::fs::remove_file(holds.join("CreatingDatabase.hold"));
+        held.release()?;
+        let attachment = outcome.ok();
+        let deadline = crate::test_support::fixture_deadline(1, 0);
+        let cleanup = tokio::time::timeout(deadline, async {
+            if reached.is_ok() {
+                let bound = crate::test_support::fresh_open_budget();
+                tokio::task::spawn_blocking(published.entered_waiter(bound)?).await??;
+                drop(attach_raw(&data, &scope, Some(token)).await?);
+                await_owner_release(&options).await?;
+            }
+            drop(attachment);
+            crate::test_support::await_managed_quiescence(&options).await
+        })
+        .await
+        .with_context(|| format!("held-owner cleanup exceeded its {deadline:?} deadline"))
+        .and_then(|retired| retired.context("retire the held owner"));
+        verdict.and(cleanup)
+    }
+
     #[tokio::test]
     async fn inspection_waits_for_a_booting_owner_without_starting_dolt() -> Result<()> {
         // Held for the whole test: it takes and releases a real owner flock and

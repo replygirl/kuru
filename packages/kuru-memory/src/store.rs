@@ -2297,6 +2297,7 @@ impl MemoryStore {
                     .await??
                     .map(Arc::new)
                 };
+            progress.milestone(open_timeline::Event::LegacyPrepared);
             let recovered = recover_staging(
                 &directory,
                 &options.project_scope,
@@ -2306,6 +2307,7 @@ impl MemoryStore {
                 progress,
             )
             .await?;
+            progress.milestone(open_timeline::Event::RecoveryChecked);
             let new_stage = || {
                 parent.join(format!(
                     "{}.staging-{}",
@@ -2345,7 +2347,7 @@ impl MemoryStore {
                 lock = Some(returned_lock);
                 match created {
                     creation_worker::Outcome::Ready => {
-                        open_timeline::stamp(open_timeline::Event::TemplateCopied);
+                        progress.milestone(open_timeline::Event::TemplateCopied);
                         let lease =
                             Server::quiescence_at(&staging, lifecycle_root.as_deref(), timeout)
                                 .await?;
@@ -2387,7 +2389,7 @@ impl MemoryStore {
                 .move_to(&directory)
                 .context("cannot activate validated Dolt memory")?;
             drop(staging);
-            open_timeline::stamp(open_timeline::Event::Activated);
+            progress.milestone(open_timeline::Event::Activated);
         }
         let activation = read_activation(&directory, &options.project_scope)?;
         if let Some(receipt) = &activation.restore {
