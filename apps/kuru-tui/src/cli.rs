@@ -961,6 +961,28 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
     );
     let cwd = root.path().to_path_buf();
 
+    // State directories are never tool roots. Refuse a workspace that contains
+    // the data directory once, before any command can review or use state.
+    // Configuration and trust status remain pure inspections; status reports
+    // the same condition in its review.
+    if !matches!(
+        cli.command,
+        Some(
+            Command::Config
+                | Command::Trust {
+                    command: TrustCommand::Status
+                }
+        )
+    ) && matches!(crate::trust::state_inside_workspace(&data, &root), Ok(true))
+    {
+        let refusal = state_inside_workspace_refusal(&data, &root);
+        return Err(if matches!(cli.command, Some(Command::Run { .. })) {
+            anyhow::Error::new(crate::headless::RunExit(2)).context(refusal)
+        } else {
+            anyhow::anyhow!(refusal)
+        });
+    }
+
     // Inventory is a fixed, non-provisioning inspection. It must not parse or
     // activate automatic workspace configuration to list old scopes.
     if matches!(
@@ -1234,7 +1256,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
     {
         let _retained_data = Directory::open(&data, Privacy::OwnerOnly, NameRetention::Movable)
             .map_err(|error| data_directory_error(&data, error))?;
-        ensure_outside_workspace(&data, &cwd)?;
+        ensure_state_outside_workspace(&data, &root)?;
         root.revalidate()
             .context("workspace changed before explicit legacy import")?;
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
@@ -1272,7 +1294,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                     async {
                         let _retained_data = Directory::ensure_private(&data)
                             .map_err(|error| data_directory_error(&data, error))?;
-                        ensure_outside_workspace(&data, &cwd)?;
+                        ensure_state_outside_workspace(&data, &root)?;
                         MemoryStore::verify_backup(options, backup, &cancellation).await
                     },
                     || cancellation.cancel(),
@@ -1292,7 +1314,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
                     async {
                         let _retained_data = Directory::ensure_private(&data)
                             .map_err(|error| data_directory_error(&data, error))?;
-                        ensure_outside_workspace(&data, &cwd)?;
+                        ensure_state_outside_workspace(&data, &root)?;
                         MemoryStore::restore_backup(
                             options,
                             &cwd,
@@ -1366,6 +1388,9 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
             "memory purge removes this project's local Dolt history and current memory; rerun with --yes after reviewing the retained-history boundary"
         );
     }
+    // Inspecting an existing store reads under the data directory, so its
+    // containment must be established first, failing closed when it cannot.
+    ensure_state_outside_workspace(&data, &root)?;
     let exists = if purge {
         false
     } else {
@@ -1397,7 +1422,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         if let Err(error) = Directory::ensure_private(&data) {
             return Err(data_directory_error(&data, error));
         }
-        ensure_outside_workspace(&data, &cwd)?;
+        ensure_state_outside_workspace(&data, &root)?;
         if runtime_owner {
             Directory::ensure_private(&data.join("locks"))
                 .context("project lock directory must be a private regular directory")?;
@@ -1417,7 +1442,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         if let Err(error) = Directory::ensure_private(&data) {
             return Err(data_directory_error(&data, error));
         }
-        ensure_outside_workspace(&data, &cwd)?;
+        ensure_state_outside_workspace(&data, &root)?;
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config;
         let outcome = MemoryStore::purge(options).await?;
@@ -1443,12 +1468,13 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
     }
     // A new installation can inspect configuration without creating state. An
     // existing store supplies only this project's interactive choices, never a
-    // resumed transcript. Refuse tool-root storage before opening its database.
+    // resumed transcript. Re-check tool-root containment by identity just before
+    // opening its database.
     let existing_memory = match async {
         if !exists && !legacy {
             return Ok::<Option<MemoryStore>, anyhow::Error>(None);
         }
-        ensure_outside_workspace(&data, &cwd)?;
+        ensure_state_outside_workspace(&data, &root)?;
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config.clone();
         options.read_only = !writer && !migrate && !backup;
@@ -1728,10 +1754,7 @@ async fn execute_inner(mut cli: Cli, install_diagnostics: bool) -> Result<()> {
         }
         std::fs::create_dir_all(&data)?;
         let data = data.canonicalize()?;
-        ensure!(
-            !data.starts_with(&cwd),
-            "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
-        );
+        ensure_state_outside_workspace(&data, &root)?;
         let memory = match existing_memory {
             Some(memory) => memory,
             None => {
@@ -2314,6 +2337,9 @@ pub(crate) fn manifest_text(
             ApprovalState::Unreadable(failure) => format!(
                 "approval record could not be read ({failure}); fix the permissions of the approval record or the Kuru data directory, then retry"
             ),
+            ApprovalState::InsideWorkspace => format!(
+                "approval storage lies inside this workspace; Kuru's data directory must be outside the tool workspace. {STATE_INSIDE_WORKSPACE_REMEDY}"
+            ),
         };
         text.push_str(&format!("\nStatus: {label}"));
     }
@@ -2369,6 +2395,33 @@ fn confirm(prompt: &str) -> Result<bool> {
     ))
 }
 
+/// The single refusal for a workspace that contains Kuru's data directory.
+fn state_inside_workspace_refusal(data: &Path, root: &Directory) -> String {
+    format!(
+        "Kuru's data directory {} is inside the workspace {}; Kuru keeps its state outside the tool workspace.\n{STATE_INSIDE_WORKSPACE_REMEDY}",
+        safe_path(data),
+        safe_path(root.path()),
+    )
+}
+
+/// The early check classifies only a positive identity observation. Each
+/// memory open repeats it just before the store opens, after its directory is
+/// retained or created, and fails closed when the data path cannot be opened
+/// without following links (an alias could otherwise reach a contained store).
+fn ensure_state_outside_workspace(data: &Path, root: &Directory) -> Result<()> {
+    match crate::trust::state_inside_workspace(data, root) {
+        Ok(false) => Ok(()),
+        Ok(true) => bail!(state_inside_workspace_refusal(data, root)),
+        Err(error) => Err(error.context(format!(
+            "Kuru's data directory {} could not be verified to be outside the tool workspace {}; use a data directory path without symbolic links.\n{STATE_INSIDE_WORKSPACE_REMEDY}",
+            safe_path(data),
+            safe_path(root.path()),
+        ))),
+    }
+}
+
+const STATE_INSIDE_WORKSPACE_REMEDY: &str = "Run Kuru from a project directory, pass `-C PROJECT`, or set `--data-dir` or `KURU_DATA_DIR` to a directory outside this workspace.";
+
 fn safe_path(path: &Path) -> String {
     let value = path.to_string_lossy();
     let mut safe = String::new();
@@ -2387,16 +2440,6 @@ fn safe_path(path: &Path) -> String {
 struct ProjectLease {
     _file: File,
     _directory: Directory,
-}
-
-fn ensure_outside_workspace(data: &Path, workspace: &Path) -> Result<()> {
-    let data = Directory::open(data, Privacy::Inherited, NameRetention::Movable)?;
-    let workspace = Directory::open(workspace, Privacy::Inherited, NameRetention::Movable)?;
-    ensure!(
-        !data.is_within(&workspace)?,
-        "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
-    );
-    Ok(())
 }
 
 fn project_lease(data: &Path, cwd: &Path) -> Result<ProjectLease> {

@@ -166,6 +166,15 @@ manager and run `kuru --provider responses --model MODEL_ID`. Provider selection
 stays explicit. See [authentication configuration](configuration.md#authentication)
 for storage overrides and migration from the removed `codex_command` setting.
 
+Kuru's workspace is the directory it is launched from, or the `-C` directory.
+Kuru keeps its state outside the tool workspace, so it refuses a workspace that
+contains its data directory. The default data directory is under your home
+directory, so running `kuru` from the home directory itself stops before any
+review or state with a message naming both directories. Run Kuru from a project
+directory, pass `-C PROJECT`, or set `--data-dir` or `KURU_DATA_DIR` to a
+directory outside that workspace. See
+[storage and authority](configuration.md#storage-and-authority).
+
 ## Supported platforms
 
 | System | Architecture | Target |

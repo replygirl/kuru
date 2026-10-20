@@ -37,6 +37,9 @@ pub(crate) enum ApprovalState {
     Invalid,
     /// The operating system refused or failed a read of the record or its storage.
     Unreadable(ReadFailure),
+    /// Kuru's data directory, which holds approval storage, is the workspace
+    /// or lies beneath it. No record is read and none can be stored there.
+    InsideWorkspace,
 }
 
 /// An operating-system error code from reading approval state. It displays
@@ -261,6 +264,9 @@ impl<'a> ApprovalStore<'a> {
 
     /// Inspect existing approval state without creating any directory, file, or lock.
     pub(crate) fn inspect(&self, manifest: &AuthorityManifest) -> ApprovalState {
+        if self.inside_workspace() {
+            return ApprovalState::InsideWorkspace;
+        }
         match self.read_record() {
             Ok(None) => ApprovalState::Absent,
             Ok(Some(checked))
@@ -285,6 +291,9 @@ impl<'a> ApprovalStore<'a> {
         extended: &AuthorityManifest,
         source_paths: &[[u8; 32]],
     ) -> (ApprovalState, Option<ReviewGeneration>) {
+        if self.inside_workspace() {
+            return (ApprovalState::InsideWorkspace, None);
+        }
         if !valid_source_paths(source_paths) {
             return (ApprovalState::Invalid, None);
         }
@@ -534,6 +543,12 @@ impl<'a> ApprovalStore<'a> {
         }))
     }
 
+    /// Only a positive identity observation classifies. An inspection error
+    /// leaves the record read to report the same object's own failure.
+    fn inside_workspace(&self) -> bool {
+        matches!(state_inside_workspace(self.data, self.root), Ok(true))
+    }
+
     fn open_store(&self) -> Result<Option<Directory>> {
         if !exists(self.data)? {
             return Ok(None);
@@ -682,6 +697,25 @@ pub(crate) fn exists(path: &Path) -> Result<bool> {
     }
 }
 
+/// Whether Kuru's data directory is the workspace root or lies beneath it,
+/// judged by the native identity of the directory or, while it does not exist
+/// yet, of its nearest existing ancestor. Each component is opened without
+/// following links, so an alias cannot hide containment; nothing is created.
+pub(crate) fn state_inside_workspace(data: &Path, root: &Directory) -> Result<bool> {
+    let mut candidate = data;
+    loop {
+        match Directory::open(candidate, Privacy::Inherited, NameRetention::Movable) {
+            Ok(directory) => return Ok(directory.is_within(root)?),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                candidate = candidate
+                    .parent()
+                    .context("data directory has no existing ancestor")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 pub(crate) fn ensure_outside_root(data: &Path, root: &Directory) -> Result<()> {
     ensure!(
         !data.starts_with(root.path()),
@@ -822,6 +856,67 @@ mod tests {
         assert_eq!(store.inspect(&fixture.manifest()), ApprovalState::Absent);
         assert!(!store.revoke().unwrap());
         assert!(!fixture.data.exists());
+    }
+
+    #[test]
+    fn approval_storage_inside_the_workspace_has_its_own_state() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        let manifest = fixture.manifest();
+        let nested = fixture.project.join("state/kuru");
+        let store = ApprovalStore::new(&nested, &fixture.workspace);
+        // Absent data is judged by its nearest existing ancestor, the root.
+        assert!(state_inside_workspace(&nested, &fixture.workspace).unwrap());
+        assert_eq!(store.inspect(&manifest), ApprovalState::InsideWorkspace);
+        assert_eq!(
+            store.inspect_nested(&manifest, &manifest, &[[0; 32]]).0,
+            ApprovalState::InsideWorkspace
+        );
+        assert!(!fixture.project.join("state").exists());
+        Directory::ensure_private(&nested).unwrap();
+        assert_eq!(store.inspect(&manifest), ApprovalState::InsideWorkspace);
+        assert_eq!(
+            ApprovalStore::new(&fixture.project, &fixture.workspace).inspect(&manifest),
+            ApprovalState::InsideWorkspace
+        );
+        // The store's own containment check still refuses persistence.
+        assert!(
+            store
+                .approve_command(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("approval storage must be outside the workspace")
+        );
+        assert!(!nested.join("trust").exists());
+
+        assert!(!state_inside_workspace(&fixture.data, &fixture.workspace).unwrap());
+        let outside = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        assert_eq!(outside.inspect(&manifest), ApprovalState::Absent);
+        // A malformed record outside the workspace remains invalid.
+        outside.approve_command(&manifest).unwrap();
+        let directory = outside.open_store().unwrap().unwrap();
+        replace_record(&directory, &record_name(&fixture.workspace), b"{}");
+        assert_eq!(outside.inspect(&manifest), ApprovalState::Invalid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_uninspectable_data_path_is_left_to_the_record_read() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        let target = fixture.project.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = fixture.data.with_file_name("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // A linked component is not followed, so containment is not claimed.
+        assert!(state_inside_workspace(&link.join("kuru"), &fixture.workspace).is_err());
+        let store = ApprovalStore::new(&link, &fixture.workspace);
+        let manifest = fixture.manifest();
+        // The record read refuses the linked store itself and fails closed:
+        // it is structurally invalid, never approved, and cannot be written.
+        assert_eq!(store.inspect(&manifest), ApprovalState::Invalid);
+        assert!(store.approve_command(&manifest).is_err());
+        assert!(!target.join("trust").exists());
     }
 
     #[test]

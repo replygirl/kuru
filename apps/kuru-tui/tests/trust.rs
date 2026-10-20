@@ -1830,3 +1830,225 @@ fn real_pty_refusal_eof_and_persistent_choice_precede_the_alternate_screen() {
     let status = sandbox.success(&["trust", "status"]);
     assert!(text(&status.stdout).contains("Status: approved"));
 }
+
+/// A launch whose workspace contains Kuru's data directory. `data` selects an
+/// explicit `--data-dir`; `None` derives the default from `XDG_DATA_HOME`
+/// under `xdg_data_home`, as a home-directory launch does.
+fn contained_command(
+    sandbox: &Sandbox,
+    workspace: &std::path::Path,
+    data: Option<&std::path::Path>,
+    xdg_data_home: &std::path::Path,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+    #[cfg(windows)]
+    command.fixture_allow_independent_service();
+    command.arg("-C").arg(workspace);
+    if let Some(data) = data {
+        command.arg("--data-dir").arg(data);
+    }
+    command
+        .env_remove("KURU_DATA_DIR")
+        .env("XDG_DATA_HOME", xdg_data_home)
+        .env("XDG_CONFIG_HOME", sandbox.root.path().join("config"));
+    command
+}
+
+fn assert_contained_refusal(output: &Output, workspace: &std::path::Path) {
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    for expected in [
+        "Kuru's data directory",
+        "is inside the workspace",
+        "outside the tool workspace",
+        "Run Kuru from a project directory, pass `-C PROJECT`, or set `--data-dir` or `KURU_DATA_DIR`",
+    ] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
+    assert!(
+        stderr.contains(&safe_source_label(workspace)),
+        "workspace not named: {stderr}"
+    );
+    for misleading in [
+        "invalid or unsafe",
+        "Continue once",
+        "approval storage must be outside",
+        "authentication state must be outside",
+    ] {
+        assert!(!stderr.contains(misleading), "{misleading:?}: {stderr}");
+    }
+}
+
+#[test]
+fn a_workspace_containing_the_data_directory_is_refused_before_review() {
+    let sandbox = Sandbox::new("allow_shell = true\n");
+    let nested = sandbox.project.join("state");
+    let xdg = sandbox.root.path().join("xdg-data");
+    for present in [false, true] {
+        if present {
+            std::fs::create_dir(&nested).unwrap();
+        }
+        let run = |args: &[&str]| {
+            contained_command(&sandbox, &sandbox.project, Some(&nested), &xdg)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+
+        // Status remains a pure inspection with its own classification.
+        let status = run(&["trust", "status"]);
+        assert!(status.status.success(), "{}", text(&status.stderr));
+        let stdout = text(&status.stdout);
+        assert!(
+            stdout.contains(
+                "Status: approval storage lies inside this workspace; Kuru's data directory must be outside the tool workspace."
+            ),
+            "{stdout}"
+        );
+        assert!(stdout.contains("pass `-C PROJECT`"), "{stdout}");
+        assert!(!stdout.contains("invalid or unsafe"), "{stdout}");
+        // Configuration inspection never touches the data directory.
+        let config = run(&["config"]);
+        assert!(config.status.success(), "{}", text(&config.stderr));
+        toml::from_slice::<toml::Value>(&config.stdout).unwrap();
+
+        for args in [
+            &["sessions"][..],
+            &["--trust-workspace-once", "sessions"],
+            &["trust", "approve", "--yes"],
+            &["trust", "revoke"],
+            &["logout"],
+            &["memory", "inventory"],
+            &["file", "list"],
+        ] {
+            let output = run(args);
+            assert_contained_refusal(&output, &sandbox.project);
+            assert_eq!(output.status.code(), Some(1), "{args:?}");
+        }
+        let output = run(&["--trust-workspace-once", "run", "contained"]);
+        assert_contained_refusal(&output, &sandbox.project);
+        assert_eq!(output.status.code(), Some(2));
+        if present {
+            assert_eq!(std::fs::read_dir(&nested).unwrap().count(), 0);
+        } else {
+            assert!(!nested.exists());
+        }
+    }
+    assert!(!sandbox.data.exists());
+    assert!(!xdg.exists());
+
+    // The default data directory derived from XDG_DATA_HOME is classified the
+    // same way when the workspace is its ancestor, as for a home launch.
+    let output = contained_command(&sandbox, sandbox.root.path(), None, &xdg)
+        .arg("sessions")
+        .output()
+        .unwrap();
+    assert_contained_refusal(&output, sandbox.root.path());
+    assert!(!xdg.exists());
+}
+
+#[cfg(unix)]
+fn contained_terminal_command(
+    sandbox: &Sandbox,
+    workspace: &std::path::Path,
+    data: Option<&std::path::Path>,
+    xdg_data_home: &std::path::Path,
+) -> ProcessCommand {
+    let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_kuru"));
+    command.arg("-C").arg(workspace);
+    if let Some(data) = data {
+        command.arg("--data-dir").arg(data);
+    }
+    command
+        .env_remove("KURU_DATA_DIR")
+        .env("XDG_DATA_HOME", xdg_data_home)
+        .env("XDG_CONFIG_HOME", sandbox.root.path().join("config"))
+        .env(
+            kuru_memory::test_support::OWNER_DIAGNOSTIC_ENV,
+            sandbox.root.owner_diagnostic_path(),
+        )
+        .env("TERM", "xterm-256color");
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn real_pty_launch_refuses_contained_state_without_the_trust_prompt() {
+    // With automatic claims the prompt used to appear first; without claims
+    // the launch used to create the nested directory before refusing.
+    for config in ["allow_shell = true\n", ""] {
+        let sandbox = Sandbox::new(config);
+        let nested = sandbox.project.join("state");
+        let xdg = sandbox.root.path().join("xdg-data");
+        std::fs::create_dir(sandbox.root.path().join(".kuru")).unwrap();
+        std::fs::write(sandbox.root.path().join(".kuru/config.toml"), config).unwrap();
+        for (workspace, data) in [
+            (sandbox.project.clone(), Some(nested.as_path())),
+            (sandbox.root.path().to_path_buf(), None),
+        ] {
+            let command = contained_terminal_command(&sandbox, &workspace, data, &xdg);
+            let mut terminal = terminal::Terminal::spawn(command, 35, 120).unwrap();
+            wait_for_refusal(&mut terminal, Duration::from_secs(10));
+            let output = String::from_utf8_lossy(&terminal.output).into_owned();
+            assert!(
+                output.contains("outside the tool workspace")
+                    && output.contains("pass `-C PROJECT`"),
+                "{config:?} {workspace:?}: {}",
+                terminal.screen()
+            );
+            assert!(
+                !output.contains("Continue once") && !output.contains("invalid or unsafe"),
+                "{config:?} {workspace:?}: {}",
+                terminal.screen()
+            );
+            assert!(!nested.exists());
+            assert!(!xdg.exists());
+        }
+    }
+}
+
+/// A data path that reaches a store inside the workspace through a link
+/// cannot be classified by identity early, so every memory open re-checks
+/// containment and fails closed rather than opening the contained store.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_data_directory_into_the_workspace_never_opens_its_store() {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::new("");
+        let state = sandbox.project.join("state");
+        let scope = kuru_runtime::project_scope(&sandbox.project).unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(state.clone(), scope.clone())
+            .await
+            .unwrap();
+        MemoryStore::open(options)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        assert!(MemoryStore::exists(&state, &scope).unwrap());
+        let alias = sandbox.root.path().join("alias");
+        std::os::unix::fs::symlink(&state, &alias).unwrap();
+        let xdg = sandbox.root.path().join("xdg-data");
+        for args in [&["sessions"][..], &["--provider", "demo", "run", "linked"]] {
+            let output = contained_command(&sandbox, &sandbox.project, Some(&alias), &xdg)
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = text(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{args:?} opened the linked store: {stderr}"
+            );
+            assert!(
+                stderr.contains("could not be verified to be outside the tool workspace")
+                    && stderr.contains("pass `-C PROJECT`"),
+                "{args:?}: {stderr}"
+            );
+            assert!(!stderr.contains("activation record"), "{args:?}: {stderr}");
+        }
+        // The contained store was not opened, migrated or changed.
+        assert!(MemoryStore::exists(&state, &scope).unwrap());
+    })
+    .await
+}
