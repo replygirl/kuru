@@ -165,11 +165,11 @@ jobs:
     timeout-minutes: 90
     env:
       # Cargo.lock names in kuru-archive's locked dependency closure, which
-      # holds the ZIP writer, its deflate code and the Unix permission
-      # bindings zip 9 requires. The closure follows every edge the lock
-      # records, for any feature or target; the digest covers every locked
-      # version of each name. bundle_build.rs recomputes the closure from
-      # Cargo.lock and requires exactly this list.
+      # holds the ZIP writer, its deflate code and the nix bindings zip 9
+      # requires on macOS and BSD targets. The closure follows every edge
+      # the lock records, for any feature or target; the digest covers every
+      # locked version of each name. bundle_build.rs recomputes the closure
+      # from Cargo.lock and requires exactly this list.
       ENGINE_ARCHIVE_CRATES: >-
         adler2 allocator-api2 anyhow bitflags cfg-if cfg_aliases crc32fast
         equivalent flate2 foldhash hashbrown indexmap libc memchr miniz_oxide

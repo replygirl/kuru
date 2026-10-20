@@ -30,6 +30,7 @@ asset hash](https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_pub
 The 0.12.1 update, checked on 2026-09-26, embeds the same asset bytes and MIT
 license. The connector package carries the crate and asset MIT attributions in
 `THIRD_PARTY_NOTICES.md`.
+
 The advisory patch of 2026-10-20 moved the strict ZIP codec's `zip` pin to
 9.0.5 and resolved the transitive `rustls` entry to 0.23.46. RustSec reported
 RUSTSEC-2026-0367, 0368 and 0369 against `zip` 8.6.0 (all in its extraction
@@ -37,7 +38,8 @@ path, which Kuru never calls) and RUSTSEC-2026-0346 through 0349 against
 `rustls` 0.23.45. Kuru uses only the ZIP writer with `deflate-flate2`; the
 9.0 release keeps that writer API and feature name, and the lockfile change
 is limited to the two package entries plus the `nix` crate that `zip` 9
-requires for Unix permission handling.
+requires on macOS and BSD targets for permission handling; `Cargo.lock`
+records that edge for every target.
 
 ## Rust dependencies
 
