@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::{
     cli::{self, Cli},
-    trust::{ApprovalState, ApprovalStore},
+    trust::{ApprovalState, ApprovalStore, state_inside_workspace},
 };
 
 const SCHEMA_VERSION: u8 = 1;
@@ -62,6 +62,7 @@ enum Condition {
     PayloadConsistent,
     PayloadInvalid,
     InvocationInvalid,
+    StateInsideWorkspace,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -77,6 +78,7 @@ enum Action {
     RetryInspection,
     ReinstallKuru,
     CheckInvocation,
+    SeparateStateDirectory,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +201,7 @@ fn human_condition(value: Condition) -> &'static str {
         Condition::PayloadConsistent => "the embedded archive matches its target catalog",
         Condition::PayloadInvalid => "the embedded archive does not match its target catalog",
         Condition::InvocationInvalid => "the workspace or data directory could not be resolved",
+        Condition::StateInsideWorkspace => "Kuru's data directory lies inside this workspace",
     }
 }
 
@@ -223,6 +226,9 @@ fn human_action(value: Action) -> &'static str {
         Action::ReinstallKuru => "Reinstall Kuru from a verified release.",
         Action::CheckInvocation => {
             "Check `-C`, `--data-dir`, and the local data-directory environment."
+        }
+        Action::SeparateStateDirectory => {
+            "Run Kuru from a project directory, pass `-C PROJECT`, or set `--data-dir` or `KURU_DATA_DIR` to a directory outside this workspace."
         }
     }
 }
@@ -278,10 +284,13 @@ pub(crate) async fn run(
     json: bool,
 ) -> Result<()> {
     let mut checks = Vec::with_capacity(6);
+    // A launch refuses this workspace before reviewing or using any state, so
+    // the state checks report that cause instead of inspecting it.
+    let contained = matches!(state_inside_workspace(data, root), Ok(true));
     let captured = capture_configuration(cli, user, root).await;
     match captured {
         Ok((snapshot, chatgpt_selected)) => {
-            checks.push(chatgpt_subscription(data, cwd, chatgpt_selected).await);
+            checks.push(chatgpt_subscription(data, cwd, chatgpt_selected, contained).await);
             if root.revalidate().is_err() {
                 checks.push(Finding::new(
                     CheckId::Configuration,
@@ -308,26 +317,30 @@ pub(crate) async fn run(
                     Condition::ConfigurationValid,
                     Action::None,
                 ));
-                let trust = workspace_trust(data, root, &snapshot);
+                let trust = workspace_trust(data, root, &snapshot, contained);
                 let route_authorized = trust.route_authorized || cli.trust_workspace_once;
                 checks.push(trust.finding);
                 checks.push(responses_route(&snapshot, route_authorized));
             }
         }
         Err(ConfigurationFailure::Invalid) => {
-            checks.push(chatgpt_subscription(data, cwd, false).await);
+            checks.push(chatgpt_subscription(data, cwd, false, contained).await);
             checks.push(Finding::new(
                 CheckId::Configuration,
                 State::Problem,
                 Condition::ConfigurationInvalid,
                 Action::CheckConfiguration,
             ));
-            checks.push(Finding::new(
-                CheckId::WorkspaceTrust,
-                State::Unverified,
-                Condition::InspectionUnavailable,
-                Action::RetryInspection,
-            ));
+            checks.push(if contained {
+                contained_finding(CheckId::WorkspaceTrust, State::Problem)
+            } else {
+                Finding::new(
+                    CheckId::WorkspaceTrust,
+                    State::Unverified,
+                    Condition::InspectionUnavailable,
+                    Action::RetryInspection,
+                )
+            });
             checks.push(Finding::new(
                 CheckId::ResponsesRoute,
                 State::Unverified,
@@ -336,19 +349,23 @@ pub(crate) async fn run(
             ));
         }
         Err(ConfigurationFailure::Unreadable) => {
-            checks.push(chatgpt_subscription(data, cwd, false).await);
+            checks.push(chatgpt_subscription(data, cwd, false, contained).await);
             checks.push(Finding::new(
                 CheckId::Configuration,
                 State::Unverified,
                 Condition::ConfigurationUnreadable,
                 Action::RetryInspection,
             ));
-            checks.push(Finding::new(
-                CheckId::WorkspaceTrust,
-                State::Unverified,
-                Condition::InspectionUnavailable,
-                Action::RetryInspection,
-            ));
+            checks.push(if contained {
+                contained_finding(CheckId::WorkspaceTrust, State::Problem)
+            } else {
+                Finding::new(
+                    CheckId::WorkspaceTrust,
+                    State::Unverified,
+                    Condition::InspectionUnavailable,
+                    Action::RetryInspection,
+                )
+            });
             checks.push(Finding::new(
                 CheckId::ResponsesRoute,
                 State::Unverified,
@@ -358,7 +375,11 @@ pub(crate) async fn run(
         }
     }
 
-    checks.push(memory(data, cwd).await);
+    checks.push(if contained {
+        contained_finding(CheckId::Memory, State::Unverified)
+    } else {
+        memory(data, cwd).await
+    });
     checks.push(if kuru_memory::provision::verify_embedded_asset().is_ok() {
         Finding::new(
             CheckId::EmbeddedEngine,
@@ -437,13 +458,28 @@ struct TrustObservation {
     route_authorized: bool,
 }
 
-fn workspace_trust(data: &Path, root: &Directory, snapshot: &ConfigSnapshot) -> TrustObservation {
+fn contained_finding(id: CheckId, state: State) -> Finding {
+    Finding::new(
+        id,
+        state,
+        Condition::StateInsideWorkspace,
+        Action::SeparateStateDirectory,
+    )
+}
+
+fn workspace_trust(
+    data: &Path,
+    root: &Directory,
+    snapshot: &ConfigSnapshot,
+    contained: bool,
+) -> TrustObservation {
     let has_responses_claim = snapshot
         .manifest()
         .claims()
         .iter()
         .any(|claim| claim.category() == AuthorityClaimCategory::ResponsesRoute);
-    if snapshot.manifest().claims().is_empty() {
+    // Independent of claims: without any, the launch still refuses.
+    if snapshot.manifest().claims().is_empty() && !contained {
         return TrustObservation {
             finding: Finding::new(
                 CheckId::WorkspaceTrust,
@@ -454,7 +490,12 @@ fn workspace_trust(data: &Path, root: &Directory, snapshot: &ConfigSnapshot) -> 
             route_authorized: !has_responses_claim,
         };
     }
-    match ApprovalStore::new(data, root).inspect(snapshot.manifest()) {
+    let state = if contained {
+        ApprovalState::InsideWorkspace
+    } else {
+        ApprovalStore::new(data, root).inspect(snapshot.manifest())
+    };
+    match state {
         ApprovalState::Matching => TrustObservation {
             finding: Finding::new(
                 CheckId::WorkspaceTrust,
@@ -498,6 +539,10 @@ fn workspace_trust(data: &Path, root: &Directory, snapshot: &ConfigSnapshot) -> 
                 Condition::InspectionUnavailable,
                 Action::RetryInspection,
             ),
+            route_authorized: !has_responses_claim,
+        },
+        ApprovalState::InsideWorkspace => TrustObservation {
+            finding: contained_finding(CheckId::WorkspaceTrust, State::Problem),
             route_authorized: !has_responses_claim,
         },
     }
@@ -553,7 +598,11 @@ fn responses_route(snapshot: &ConfigSnapshot, authorized: bool) -> Finding {
     }
 }
 
-async fn chatgpt_subscription(data: &Path, cwd: &Path, selected: bool) -> Finding {
+async fn chatgpt_subscription(data: &Path, cwd: &Path, selected: bool, contained: bool) -> Finding {
+    // Kuru's authentication store refuses a contained data directory.
+    if contained {
+        return contained_finding(CheckId::ChatgptSubscription, State::Unverified);
+    }
     let manager = match AuthManager::new(data.to_path_buf(), cwd.to_path_buf(), None) {
         Ok(manager) => manager,
         Err(_) => {

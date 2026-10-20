@@ -571,3 +571,71 @@ fn doctor_rechecks_stored_approval_without_granting_changed_or_corrupt_authority
     ensure!(!data.join("tools").exists());
     Ok(())
 }
+
+#[test]
+fn doctor_names_a_workspace_that_contains_the_data_directory() -> Result<()> {
+    let sandbox = tempfile::tempdir()?;
+    let project = sandbox.path().join("private-project");
+    let data = project.join("private-data");
+    let config_home = sandbox.path().join("config-home");
+    fs::create_dir(&project)?;
+    // Without automatic claims, with a claim, and with invalid configuration.
+    for config in [
+        None,
+        Some("allow_shell = true\n"),
+        Some("unknown_doctor_key = 1\n"),
+    ] {
+        if let Some(config) = config {
+            fs::create_dir_all(project.join(".kuru"))?;
+            fs::write(project.join(".kuru/config.toml"), config)?;
+        }
+        let json = report(&launch(&project, &data, &config_home, &["--json"])?, 3)?;
+        for (id, state) in [
+            ("workspace_trust", "problem"),
+            ("chatgpt_subscription", "unverified"),
+            ("memory", "unverified"),
+        ] {
+            let finding = check(&json, id)?;
+            ensure!(finding["state"] == state, "{id}: {finding}");
+            ensure!(
+                finding["condition"] == "state_inside_workspace",
+                "{id}: {finding}"
+            );
+            ensure!(
+                finding["action"] == "separate_state_directory",
+                "{id}: {finding}"
+            );
+        }
+        let configuration = &check(&json, "configuration")?["condition"];
+        ensure!(
+            *configuration
+                == if config == Some("unknown_doctor_key = 1\n") {
+                    "configuration_invalid"
+                } else {
+                    "configuration_valid"
+                },
+            "{configuration}"
+        );
+        assert_private_human_report(
+            &launch(&project, &data, &config_home, &[])?,
+            3,
+            &[
+                "Workspace trust: Problem — Kuru's data directory lies inside this workspace. Run Kuru from a project directory, pass `-C PROJECT`, or set `--data-dir` or `KURU_DATA_DIR` to a directory outside this workspace.",
+                "ChatGPT subscription: Unverified — Kuru's data directory lies inside this workspace.",
+                "Project memory: Unverified — Kuru's data directory lies inside this workspace.",
+            ],
+        )?;
+        ensure!(!data.exists(), "doctor created contained data state");
+    }
+
+    // An existing contained data directory is reported the same way.
+    fs::remove_file(project.join(".kuru/config.toml"))?;
+    fs::create_dir(&data)?;
+    let json = report(&launch(&project, &data, &config_home, &["--json"])?, 3)?;
+    ensure!(check(&json, "workspace_trust")?["condition"] == "state_inside_workspace");
+    ensure!(
+        fs::read_dir(&data)?.count() == 0,
+        "doctor wrote contained state"
+    );
+    Ok(())
+}

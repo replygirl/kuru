@@ -523,6 +523,11 @@ instead of reporting invalid state. Approving again would repeat the same
 read, so restore the owner's access to the record or data directory and retry.
 A record that becomes unreadable while a nested review is pending fails that
 publication with the read error.
+When Kuru's data directory lies inside the workspace, status reports that
+approval storage lies inside this workspace, with the remedies, instead of
+invalid state; no record can be read or stored there. Every other command,
+including interactive startup, refuses before any review prompt (see
+[storage and authority](#storage-and-authority)).
 
 The activation sets are command-specific:
 
@@ -692,6 +697,21 @@ prevents competing Kuru processes from overwriting the same project topology;
 session listing remains available without a writer lock. Restrict access to the
 user data directory as you would a chat transcript. They are not included in
 source control and should never be exposed as a tool root.
+
+The workspace, the `-C` directory or the invocation directory, is the tool
+root, and Kuru refuses a workspace that is or contains its data directory. A
+launch from the home directory with the default data directory is the common
+case. The check compares native directory identities of the data directory, or
+of its nearest existing ancestor while it does not exist yet, creates nothing,
+and runs before configuration discovery, trust review and any state access. One
+message names both directories and the remedies: run Kuru from a project
+directory, pass `-C PROJECT`, or set `--data-dir` or `KURU_DATA_DIR` to a
+directory outside the workspace. Headless `run` exits 2. `config` and `trust
+status` remain available as inspections, and `kuru doctor` reports the
+`state_inside_workspace` condition with the `separate_state_directory` action
+for workspace trust, the ChatGPT subscription and project memory (exit 3).
+The approval, tool-grant, authentication and managed-configuration stores keep
+their own containment checks.
 
 Kuru includes its pinned full-Dolt engine and licenses in the executable. First
 memory use verifies and extracts them locally; later runs reuse the verified
