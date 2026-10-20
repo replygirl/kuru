@@ -17,5 +17,5 @@
 
 ## 4. Repository gates
 
-- [~] 4.1 @integration (agent) full PR CI on the final head including the 95% workspace coverage gate -> defer: run 39449472581 at 24118cda passes every coverage partition and merge on all native platforms; only RustSec advisories (job 118720117618) is red, from advisories published 2026-10-14 against transitive rustls and zip that a separate dependency fix on main addresses. Re-observe on the rebased head before archive.
+- [~] 4.1 @integration (agent) full PR CI on the final head including the 95% workspace coverage gate -> defer: runs 39449472581 (24118cda) and 39461190875 (2195c9da, after review follow-up) pass every coverage partition and merge on all native platforms; only RustSec advisories (job 118720117618) is red, from advisories published 2026-10-14 against transitive rustls and zip that a separate dependency fix on main addresses. Re-observe on the rebased head before archive.
 
