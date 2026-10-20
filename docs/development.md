@@ -2080,8 +2080,9 @@ proves the recipe still reproduces the pin. The key hashes:
   modules never reach the binary;
 - the ZIP writer, `packages/kuru-archive/src/zip.rs`;
 - the `Cargo.lock` records of kuru-archive's locked dependency closure, which
-  holds the ZIP and deflate crates. The job's `ENGINE_ARCHIVE_CRATES` names them.
-  Other `Cargo.lock` changes do not rotate the key.
+  holds the ZIP and deflate crates and the Unix permission bindings `zip` 9
+  requires. The job's `ENGINE_ARCHIVE_CRATES` names them. Other `Cargo.lock`
+  changes do not rotate the key.
 
 `packages/kuru-memory/mise.toml` and `mise.lock` are not hashed. Instead,
 `cargo test -p kuru-delivery --features tooling --test bundle_build` requires
