@@ -15,3 +15,5 @@ Observed (local, macOS arm64): before the fix `help_output_keeps_its_place_when_
 ## 3. Delivery
 
 - [ ] 3.1 Open the PR, observe CI green including the 95% coverage gate on the exact head, and record run IDs.
+
+Observed: PR #279, run 39448000417 on ee398acb. All jobs except RustSec pass, coverage clears 95% on every platform. RustSec advisories (job 118714937401) is blocked by the pending main dependency fix for rustls/zip; it is not caused by this change. 3.1 stays open until a green run lands on the rebased head.
