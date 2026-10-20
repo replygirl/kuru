@@ -11,7 +11,11 @@
 - [x] 2.1 @unit (agent) rename a part or switch framework after replies were installed -> `roster_and_relationship_changes_relabel_earlier_replies` and `relabel_changes_only_speaker_items_and_reports_no_change_when_stable` pass: earlier replies relabel, layout identity changes only for changed items. `unknown_speakers_share_one_prefix_fallback_and_system_roles_are_unchanged` shows live and reloaded entries share the 16-character prefix, `unknown` stays for a missing speaker and the interruption record stays `kuru`.
 - [x] 2.2 @manual (agent) read record-level outputs (`kuru sessions export`, `/export`, boundary picker, `run --json`, `kuru memory export`) by source -> none go through the transcript projection; each still prints the stored speaker id and this change does not alter them. `/export` and `kuru sessions export` serialize `PublicTranscriptEntry` records (`speaker_id`); `kuru sessions` lists `last_completed_speaker`; the fork-boundary picker label embeds `record.speaker_id`; `run --json` prints `TurnOutput.speaker`; `kuru memory export` writes `StorageRecord::PublicTurn`. Only the display-name snapshot follow-on would change them.
 
-## 3. Repository gates
+## 3. Relationship replies
 
-- [~] 3.1 @integration (agent) full PR CI on the final head including the 95% workspace coverage gate -> defer: run 39449472581 at 24118cda passes every coverage partition and merge on all native platforms; only RustSec advisories (job 118720117618) is red, from advisories published 2026-10-14 against transitive rustls and zip that a separate dependency fix on main addresses. Re-observe on the rebased head before archive.
+- [x] 3.0 @unit (agent) a relationship turn completes live, its page is reinstalled, then the relationship is removed -> `relationship_replies_keep_their_composite_label_after_reload`: live and persisted both read `alliance · <members>`; an unchanged snapshot keeps the item's projection identity; after removal the label is the 16-character id prefix, the documented exception.
+
+## 4. Repository gates
+
+- [~] 4.1 @integration (agent) full PR CI on the final head including the 95% workspace coverage gate -> defer: run 39449472581 at 24118cda passes every coverage partition and merge on all native platforms; only RustSec advisories (job 118720117618) is red, from advisories published 2026-10-14 against transitive rustls and zip that a separate dependency fix on main addresses. Re-observe on the rebased head before archive.
 

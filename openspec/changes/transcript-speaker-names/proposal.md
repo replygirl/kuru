@@ -8,7 +8,7 @@ The persisted projection (`Transcript::from_page`/`append_turn`) labels assistan
 
 ## What Changes
 
-- One shared speaker-label function (roster name, relationship kind, 16-character prefix) serves the live reply, activity and persisted projections; persisted assistant entries get exactly the live label.
+- One shared speaker-label function (roster name, relationship `kind · members`, 16-character prefix) serves the live reply, activity and persisted projections; persisted assistant entries get exactly the live label.
 - Transcript items keep the raw speaker id. Every roster or relationship change re-derives the labels of all items that carry one, so renames and framework switches update earlier replies.
 - Newest, older, newer, search and restore page installs, and the initial view projection, resolve labels through that function. Non-assistant roles and records without a speaker are unchanged.
 
@@ -20,7 +20,7 @@ The persisted projection (`Transcript::from_page`/`append_turn`) labels assistan
 
 ## Impact
 
-`apps/kuru-tui/src/ui.rs`, `apps/kuru-tui/src/ui/transcript.rs` and a short passage each in `docs/interface.md` and `docs/usage.md`. No memory record, migration, CLI output, protocol or dependency change. `kuru sessions export`, the session-boundary picker and other record-level outputs still print the stored speaker id; a memory-side display-name snapshot in `PublicTurnRecord` is an explicit follow-on and non-goal. The interface docs now state that reloaded replies share the live name, and the usage docs state that exports carry stored identities.
+`apps/kuru-tui/src/ui.rs`, `apps/kuru-tui/src/ui/transcript.rs` and a short passage each in `docs/interface.md` and `docs/usage.md`. No memory record, migration, CLI output, protocol or dependency change. `kuru sessions`, `/export`, `kuru sessions export`, `kuru run --json`, `kuru memory export` and the fork-boundary picker are not transcript projections and still print the stored speaker id; a memory-side display-name snapshot in `PublicTurnRecord` is an explicit follow-on and non-goal. The interface docs state that reloaded replies share the live name, naming the removed-relationship exception, and the usage docs list the outputs that keep stored identities.
 
 ## Surfaces
 

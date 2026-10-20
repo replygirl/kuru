@@ -796,6 +796,8 @@ impl View {
         self.mode = runtime.mode;
         self.model = runtime.model;
         self.effort = runtime.effort;
+        let roster_changed =
+            self.parts != runtime.parts || self.relationships != runtime.relationships;
         self.parts = runtime.parts;
         self.relationships = runtime.relationships;
         self.focus = runtime.focus;
@@ -804,7 +806,9 @@ impl View {
         self.routes.retain(|(from, to)| {
             self.parts.iter().any(|(id, _)| id == from) && self.parts.iter().any(|(id, _)| id == to)
         });
-        self.relabel_transcript();
+        if roster_changed {
+            self.relabel_transcript();
+        }
     }
 
     fn actor_name(&self, id: &str) -> String {
@@ -815,7 +819,7 @@ impl View {
     fn relabel_transcript(&mut self) {
         let (parts, relationships) = (&self.parts, &self.relationships);
         self.transcript
-            .relabel(&|id| speaker_label(parts, relationships, id));
+            .relabel(&|id| transcript_label(parts, relationships, id));
     }
 
     fn settle(&mut self) {
@@ -1101,19 +1105,13 @@ impl View {
                     .iter()
                     .map(|id| self.actor_name(id))
                     .collect::<Vec<_>>();
-                if members.is_empty() {
-                    relationship.kind.to_string()
-                } else {
-                    format!("{} · {}", relationship.kind, members.join(" + "))
-                }
+                relationship_label(&relationship.kind.to_string(), &members)
             })
             .unwrap_or_else(|| self.actor_name(&output.speaker));
         self.speaker_id = output.speaker;
         self.speaker = speaker.clone();
-        self.transcript.push((speaker, output.text));
-        if output.relationship.is_none() {
-            self.transcript.set_last_speaker(&self.speaker_id);
-        }
+        self.transcript
+            .push_speaker((speaker, output.text), &self.speaker_id);
         if let (Some(turn), Some(source)) = (&self.active_operation_id, &self.active_source_view) {
             self.transcript.bind_answer(&self.session, turn, source);
         }
@@ -1832,8 +1830,7 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
 }
 
 /// Label a part or relationship id for display: the part's name, a
-/// relationship's kind, or the id's first 16 characters. The live reply and the
-/// persisted page projection share this so one speaker has one label.
+/// relationship's kind, or the id's first 16 characters.
 fn speaker_label(parts: &[(String, String)], relationships: &[Relationship], id: &str) -> String {
     parts
         .iter()
@@ -1848,12 +1845,43 @@ fn speaker_label(parts: &[(String, String)], relationships: &[Relationship], id:
         .unwrap_or_else(|| id.chars().take(16).collect())
 }
 
+/// The label of a relationship reply: its kind and member names.
+fn relationship_label(kind: &str, members: &[String]) -> String {
+    if members.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind} · {}", members.join(" + "))
+    }
+}
+
+/// Label a transcript reply's speaker. A part reads as its name and a known
+/// relationship as `kind · members`, exactly as the live reply shows; a
+/// relationship that no longer exists falls back to the id's first 16
+/// characters. The live reply and every page projection share this.
+fn transcript_label(
+    parts: &[(String, String)],
+    relationships: &[Relationship],
+    id: &str,
+) -> String {
+    if !parts.iter().any(|(part, _)| part == id)
+        && let Some(relationship) = relationships.iter().find(|r| r.id == id)
+    {
+        let members = relationship
+            .members
+            .iter()
+            .map(|member| speaker_label(parts, relationships, member))
+            .collect::<Vec<_>>();
+        return relationship_label(&relationship.kind.to_string(), &members);
+    }
+    speaker_label(parts, relationships, id)
+}
+
 fn transcript_from_public_page(
     page: PublicTranscriptPage,
     runtime: &RuntimeSnapshot,
 ) -> Transcript {
     Transcript::from_page(page, &|id| {
-        speaker_label(&runtime.parts, &runtime.relationships, id)
+        transcript_label(&runtime.parts, &runtime.relationships, id)
     })
 }
 
@@ -2309,7 +2337,7 @@ fn apply_public_read(view: &mut View, source_view: &str, read: PublicRead) {
         return;
     }
     let (parts, relationships) = (&view.parts, &view.relationships);
-    let label = |id: &str| speaker_label(parts, relationships, id);
+    let label = |id: &str| transcript_label(parts, relationships, id);
     match read.page {
         Ok(page) => match read.kind {
             PublicReadKind::Older => {
@@ -6823,7 +6851,7 @@ mod tests {
         view.apply_runtime(switched);
         let prefix: String = speaker.chars().take(16).collect();
         assert_eq!(labels(&view), [prefix.clone(), prefix]);
-        // A relationship id is named by its kind once the relationship is known.
+        // A relationship id is named like the live reply once the relationship is known.
         let members = view.parts[..2].iter().map(|part| part.0.clone()).collect();
         let relation = Relationship::new(RelationshipKind::Alliance, members).unwrap();
         install_public_read(
@@ -6835,11 +6863,60 @@ mod tests {
             labels(&view),
             [relation.id.chars().take(16).collect::<String>()]
         );
+        let composite = format!(
+            "alliance · {}",
+            view.parts[..2]
+                .iter()
+                .map(|part| part.1.split(" · ").next().unwrap())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        );
         view.event(Event::Relationship {
             actor: relation.id.clone(),
             relationship: relation,
         });
-        assert_eq!(labels(&view), ["alliance"]);
+        assert_eq!(labels(&view), [composite]);
+    }
+
+    #[test]
+    fn relationship_replies_keep_their_composite_label_after_reload() {
+        let mut view = fixture();
+        let members = view.parts[..2]
+            .iter()
+            .map(|part| part.0.clone())
+            .collect::<Vec<_>>();
+        let relation = Relationship::new(RelationshipKind::Alliance, members).unwrap();
+        let names = relation
+            .members
+            .iter()
+            .map(|id| view.actor_name(id))
+            .collect::<Vec<_>>();
+        let composite = format!("alliance · {}", names.join(" + "));
+        let mut runtime = runtime_snapshot();
+        runtime.relationships = vec![relation.clone()];
+        view.apply_runtime(runtime.clone());
+        let mut output = reply_output(&view, &relation.id, "answer-1");
+        output.relationship = Some(relation.clone());
+        view.complete_turn(output);
+        view.transcript.bind_answer("plain-session", "1", "main");
+        assert_eq!(labels(&view), std::slice::from_ref(&composite));
+        // The persisted page names the same relationship the same way.
+        install_public_read(
+            &mut view,
+            PublicReadKind::Newest,
+            Ok(turn_read_page(1, Some(&relation.id), None)),
+        );
+        assert_eq!(labels(&view), std::slice::from_ref(&composite));
+        // An unchanged runtime snapshot leaves labels and layout identity alone.
+        let projection = view.transcript.items[0].projection;
+        view.apply_runtime(runtime);
+        assert_eq!(view.transcript.items[0].projection, projection);
+        // Once the relationship is gone the reply falls back to the id prefix.
+        view.apply_runtime(runtime_snapshot());
+        assert_eq!(
+            labels(&view),
+            [relation.id.chars().take(16).collect::<String>()]
+        );
     }
 
     fn public_read_cursor(sequence: i64) -> PublicTranscriptCursor {

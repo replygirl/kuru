@@ -163,13 +163,23 @@ pub(super) fn turn_key(session: &str, turn: &str, view: &str) -> String {
 
 impl Transcript {
     pub fn push(&mut self, text: (String, String)) {
+        self.push_item(text, None);
+    }
+
+    /// Push a reply that keeps its raw speaker id, so a later roster change can
+    /// name it again.
+    pub(super) fn push_speaker(&mut self, text: (String, String), speaker: &str) {
+        self.push_item(text, Some(speaker.to_owned()));
+    }
+
+    fn push_item(&mut self, text: (String, String), speaker: Option<String>) {
         self.append(
             text,
             Item {
                 projection: uuid::Uuid::new_v4(),
                 id: ItemId::Local(uuid::Uuid::new_v4()),
                 turn_key: None,
-                speaker: None,
+                speaker,
                 local: true,
             },
         );
@@ -526,14 +536,6 @@ impl Transcript {
         }
     }
 
-    /// Record the raw speaker of the newest item so a later roster change can
-    /// name it again.
-    pub(super) fn set_last_speaker(&mut self, speaker: &str) {
-        if let Some(item) = self.items.last_mut() {
-            item.speaker = Some(speaker.to_owned());
-        }
-    }
-
     /// Derive the label of every item that carries a speaker id again. A
     /// changed label gets a new projection identity so cached layouts rebuild.
     pub(super) fn relabel(&mut self, label: Label) -> bool {
@@ -782,8 +784,9 @@ mod tests {
         assert_eq!(transcript.items[0].projection, projections[0]);
         assert_ne!(transcript.items[1].projection, projections[1]);
         assert_eq!(transcript.items[2].projection, projections[2]);
-        transcript.set_last_speaker("speaker");
+        transcript.push_speaker(("kuru".into(), "reply".into()), "speaker");
         assert!(transcript.relabel(&named));
-        assert_eq!(transcript[2].0, "Self");
+        assert_eq!(transcript[3].0, "Self");
+        assert_eq!(transcript[2].0, "kuru");
     }
 }
