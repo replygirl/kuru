@@ -293,7 +293,10 @@ async fn a_gated_owner_writes_one_complete_record() -> Result<()> {
                     Event::ExtractStart
                         | Event::ExtractEnd
                         | Event::CreateStart
+                        | Event::LegacyPrepared
+                        | Event::RecoveryChecked
                         | Event::ChannelAccepted
+                        | Event::CopyEnd
                         | Event::TemplateCopied
                         | Event::ColdCreated
                         | Event::Activated

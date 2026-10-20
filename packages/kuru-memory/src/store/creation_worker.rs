@@ -226,6 +226,10 @@ impl TemplateCreation {
             self.preserve().await?;
             return Ok((startup, Outcome::Cold(self.marker_pause)));
         }
+        // A completed bounded unit of this open's creation.
+        if let Some(ticks) = &self.engine.ticks {
+            ticks.advance();
+        }
         let base = &self.base;
         let make_options = |directory: PathBuf, read_only| ServerOptions {
             directory,
@@ -243,7 +247,9 @@ impl TemplateCreation {
             #[cfg(test)]
             hooks: stage_worker::StageHooks::default(),
         };
-        let mut progress = ProgressReporter::silent();
+        // Its stages stay with the opener's OpeningDatabase report; its
+        // reports and milestones still advance this open's count.
+        let mut progress = ProgressReporter::counting(self.engine.ticks.clone());
         match worker
             .adopt_and_mark(startup, &mut self.marker_pause, &mut progress)
             .await

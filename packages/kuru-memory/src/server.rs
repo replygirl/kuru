@@ -853,6 +853,10 @@ impl Server {
             let creation = crate::spawn_gate::child_creation().await;
             #[cfg(any(test, feature = "test-support"))]
             let program = PathBuf::from(command.get_program());
+            crate::progress::milestone(
+                options.ticks.as_ref(),
+                crate::open_timeline::Event::SpawnCall,
+            );
             let child = kuru_platform::unix::spawn_piped(command)
                 .context("start memory lifetime supervisor")?;
             let spawned = Instant::now();
@@ -869,7 +873,10 @@ impl Server {
                 &program,
                 crate::test_support::spawn_ledger::DOLT_SUPERVISOR,
             );
-            crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);
+            crate::progress::milestone(
+                options.ticks.as_ref(),
+                crate::open_timeline::Event::SupervisorSpawned,
+            );
             drop(_test_spawn_guard);
             let mut owner = Owner {
                 child: Some(child),
@@ -941,6 +948,10 @@ impl Server {
             command
                 .environment
                 .extend(crate::test_support::lifecycle_trace::forwarded());
+            crate::progress::milestone(
+                options.ticks.as_ref(),
+                crate::open_timeline::Event::SpawnCall,
+            );
             let child = command
                 .spawn()
                 .await
@@ -954,7 +965,10 @@ impl Server {
                 &options.supervisor,
                 crate::test_support::spawn_ledger::DOLT_SUPERVISOR,
             );
-            crate::open_timeline::stamp(crate::open_timeline::Event::SupervisorSpawned);
+            crate::progress::milestone(
+                options.ticks.as_ref(),
+                crate::open_timeline::Event::SupervisorSpawned,
+            );
             drop(_test_spawn_guard);
             let accept = listener.accept(
                 &child,
@@ -983,7 +997,10 @@ impl Server {
                             .context("accept memory supervisor private channel"),
                     }
                 })?;
-                crate::open_timeline::stamp(crate::open_timeline::Event::ChannelAccepted);
+                crate::progress::milestone(
+                    options.ticks.as_ref(),
+                    crate::open_timeline::Event::ChannelAccepted,
+                );
                 owner.lifetime = Some(accepted);
                 let channel = owner.lifetime.as_mut().expect("owned lifetime");
                 step.set(ReadinessPart::Write);
