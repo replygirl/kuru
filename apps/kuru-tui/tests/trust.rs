@@ -2006,3 +2006,49 @@ fn real_pty_launch_refuses_contained_state_without_the_trust_prompt() {
         }
     }
 }
+
+/// A data path that reaches a store inside the workspace through a link
+/// cannot be classified by identity early, so every memory open re-checks
+/// containment and fails closed rather than opening the contained store.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_data_directory_into_the_workspace_never_opens_its_store() {
+    kuru_memory::test_support::closing(async {
+        let sandbox = Sandbox::new("");
+        let state = sandbox.project.join("state");
+        let scope = kuru_runtime::project_scope(&sandbox.project).unwrap();
+        let options = kuru_memory::test_support::warmed_open_options(state.clone(), scope.clone())
+            .await
+            .unwrap();
+        MemoryStore::open(options)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        assert!(MemoryStore::exists(&state, &scope).unwrap());
+        let alias = sandbox.root.path().join("alias");
+        std::os::unix::fs::symlink(&state, &alias).unwrap();
+        let xdg = sandbox.root.path().join("xdg-data");
+        for args in [&["sessions"][..], &["--provider", "demo", "run", "linked"]] {
+            let output = contained_command(&sandbox, &sandbox.project, Some(&alias), &xdg)
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = text(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{args:?} opened the linked store: {stderr}"
+            );
+            assert!(
+                stderr.contains("could not be verified to be outside the tool workspace")
+                    && stderr.contains("pass `-C PROJECT`"),
+                "{args:?}: {stderr}"
+            );
+            assert!(!stderr.contains("activation record"), "{args:?}: {stderr}");
+        }
+        // The contained store was not opened, migrated or changed.
+        assert!(MemoryStore::exists(&state, &scope).unwrap());
+    })
+    .await
+}

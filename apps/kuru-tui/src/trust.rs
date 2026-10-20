@@ -911,10 +911,12 @@ mod tests {
         // A linked component is not followed, so containment is not claimed.
         assert!(state_inside_workspace(&link.join("kuru"), &fixture.workspace).is_err());
         let store = ApprovalStore::new(&link, &fixture.workspace);
-        assert_ne!(
-            store.inspect(&fixture.manifest()),
-            ApprovalState::InsideWorkspace
-        );
+        let manifest = fixture.manifest();
+        // The record read refuses the linked store itself and fails closed:
+        // it is structurally invalid, never approved, and cannot be written.
+        assert_eq!(store.inspect(&manifest), ApprovalState::Invalid);
+        assert!(store.approve_command(&manifest).is_err());
+        assert!(!target.join("trust").exists());
     }
 
     #[test]

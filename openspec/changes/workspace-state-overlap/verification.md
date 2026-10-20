@@ -14,3 +14,8 @@
 ## 3. Preservation
 
 - [ ] 3.1 @integration (agent) existing trust, preferences, doctor and CLI suites plus host/Windows lint, typecheck, docs and cospec checks -> pass; CI coverage gate holds at 95%. Observed locally: app suite 447/0, all static checks exit 0. CI run 39446598749 on 86ce5873: 60 checks pass; coverage macOS 95.23%, Ubuntu 95.22%, Windows 95.01% (gate 95%). Open: `quality / RustSec advisories` fails on externally published rustls (RUSTSEC-2026-0346..0349) and zip (RUSTSEC-2026-0367..0369) advisories unrelated to this change, so the required green run is not yet observed.
+
+## 4. Fail-closed memory opens (review round) [critical]
+
+- [x] 4.1 @regression (agent) child-process `sessions` and `run` with `--data-dir` linked to an existing store inside the workspace -> before (2eeba124): fails with the misleading "project memory has no activation record; preserve the store and repair it" from `MemoryStore::exists`; after: refused with "could not be verified to be outside the tool workspace" plus remedies, store untouched. Observed: failed on 2eeba124 with that message; passes after the fix.
+- [x] 4.2 @unit (agent) linked data path in `ApprovalStore` -> not `InsideWorkspace`; `inspect` is `Invalid`, `approve_command` fails, nothing is written. Observed: passes.

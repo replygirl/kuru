@@ -706,11 +706,16 @@ of its nearest existing ancestor while it does not exist yet, creates nothing,
 and runs before configuration discovery, trust review and any state access. One
 message names both directories and the remedies: run Kuru from a project
 directory, pass `-C PROJECT`, or set `--data-dir` or `KURU_DATA_DIR` to a
-directory outside the workspace. Headless `run` exits 2. `config` and `trust
-status` remain available as inspections, and `kuru doctor` reports the
-`state_inside_workspace` condition with the `separate_state_directory` action
-for workspace trust, the ChatGPT subscription and project memory (exit 3).
-The approval, tool-grant, authentication and managed-configuration stores keep
+directory outside the workspace. Headless `run` exits 2. Only `config` and
+`trust status` are exempt, as pure inspections; every other command refuses,
+including `login`, `logout`, `trust approve` and `trust revoke`. `kuru doctor`
+reports the `state_inside_workspace` condition with the
+`separate_state_directory` action for workspace trust, the ChatGPT
+subscription and project memory (exit 3).
+Each memory open repeats the identity check just before the store opens and
+fails closed when the data path cannot be opened without following symbolic
+links, so a linked `--data-dir` cannot reach a store inside the workspace. The
+approval, tool-grant, authentication and managed-configuration stores keep
 their own containment checks.
 
 Kuru includes its pinned full-Dolt engine and licenses in the executable. First
