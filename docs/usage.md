@@ -238,8 +238,9 @@ label the field as unknown instead of assigning the current part.
 including typed content, settlement and fork provenance. Markdown is the default;
 JSONL has one manifest followed by transcript records. `--output` can replace a
 selected existing file after checking its identity; without it, output goes to
-stdout. This export omits private actor and relationship histories, reasoning
-summaries, notes and candidate branches. Use `kuru memory export` for a complete
+stdout. Records name each speaker by its stored identity, not the display name
+shown in the interface. This export omits private actor and relationship
+histories, reasoning summaries, notes and candidate branches. Use `kuru memory export` for a complete
 memory export. P11 still admits one conversation driver per project; simultaneous
 drivers and live-session presence arrive with the separate concurrent-session
 work.

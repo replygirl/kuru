@@ -41,6 +41,10 @@ relationship and a subdued input/output token line. That line names tool-call an
 peer-round limits independently. An empty model response appears as a separate
 response outcome rather than a budget, and an older limited result whose cause was
 not stored is labeled as an unspecified legacy limit.
+Saved and reloaded replies, including older pages, restored sessions and search
+results, carry the same speaker name as the live reply and follow later part
+renames and framework switches. A speaker the roster no longer lists shows the
+first 16 characters of its identity, as in the live view.
 Private peer messages and state notes stay out of the activity feed. Numbered
 nodes map to the adjacent roster in compact sidebars.
 

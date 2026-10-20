@@ -54,11 +54,20 @@ async fn runtime_adapter_projects_real_relationship_completion_and_sanitized_rou
             .await
             .unwrap();
         let initial = project_initial_view(&harness).await.unwrap();
+        // The restored history names the seeded speaker as the live view does.
+        let seeded_name = initial
+            .runtime
+            .parts
+            .iter()
+            .find(|(id, _)| *id == seeded.speaker)
+            .map(|(_, name)| name.split(" · ").next().unwrap().to_owned())
+            .expect("seeded speaker is in the roster");
+        assert_ne!(seeded_name, seeded.speaker);
         assert_eq!(
             initial.transcript,
             vec![
                 ("user".into(), "history seed".into()),
-                (seeded.speaker, seeded.text),
+                (seeded_name, seeded.text),
             ]
         );
         assert_eq!(initial.session, harness.session.id);
