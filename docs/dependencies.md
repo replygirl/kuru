@@ -31,6 +31,16 @@ The 0.12.1 update, checked on 2026-09-26, embeds the same asset bytes and MIT
 license. The connector package carries the crate and asset MIT attributions in
 `THIRD_PARTY_NOTICES.md`.
 
+The advisory patch of 2026-10-20 moved the strict ZIP codec's `zip` pin to
+9.0.5 and resolved the transitive `rustls` entry to 0.23.46. RustSec reported
+RUSTSEC-2026-0367, 0368 and 0369 against `zip` 8.6.0 (all in its extraction
+path, which Kuru never calls) and RUSTSEC-2026-0346 through 0349 against
+`rustls` 0.23.45. Kuru uses only the ZIP writer with `deflate-flate2`; the
+9.0 release keeps that writer API and feature name, and the lockfile change
+is limited to the two package entries plus the `nix` crate that `zip` 9
+requires on macOS and BSD targets for permission handling; `Cargo.lock`
+records that edge for every target.
+
 ## Rust dependencies
 
 | Dependency | Latest stable pin | Registry |
@@ -64,7 +74,7 @@ license. The connector package carries the crate and asset MIT attributions in
 | `vt100` | `0.16.2` | [sparse index](https://index.crates.io/vt/10/vt100) |
 | `tar` | `0.4.46` | [sparse index](https://index.crates.io/3/t/tar) |
 | `flate2` | `1.1.10` | [sparse index](https://index.crates.io/fl/at/flate2) |
-| `zip` | `8.6.0` | [sparse index](https://index.crates.io/3/z/zip) |
+| `zip` | `9.0.5` | [sparse index](https://index.crates.io/3/z/zip) |
 | `crc32fast` | `1.5.2` | [sparse index](https://index.crates.io/cr/c3/crc32fast) |
 | `windows-sys` | `0.61.2` | [sparse index](https://index.crates.io/wi/nd/windows-sys) |
 | `portable-pty` (Windows terminal tests) | `0.9.0` | [sparse index](https://index.crates.io/po/rt/portable-pty) |
