@@ -6,7 +6,7 @@
   "devDependencies": {
     "oxfmt": "0.70.0",
     "oxlint": "1.85.0",
-    "vitepress": "2.0.0-alpha.20",
+    "vitepress": "2.0.0-alpha.21",
     "vitepress-plugin-llms": "1.14.0"
   }
 }
